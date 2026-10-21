@@ -1,6 +1,6 @@
 # Languages
 
-ThunderControl 0.8.26 uses English as its development language and bundles Korean translations. It follows the preferred language macOS selects for this app. Unsupported languages fall back to English.
+ThunderControl is available in English and Korean. It follows the language macOS selects for the app; other languages fall back to English.
 
 ## Change the app language
 

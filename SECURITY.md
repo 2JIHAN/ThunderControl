@@ -8,4 +8,4 @@ Never publish PINs, tokens, pairing material, Keychain exports or unreviewed dia
 
 Do not disable SIP or Gatekeeper to test the app. Do not reset macOS permissions or delete Keychain items as a generic upgrade step. A change in bundle ID or signing identity can affect existing permission grants.
 
-Current validation is focused on v0.8.25. There is no promised support lifecycle for older prereleases.
+The current public release is v0.8.26. Its input and display implementation evidence is inherited from v0.8.25; see [verification scope](docs/VERIFICATION.md) for the additional release checks and remaining gaps. There is no promised support lifecycle for older prereleases.

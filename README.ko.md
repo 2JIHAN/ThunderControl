@@ -2,41 +2,56 @@
 
 # <img src="docs/assets/app-icon.png" width="32" height="32" alt=""> ThunderControl
 
-MacBook의 키보드와 트랙패드로 Mac mini를 조작하면서, Mac mini의 HiDPI 확장 화면을 MacBook에서 보세요. Wi-Fi 원격 데스크톱이 아닌, 두 Mac을 직접 잇는 전용 Thunderbolt Bridge를 사용합니다.
+Thunderbolt로 두 Mac을 직접 연결하고, MacBook의 키보드와 트랙패드, 화면으로 Mac mini에서 작업하세요.
 
-**[Apple Silicon용 v0.8.26 다운로드](https://github.com/2JIHAN/ThunderControl/releases/download/v0.8.26/ThunderControl-0.8.26-macOS-arm64.zip)** | [릴리스 안내와 체크섬](https://github.com/2JIHAN/ThunderControl/releases/tag/v0.8.26)
+**[Apple Silicon용 다운로드](https://github.com/2JIHAN/ThunderControl/releases/download/v0.8.26/ThunderControl-0.8.26-macOS-arm64.zip)** | [릴리스 안내와 체크섬](https://github.com/2JIHAN/ThunderControl/releases/tag/v0.8.26)
 
-> **실험용 프리뷰:** Apple Silicon 전용입니다. 영상 기능은 macOS 14 이상을 대상으로 하지만, 로컬 테스트는 macOS 27.2에서 진행했으며 폭넓은 호환성을 검증하지 않았습니다. Developer ID 서명과 **Apple 공증을 완료하고 공증 티켓을 첨부했습니다.** macOS 권한 승인은 별도로 필요합니다. Gatekeeper나 SIP를 끄지 마세요.
+Apple Silicon Mac 두 대를 위한 실험용 프리뷰입니다. 화면 공유에는 macOS 14 이상이 필요합니다. 배포 앱은 Developer ID 서명과 Apple 공증을 마쳤습니다.
 
-![개념 연결도: MacBook의 입력은 Mac mini로, Mac mini의 가상 화면 영상은 Thunderbolt Bridge를 통해 MacBook으로 전달됩니다.](docs/assets/overview-ko.svg)
+![MacBook의 키보드와 포인터 입력은 Mac mini로, Mac mini의 확장 화면은 Thunderbolt Bridge를 통해 MacBook으로 전달됩니다.](docs/assets/overview-ko.svg)
 
-*앱 스크린샷이 아닌 개념 연결도입니다. 입력과 보기 전용 영상은 별도 연결을 사용합니다.*
+*앱 스크린샷이 아닌 연결 개념도입니다.*
 
-## 주요 기능
+## 할 수 있는 일
 
-- 두 Mac 사이에서 키보드, 포인터, 스크롤 입력을 공유합니다.
-- Mac mini에 앱 소유 가상 확장 화면을 만들고 MacBook에서 2배 HiDPI 영상을 받습니다.
-- 기기 쌍별 화면 배치를 기억하고 macOS 기본 전체화면을 사용합니다.
-- 입력과 영상을 분리하고, 연결 승인과 안전 중지를 적용합니다.
+- **MacBook으로 Mac mini에서 작업하세요.** 앱은 mini에서 실행하고, 키보드와 포인터, 스크롤은 MacBook에서 조작합니다.
+- **HiDPI 작업 공간을 추가하세요.** 기존 모니터를 복제하는 대신 가상 확장 화면을 만듭니다. 2배 HiDPI와 macOS 기본 전체화면을 지원합니다.
+- **화면 배치를 그대로 이어 쓰세요.** 확장 화면 위치를 Mac 조합별로 저장하고 다음 연결에 다시 적용합니다.
 
-## 설치와 연결
+ThunderControl은 두 Mac 사이의 전용 Thunderbolt Bridge를 사용합니다. Wi-Fi나 인터넷을 통한 원격 접속용 앱은 아닙니다.
 
-1. ZIP을 내려받아 SHA-256을 릴리스의 `SHA256SUMS.txt`와 비교한 뒤 압축을 풉니다. 양쪽 Mac에서 기존 앱을 종료하고 `/Applications/ThunderControl.app`을 교체하세요. 업데이트 때문에 Keychain이나 권한을 초기화하지 마세요.
-2. 충전 전용 USB-C 케이블이 아닌 Thunderbolt 케이블로 연결하세요. 양쪽 Mac에서 Thunderbolt Bridge를 켜고 전용 직접 연결을 구성하세요.
-3. 양쪽 앱을 여세요. MacBook은 **보내기**, Mac mini는 **받기**를 선택합니다. 역할에 따라 요청되는 손쉬운 사용, 입력 모니터링, 로컬 네트워크, 화면 기록 권한을 허용하세요.
-4. 연결할 상대를 선택하고 **연결 요청**을 누른 뒤 PIN 확인 안내를 따르세요. 보내는 Mac의 코드를 확인하고 본인이 요청한 연결만 승인하세요.
-5. 입력 연결이 완료되면 MacBook에서 **화면 받기**, Mac mini에서 **확장 화면 보내기**를 누르세요. 영상은 **화면 종료**로 끝냅니다. **Control+Option+Escape**는 원격 입력을 중지하며, 안전 중지 후에는 직접 재개해야 합니다. 로컬 키보드도 사용할 수 있도록 두세요.
+## 두 Mac 연결하기
 
-## 언어
+1. **양쪽 Mac에 설치하세요.** ZIP을 내려받아 릴리스의 `SHA256SUMS.txt`와 비교한 뒤 압축을 풉니다. 기존 앱을 종료하고 `/Applications`에 복사하세요. 이전 앱은 복구용으로 보관해도 됩니다. 업데이트 때문에 페어링, Keychain, 권한을 초기화할 필요는 없습니다.
+2. **Thunderbolt 케이블로 연결하세요.** USB-C 단자 모양만 같다고 되는 것은 아닙니다. 양쪽 Mac의 네트워크 설정에서 Thunderbolt Bridge가 구성되어 있고 활성 상태인지 확인하세요.
+3. **입력 역할을 정하세요.** MacBook은 **보내기**, Mac mini는 **받기**를 선택합니다. 양쪽에서 손쉬운 사용과 입력 모니터링을 허용하고, 로컬 네트워크 권한도 요청되면 허용하세요. mini가 연결을 기다립니다. 대기를 중지한 상태라면 **대기 재개**를 누르세요.
+4. **Mac mini와 페어링하세요.** MacBook에서 mini를 선택하고 **연결**을 누릅니다. mini에 표시되는 PIN 입력 안내에 따라 MacBook의 코드를 확인하세요. 본인이 요청한 연결만 승인하세요.
+5. **확장 화면을 여세요.** 입력 연결이 완료되면 MacBook에서 **화면 받기**, mini에서 **확장 화면 보내기**를 누릅니다. mini에서 화면 기록 권한을 요청하면 허용하세요.
 
-v0.8.26(build 56)은 영어와 한국어 네이티브 UI를 포함합니다. macOS의 앱 언어를 따르며, 대체 언어는 영어입니다. macOS 설정에서 ThunderControl의 앱별 언어를 바꾸고 앱을 다시 실행하세요. 앱 내부에는 언어 선택 메뉴가 없습니다. 자세한 내용은 [현지화 안내](docs/LOCALIZATION.md)를 확인하세요.
+MacBook의 **화면 배치**에서 화면 위치를 맞추세요. 배치한 방향의 화면 가장자리로 포인터를 넘겨 두 Mac 사이를 오갑니다.
 
-## 자세히 알아보기
+**보내기와 받기는 입력을 기준으로 한 이름입니다.** 화면은 반대 방향으로 전달됩니다. 영상 창은 보기 전용이고, mini 조작은 별도의 입력 연결이 담당합니다.
 
-[소스에서 빌드하기](docs/BUILDING.md) | [검증 범위](docs/VERIFICATION.md) | [공증 상태](docs/NOTARIZATION.md) | [보안과 제보](SECURITY.md)
+## 중지하거나 제어권 되찾기
 
-프레임 속도, 입력부터 화면 표시까지의 지연, 모든 환경의 호환성을 보장하지 않습니다. 독립 보안 감사나 실제 두 Mac 간 시스템 제스처 검증을 완료했다는 주장도 하지 않습니다. PIN, 페어링 자료, 비공개 진단 자료를 공개하지 마세요.
+- **Control+Option+Escape**로 원격 입력을 중지하고 로컬 제어로 돌아옵니다.
+- **화면 종료**는 영상만 별도로 끝냅니다. 일반적으로 입력 연결은 유지됩니다.
+- 안전 중지 후에는 앱 상태를 확인하고 직접 재개하세요. mini에서도 로컬 키보드를 사용할 수 있도록 두세요.
 
-## 라이선스 상태
+기기 목록에 mini가 없다면 케이블, Thunderbolt Bridge, 로컬 네트워크 권한과 mini의 수신 대기 상태를 확인하세요. 입력은 연결되지만 화면이 보이지 않는다면 mini의 화면 기록 권한과 양쪽 화면 공유 버튼을 확인하세요. 문제 해결의 첫 단계로 페어링을 초기화하지 마세요.
 
-원본 코드와 아트워크의 라이선스는 아직 정하지 않았습니다. 공개 열람이 자유로운 재배포를 허용한다는 뜻은 아닙니다. 외부 코드의 기존 라이선스는 유지됩니다. [외부 코드 고지](THIRD_PARTY_NOTICES.md)를 확인하세요.
+## 사용 전 알아둘 점
+
+로컬 검증은 macOS 27.2에서 진행했습니다. 실제 두 Mac 간 입력부터 화면 표시까지의 지연, 기본 Mission Control 제스처, 폭넓은 macOS 호환성은 아직 검증하지 않았습니다. 프레임 속도와 화질도 보장하지 않습니다. 자세한 내용은 [검증 범위](docs/VERIFICATION.md)를 확인하세요.
+
+일부 화면 기능과 시스템 제스처는 비공개 macOS 인터페이스를 사용하므로 OS 업데이트 후 동작이 달라질 수 있습니다. Gatekeeper와 SIP는 켜 두세요. Apple 공증이 독립적인 보안 감사를 뜻하지는 않습니다.
+
+## 안내와 개발 문서
+
+앱은 macOS의 앱별 언어 설정에 따라 영어와 한국어를 표시합니다. [언어 변경 방법](docs/LOCALIZATION.md#change-the-app-language)을 확인하세요.
+
+[소스에서 빌드하기](docs/BUILDING.md) | [검증 범위](docs/VERIFICATION.md) | [서명과 공증](docs/NOTARIZATION.md) | [보안과 제보](SECURITY.md)
+
+## 라이선스
+
+원본 코드와 아트워크의 라이선스는 아직 정하지 않았습니다. 공개 열람이 자유로운 재배포를 허용한다는 뜻은 아닙니다. 외부 코드의 라이선스는 [고지 문서](THIRD_PARTY_NOTICES.md)에 보존되어 있습니다.
