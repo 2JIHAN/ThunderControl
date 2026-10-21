@@ -40,3 +40,9 @@ All five native settings tabs were constructed in both languages with the app in
 The final implementation retained the four-size generated H.264/AEAD/decoder pipeline checks listed above. Strict/deep code-signature validation, bundled-license matching and executable private-path scans are separate release checks. Release assets include SHA-256 checksums, and the published download is compared with the local ZIP.
 
 Offscreen rendering and guarded-state observations do not establish visible-window focus behavior, packet instrumentation, live sharing or physical two-Mac results.
+
+## Apple notarization update, 2026-10-21
+
+Apple returned `Accepted`, status code 0, with the summary `Ready for distribution` and no listed issues. The approval ticket was stapled to the app and `stapler validate` passed. Strict/deep code-signature validation passed, and Gatekeeper returned `accepted` with `source=Notarized Developer ID`. Both executables remained byte-identical to the initial v0.8.26 package; there was no rebuild or re-sign after approval.
+
+The rebuilt distribution ZIP includes the stapled app and updated notes/checksum. The initial unnotarized ZIP is retained locally as a backup. The published replacement is separately downloaded and checked for checksum, signature, ticket and Gatekeeper assessment. None of the live-session or physical-device limitations above are removed by notarization.

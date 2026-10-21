@@ -6,7 +6,7 @@ MacBook의 키보드와 트랙패드로 Mac mini를 조작하면서, Mac mini의
 
 **[Apple Silicon용 v0.8.26 다운로드](https://github.com/2JIHAN/ThunderControl/releases/download/v0.8.26/ThunderControl-0.8.26-macOS-arm64.zip)** | [릴리스 안내와 체크섬](https://github.com/2JIHAN/ThunderControl/releases/tag/v0.8.26)
 
-> **실험용 프리뷰:** Apple Silicon 전용입니다. 영상 기능은 macOS 14 이상을 대상으로 하지만, 로컬 테스트는 macOS 27.2에서 진행했으며 폭넓은 호환성을 검증하지 않았습니다. Developer ID로 서명했지만 **Apple 공증 및 공증 티켓 스테이플링은 하지 않았습니다.** Gatekeeper가 실행을 차단할 수 있습니다. Gatekeeper나 SIP를 끄지 마세요.
+> **실험용 프리뷰:** Apple Silicon 전용입니다. 영상 기능은 macOS 14 이상을 대상으로 하지만, 로컬 테스트는 macOS 27.2에서 진행했으며 폭넓은 호환성을 검증하지 않았습니다. Developer ID 서명과 **Apple 공증을 완료하고 공증 티켓을 첨부했습니다.** macOS 권한 승인은 별도로 필요합니다. Gatekeeper나 SIP를 끄지 마세요.
 
 ![개념 연결도: MacBook의 입력은 Mac mini로, Mac mini의 가상 화면 영상은 Thunderbolt Bridge를 통해 MacBook으로 전달됩니다.](docs/assets/overview-ko.svg)
 
@@ -33,7 +33,7 @@ v0.8.26(build 56)은 영어와 한국어 네이티브 UI를 포함합니다. mac
 
 ## 자세히 알아보기
 
-[소스에서 빌드하기](docs/BUILDING.md) | [검증 범위](docs/VERIFICATION.md) | [보안과 제보](SECURITY.md)
+[소스에서 빌드하기](docs/BUILDING.md) | [검증 범위](docs/VERIFICATION.md) | [공증 상태](docs/NOTARIZATION.md) | [보안과 제보](SECURITY.md)
 
 프레임 속도, 입력부터 화면 표시까지의 지연, 모든 환경의 호환성을 보장하지 않습니다. 독립 보안 감사나 실제 두 Mac 간 시스템 제스처 검증을 완료했다는 주장도 하지 않습니다. PIN, 페어링 자료, 비공개 진단 자료를 공개하지 마세요.
 

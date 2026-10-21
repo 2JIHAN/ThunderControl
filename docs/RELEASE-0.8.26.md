@@ -6,7 +6,7 @@ English-first native macOS UI with bundled Korean support, plus a shorter biling
 
 **Download:** `ThunderControl-0.8.26-macOS-arm64.zip` for Apple Silicon. Compare it with `SHA256SUMS.txt` before expanding it. The video helper targets macOS 14 or later; local validation used macOS 27.2, not a broad OS compatibility matrix.
 
-**Signing:** Developer ID-signed, but not Apple-notarized or stapled. Gatekeeper may block an Internet download. Do not disable Gatekeeper or SIP. Read the repository's installation and safety guidance before deciding whether to run it.
+**Signing update, 2026-10-21:** Apple notarization was accepted, the approval ticket was stapled to the app and validated, and Gatekeeper assessed it as **Notarized Developer ID**. The two executable files are byte-identical to the initial v0.8.26 build. The ZIP and checksum were updated to carry the ticket and current installation notes. This is still an experimental prerelease, not App Store review or a guarantee of safe/correct behavior. macOS role-specific permissions remain required. Do not disable Gatekeeper or SIP.
 
 ## What's new
 

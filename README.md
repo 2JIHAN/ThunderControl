@@ -6,7 +6,7 @@ Control your Mac mini with your MacBook's keyboard and trackpad, while viewing t
 
 **[Download v0.8.26 for Apple Silicon](https://github.com/2JIHAN/ThunderControl/releases/download/v0.8.26/ThunderControl-0.8.26-macOS-arm64.zip)** | [Release notes and checksums](https://github.com/2JIHAN/ThunderControl/releases/tag/v0.8.26)
 
-> **Experimental preview:** Apple Silicon only. Video targets macOS 14+, but local testing used macOS 27.2, not a broad compatibility matrix. Developer ID signed, **not notarized or stapled**; Gatekeeper may block it. Do not disable Gatekeeper or SIP.
+> **Experimental preview:** Apple Silicon only. Video targets macOS 14+, but local testing used macOS 27.2, not a broad compatibility matrix. Developer ID signed and **Apple-notarized, with a stapled ticket**. macOS permission checks still apply. Do not disable Gatekeeper or SIP.
 
 ![Conceptual connection diagram: MacBook input travels to Mac mini; Mac mini's virtual display video travels back over Thunderbolt Bridge.](docs/assets/overview-en.svg)
 
@@ -33,7 +33,7 @@ v0.8.26 (build 56) bundles native English and Korean UI. It follows the macOS ap
 
 ## More details
 
-[Build from source](docs/BUILDING.md) | [Verification scope](docs/VERIFICATION.md) | [Security and reporting](SECURITY.md)
+[Build from source](docs/BUILDING.md) | [Verification scope](docs/VERIFICATION.md) | [Notarization](docs/NOTARIZATION.md) | [Security and reporting](SECURITY.md)
 
 No guaranteed frame rate, end-to-end latency, universal compatibility, independent audit, or verified two-Mac system gestures. Do not share PINs, pairing material or private diagnostics publicly.
 
