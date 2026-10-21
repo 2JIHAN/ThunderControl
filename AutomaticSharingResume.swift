@@ -1,0 +1,127 @@
+import Foundation
+import AppKit
+import CoreGraphics
+
+/// Pure retry reducer. No route, trust, permissions or input APIs live here.
+struct AutomaticSharingResume {
+  struct Binding:Equatable {let pair:LayoutDevicePair;let inputIsSender:Bool;let host:String}
+  private(set) var binding:Binding?
+  private(set) var lastBinding:Binding?
+  private(set) var blocked=false
+  private(set) var attempts=0
+  private(set) var nextAttempt=0.0
+  mutating func bind(_ value:Binding?) {
+    guard value != binding else{return}
+    binding=value;if let value {lastBinding=value};attempts=0;nextAttempt=0
+  }
+  mutating func manualResume(){blocked=false;attempts=0;nextAttempt=0}
+  mutating func manualStop(){blocked=true;attempts=0;nextAttempt=0}
+  mutating func shouldStart(now:Double,intent:SavedSharingState?,safe:Bool,active:Bool,cleaning:Bool)->Bool {
+    guard now.isFinite,let binding,let intent,intent.pair==binding.pair,intent.inputIsSender==binding.inputIsSender,
+      intent.valid,intent.videoEnabled,safe,!blocked,!active,!cleaning,now>=nextAttempt else{return false}
+    let delays:[Double]=[1,2,4,8,15,15]
+    nextAttempt=now+delays[min(attempts,delays.count-1)];attempts=min(attempts+1,delays.count);return true
+  }
+}
+
+@MainActor extension App {
+  func sharingObserveAuthenticatedBinding() {
+    // Metadata only: capture the proven pair before a queued disconnect can
+    // erase it. Activation remains deferred until input setup has completed.
+    guard !isAutomationTest else{return}
+    if relay.authenticated,let pair=relay.authenticatedDevicePair,
+      let host=relay.authenticatedSharingPeerHost,DisplayPeerRoute.valid(host) {
+      sharingResume.bind(.init(pair:pair,inputIsSender:relay.inputIsSender,host:host))
+    } else {sharingResume.bind(nil)}
+  }
+  func sharingInputPermitted(pair:LayoutDevicePair,sender:Bool)->Bool {
+    guard !applicationIsQuitting,!sharingInputRestoreBlocked,sharingStore.isReadable else{return false}
+    guard let saved=sharingStore.load(pair:pair,inputIsSender:sender) else{return true}
+    return sender ? saved.inputAuto:saved.receiverConsent
+  }
+  func sharingCurrentIntent()->SavedSharingState? {
+    guard relay.authenticated,let pair=relay.authenticatedDevicePair else{return nil}
+    return sharingStore.load(pair:pair,inputIsSender:relay.inputIsSender)
+  }
+  func sharingSeedCurrentIntent() {
+    guard !isAutomationTest,!applicationIsQuitting,sharingStore.isReadable,relay.authenticated,let pair=relay.authenticatedDevicePair,
+      sharingStore.load(pair:pair,inputIsSender:relay.inputIsSender)==nil,
+      !relay.displayTopologyTransitionActive,!displayMode.cleaning else{return}
+    guard relay.auto || relay.forward || relay.inject || displayMode.active else{return}
+    var state=SavedSharingState.off(pair:pair,inputIsSender:relay.inputIsSender)
+    state.inputAuto=relay.inputIsSender && relay.auto
+    state.inputForward=relay.inputIsSender && !relay.auto && relay.forward
+    state.receiverConsent = !relay.inputIsSender && relay.inject
+    // Only an observed active/waiting display can seed video, never an IP preference.
+    state.videoEnabled=displayMode.active && displayMode.sharingSending == !relay.inputIsSender
+    sharingStore.save(state)
+  }
+  func sharingUserChangedInput() {
+    guard !isAutomationTest,!applicationIsQuitting else{return}
+    let binding=sharingResume.lastBinding
+    guard let pair=relay.authenticatedDevicePair ?? binding?.pair else{return}
+    let sender=relay.authenticated ? relay.inputIsSender:(binding?.inputIsSender ?? false)
+    guard (mode.selectedSegment==0)==sender else{return}
+    var state=sharingStore.load(pair:pair,inputIsSender:sender) ?? .off(pair:pair,inputIsSender:sender)
+    state.inputAuto=sender && automatic.state == .on
+    state.inputForward=sender && !state.inputAuto && forward.state == .on
+    state.receiverConsent = !sender && enable.state == .on
+    sharingStore.save(state);sharingResume.manualResume();sharingInputRestoreBlocked=false
+  }
+  func sharingUserRequestedVideo(sending:Bool) {
+    guard !sharingAutomaticVideoStart,!isAutomationTest,!applicationIsQuitting,relay.authenticated,
+      let pair=relay.authenticatedDevicePair,relay.inputIsSender == !sending else{return}
+    sharingSeedCurrentIntent()
+    var state=sharingCurrentIntent() ?? .firstVideo(pair:pair,inputIsSender:relay.inputIsSender,auto:relay.auto,forward:relay.forward,consent:relay.inject)
+    state.videoEnabled=true;state.videoSending=sending;sharingStore.save(state);sharingResume.manualResume()
+  }
+  func sharingUserStoppedVideo() {
+    guard !applicationIsQuitting,!isAutomationTest else{return}
+    if var state=sharingCurrentIntent() {state.videoEnabled=false;sharingStore.save(state)}
+    // Also handles stop during disconnected cleanup, without guessing a new pair.
+    else if let binding=sharingResume.lastBinding,var state=sharingStore.load(pair:binding.pair,inputIsSender:binding.inputIsSender) {state.videoEnabled=false;sharingStore.save(state)}
+    sharingResume.manualStop()
+  }
+  func sharingUserStoppedAll() {
+    guard !applicationIsQuitting,!isAutomationTest else{return}
+    sharingInputRestoreBlocked=true
+    if let pair=relay.authenticatedDevicePair {sharingStore.save(.off(pair:pair,inputIsSender:relay.inputIsSender))}
+    else if let binding=sharingResume.lastBinding {sharingStore.save(.off(pair:binding.pair,inputIsSender:binding.inputIsSender))}
+    sharingResume.manualStop()
+  }
+  func sharingDisplayStatusDidChange() {
+    if applicationIsQuitting {
+      if !displayMode.active && !displayMode.cleaning {DispatchQueue.main.async {NSApp.terminate(nil)}}
+      return
+    }
+    // Status strings are not evidence of user off. Cleanup and failures preserve intent.
+    sharingSeedCurrentIntent()
+  }
+  func sharingRestoreTick() {
+    guard !isAutomationTest,!applicationIsQuitting,!sharingRestoreInProgress else{return}
+    sharingRestoreInProgress=true;defer{sharingRestoreInProgress=false}
+    guard relay.authenticated,let pair=relay.authenticatedDevicePair,
+      let host=relay.authenticatedSharingPeerHost,DisplayPeerRoute.valid(host) else{sharingResume.bind(nil);return}
+    sharingResume.bind(.init(pair:pair,inputIsSender:relay.inputIsSender,host:host))
+    let safe = !automaticConnectionPaused && !relay.automaticReconnectSuspended && relay.sessionAllowed && !relay.sessionLockedSignal && !relay.screenSleeping && !relay.systemSleeping && !relay.hasUnresolvedLocalRecovery && inputPermissionsReady()
+    guard safe,!sharingInputRestoreBlocked else{return}
+    sharingSeedCurrentIntent()
+    guard let state=sharingCurrentIntent() else{return}
+    if !relay.displayTopologyTransitionActive && !displayMode.cleaning {
+      if relay.inputIsSender {
+        if !state.inputAuto && relay.auto {relay.configureAuto(false,edge:relay.selectedEdge)}
+        if !state.inputForward && relay.forward {relay.forward=false;relay.releaseInputs()}
+        if state.inputAuto && !relay.auto {relay.restoreSavedSharingAutoIfReady()}
+        // Forward's own receiver-ready check remains the Relay's responsibility.
+        if state.inputForward && !relay.forward {relay.restoreSavedSharingForwardIfReady()}
+      } else if relay.inject != state.receiverConsent {relay.consent(state.receiverConsent)}
+    }
+    let videoSafe=safe && relay.multiDisplayDesktopReady && (!state.videoSending || CGPreflightScreenCaptureAccess())
+    if sharingResume.shouldStart(now:ProcessInfo.processInfo.systemUptime,intent:state,safe:videoSafe,active:displayMode.active,cleaning:displayMode.cleaning) {
+      // Current authenticated socket route only, never a stored unrelated host.
+      displayPeer.stringValue=host;sharingAutomaticVideoStart=true
+      beginDisplay(sending:state.videoSending)
+      sharingAutomaticVideoStart=false
+    }
+  }
+}

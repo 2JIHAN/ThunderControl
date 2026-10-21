@@ -1,0 +1,4 @@
+module CSPAKE2 {
+  header "shim.h"
+  export *
+}

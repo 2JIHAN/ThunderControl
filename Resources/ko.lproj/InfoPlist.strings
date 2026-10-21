@@ -1,0 +1,2 @@
+"CFBundleDisplayName" = "ThunderControl";
+"NSLocalNetworkUsageDescription" = "확인된 Thunderbolt 브리지를 통해 페어링한 Mac에만 연결하여 키보드와 포인터를 공유하고, 직접 시작한 확장 화면을 전송합니다.";

@@ -1,0 +1,3 @@
+[submodule "Pairing/BoringSSL"]
+	path = Pairing/BoringSSL
+	url = https://boringssl.googlesource.com/boringssl

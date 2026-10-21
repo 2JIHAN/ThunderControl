@@ -1,0 +1,5 @@
+module BridgeDNSShim [system] {
+  header "BridgeDNSShim.h"
+  link "dns_sd"
+  export *
+}
