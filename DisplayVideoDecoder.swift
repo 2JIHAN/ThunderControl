@@ -153,17 +153,21 @@ private final class DisplayDecodeMailbox {
     let lock = NSLock()
     let format: DisplayVideoFormat
     var valid = true, scheduled = false, inFlight = 0, failed = false
+    var submittedAt: [Int64: Double] = [:]
     var latest: CVPixelBuffer?
     var deliver: ((CVPixelBuffer) -> Void)?
     var failure: (() -> Void)?
     init(format: DisplayVideoFormat, deliver: @escaping (CVPixelBuffer) -> Void, failure: @escaping () -> Void) { self.format = format; self.deliver = deliver; self.failure = failure }
-    func reserve() -> Bool {
+    func reserve(sequence: Int64) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard valid, !failed, inFlight < 4 else { return false }; inFlight += 1; return true
+        guard valid, !failed, inFlight < 4, submittedAt.count < 4 else { return false }; inFlight += 1; submittedAt[sequence] = ProcessInfo.processInfo.systemUptime; return true
     }
-    func complete(status: OSStatus, flags: VTDecodeInfoFlags, pixel: CVPixelBuffer?) {
+    func complete(status: OSStatus, flags: VTDecodeInfoFlags, pixel: CVPixelBuffer?, sequence: Int64) {
         lock.lock(); inFlight = max(0, inFlight - 1)
         guard valid else { lock.unlock(); return }
+        if let started = submittedAt.removeValue(forKey: sequence), sequence % 120 == 0 {
+            displayStageLog("Display receiver decode submitToCallbackMs=\((ProcessInfo.processInfo.systemUptime-started)*1000); localMonotonic=true")
+        }
         if status == noErr, let pixel, CVPixelBufferGetWidth(pixel) == format.pixelWidth,
            CVPixelBufferGetHeight(pixel) == format.pixelHeight, CVPixelBufferGetPixelFormatType(pixel) == kCVPixelFormatType_32BGRA {
             latest = pixel
@@ -181,13 +185,15 @@ private final class DisplayDecodeMailbox {
         if let error { error() } else if let image { output?(image) }
     }
     func invalidate() {
-        lock.lock(); valid = false; latest = nil; deliver = nil; failure = nil; lock.unlock()
+        lock.lock(); valid = false; submittedAt.removeAll(); latest = nil; deliver = nil; failure = nil; lock.unlock()
     }
 }
 
-private let displayDecodeCallback: VTDecompressionOutputCallback = { reference, _, status, flags, image, _, _ in
-    guard let reference else { return }
-    Unmanaged<DisplayDecodeMailbox>.fromOpaque(reference).takeUnretainedValue().complete(status: status, flags: flags, pixel: image)
+private let displayDecodeCallback: VTDecompressionOutputCallback = { reference, frameContext, status, flags, image, _, _ in
+    guard let reference, let frameContext else { return }
+    // Opaque integer cookie, never dereferenced. VT can normalize PTS timescales.
+    let sequence = Int64(UInt(bitPattern: frameContext) - 1)
+    Unmanaged<DisplayDecodeMailbox>.fromOpaque(reference).takeUnretainedValue().complete(status: status, flags: flags, pixel: image, sequence: sequence)
 }
 
 /// Main-thread entry points; output callbacks are coalesced onto the main queue.
@@ -249,8 +255,8 @@ private let displayDecodeCallback: VTDecompressionOutputCallback = { reference, 
         guard CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: description,
             sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
             sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &sample) == noErr, let sample else { throw DisplayVideoError.decoderFailed }
-        guard mailbox.reserve() else { throw DisplayVideoError.backlog }
-        let status = VTDecompressionSessionDecodeFrame(session, sampleBuffer: sample, flags: [._EnableAsynchronousDecompression], frameRefcon: nil, infoFlagsOut: nil)
+        guard sequence >= 0, sequence < Int64.max, mailbox.reserve(sequence: sequence) else { throw DisplayVideoError.backlog }
+        let status = VTDecompressionSessionDecodeFrame(session, sampleBuffer: sample, flags: [._EnableAsynchronousDecompression], frameRefcon: UnsafeMutableRawPointer(bitPattern: UInt(sequence) + 1), infoFlagsOut: nil)
         guard status == noErr else { throw DisplayVideoError.decoderFailed }
         sequence += 1
     }
@@ -399,11 +405,22 @@ struct DisplayViewerStartup {
     private var viewerWindow: DisplayViewerWindow?
     private var surface: DisplayVideoSurface?
     private var latestDecoded = DisplayLatestDecodedFrame()
-    private var presentationTimer: Timer?
+    private var readinessRequested = false
+    private var readinessEpoch: UInt64 = 0
+    private var lastStreamSequence: UInt64?
+    private var lastCursorSequence: UInt64?
+    private var cursorExpiry: DispatchWorkItem?
+    private let cursorOverlay = CALayer()
+    private var cursorGlyphs: [UInt8: (CGImage, CGSize, CGPoint)] = [:]
+    private var cursorMetadata: DisplayCursorMetadata?
+    private var lastDecodedAt: Double = 0
     private(set) var presentationStats = DisplayPresentationStats()
     private var decoder: DisplayH264Decoder?
     private var closing = false
     private(set) var receivedFrameCount = 0
+    var cursorVisibleForTests: Bool { cursorOverlay.superlayer != nil && cursorOverlay.contents != nil && !cursorOverlay.isHidden }
+    var cursorFrameForTests: CGRect { cursorOverlay.frame }
+    var readinessRequestedForTests: Bool { readinessRequested }
     var isFullScreenForTests: Bool { viewerWindow?.styleMask.contains(.fullScreen) == true }
     var isOpenForSourceOwnership:Bool { !closing && viewerWindow != nil }
     var hasStableSourceOwnership:Bool {
@@ -502,10 +519,20 @@ struct DisplayViewerStartup {
         if decoder == nil {
             decoder = DisplayH264Decoder(format: self.format, output: { [weak self] pixel in self?.present(pixel) }, failure: { [weak self] in self?.close() })
         }
-        do { try decoder!.accept(payload) } catch { clear(); throw error }
+        var video = payload
+        if payload.first == 6 {
+            let frame = try DisplayStreamFrame(payload)
+            guard lastStreamSequence.map({frame.sequence > $0}) ?? true else { throw DisplayVideoError.malformed }
+            lastStreamSequence = frame.sequence; video = frame.video
+            if frame.sequence % 120 == 0 {
+                displayStageLog("Display source stages us: captureArrivalToEncode=\(frame.encodeStart-frame.capture) encode=\(frame.encodeEnd-frame.encodeStart); remoteClockOffset=unknown panelLatency=unmeasured")
+            }
+        }
+        do { try decoder!.accept(video) } catch { clear(); throw error }
     }
     private func present(_ pixel: CVPixelBuffer) {
         guard !closing, surface != nil, viewerWindow != nil else { return }
+        lastDecodedAt = ProcessInfo.processInfo.systemUptime
         receivedFrameCount += 1; presentationStats.decoded &+= 1
         if latestDecoded.replace(pixel) { presentationStats.replacedDecoded &+= 1 }
         drainPresentation()
@@ -517,29 +544,78 @@ struct DisplayViewerStartup {
         guard renderer.status != .failed else { close(); return }
         guard renderer.isReadyForMoreMediaData else {
             presentationStats.readinessDeferrals &+= 1
-            if presentationTimer == nil {
-                let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-                    MainActor.assumeIsolated { self?.drainPresentation() }
+            if !readinessRequested {
+                readinessRequested = true
+                let token = readinessEpoch
+                renderer.requestMediaDataWhenReady(on: .main) { [weak self] in
+                    MainActor.assumeIsolated {
+                        guard let self, self.readinessEpoch == token, !self.closing else { return }
+                        self.stopReadiness()
+                        self.drainPresentation()
+                    }
                 }
-                presentationTimer = timer; RunLoop.main.add(timer, forMode: .common)
             }
             return
         }
-        presentationTimer?.invalidate(); presentationTimer = nil
+        stopReadiness()
         guard let pixel = latestDecoded.take() else { return }
         let started = ProcessInfo.processInfo.systemUptime
         do {
             let sample = try displayImmediateImageSample(pixel, format: self.format)
             renderer.enqueue(sample)
             presentationStats.submitted &+= 1
+            updateCursorOverlay()
+            if presentationStats.submitted % 120 == 0 {
+                displayStageLog("Display receiver stages ms: decodedMainToRendererSubmit=\((ProcessInfo.processInfo.systemUptime-lastDecodedAt)*1000); enqueueNotPanel=true crossHostLatency=unknown")
+            }
             let elapsed = (ProcessInfo.processInfo.systemUptime - started) * 1000
             presentationStats.totalEnqueueMilliseconds += elapsed
             presentationStats.maximumEnqueueMilliseconds = max(presentationStats.maximumEnqueueMilliseconds, elapsed)
         } catch { close() }
     }
+    private func stopReadiness() {
+        readinessEpoch &+= 1
+        if readinessRequested, #available(macOS 14.0, *) { surface?.videoLayer?.sampleBufferRenderer.stopRequestingMediaData() }
+        readinessRequested = false
+    }
+    func acceptCursor(_ payload: Data) throws {
+        let next = try DisplayCursorMetadata(payload)
+        guard !closing, viewerWindow != nil, lastCursorSequence.map({next.sequence > $0}) ?? true else { throw DisplayVideoError.malformed }
+        lastCursorSequence = next.sequence; cursorMetadata = next
+        cursorExpiry?.cancel()
+        let token = windowEpoch, cursorSequence = next.sequence
+        let expiry = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { guard let self, self.windowEpoch == token, self.lastCursorSequence == cursorSequence else { return }; self.cursorOverlay.isHidden = true; self.cursorMetadata = nil }
+        }
+        cursorExpiry = expiry; DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: expiry)
+        updateCursorOverlay()
+    }
+    private func updateCursorOverlay() {
+        guard let surface, let m = cursorMetadata else { cursorOverlay.isHidden = true; return }
+        let bounds = surface.bounds
+        let scale = min(bounds.width / CGFloat(format.width), bounds.height / CGFloat(format.height))
+        let width = CGFloat(format.width)*scale, height = CGFloat(format.height)*scale
+        let cursor: NSCursor
+        switch m.shape { case 1: cursor = .iBeam; case 2: cursor = .crosshair; case 3: cursor = .pointingHand; case 4: cursor = .closedHand; default: cursor = .arrow }
+        if cursorGlyphs[m.shape] == nil {
+            var rect = CGRect(origin: .zero, size: cursor.image.size)
+            guard let image = cursor.image.cgImage(forProposedRect: &rect, context: nil, hints: nil) else { cursorOverlay.isHidden = true; return }
+            cursorGlyphs[m.shape] = (image, cursor.image.size, cursor.hotSpot)
+        }
+        guard let (image, size, hotSpot) = cursorGlyphs[m.shape], let layer = surface.layer else { cursorOverlay.isHidden = true; return }
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        if cursorOverlay.superlayer !== layer { layer.addSublayer(cursorOverlay) }
+        cursorOverlay.contents = image; cursorOverlay.contentsGravity = .resize
+        cursorOverlay.frame = CGRect(x: (bounds.width-width)/2 + m.x*width-hotSpot.x,
+            y: (bounds.height-height)/2 + (1-m.y)*height-(size.height-hotSpot.y), width: size.width, height: size.height)
+        cursorOverlay.zPosition = 100; cursorOverlay.isHidden = !m.visible
+        CATransaction.commit()
+    }
     func clear() {
         forwardedButtons.removeAll()
-        presentationTimer?.invalidate(); presentationTimer = nil; latestDecoded.clear()
+        stopReadiness(); latestDecoded.clear()
+        cursorExpiry?.cancel(); cursorExpiry = nil; cursorMetadata = nil; cursorOverlay.removeFromSuperlayer(); cursorGlyphs.removeAll()
+        lastCursorSequence = nil; lastStreamSequence = nil; lastDecodedAt = 0
         decoder?.clear(); decoder = nil; receivedFrameCount = 0
         presentationStats = DisplayPresentationStats()
         if #available(macOS 14.0, *), let layer = surface?.videoLayer {

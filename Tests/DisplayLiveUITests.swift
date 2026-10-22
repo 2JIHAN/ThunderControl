@@ -94,7 +94,10 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     try displayViewerStartupLifecycleTests()
     guard #available(macOS 14.0, *) else { throw DisplayLiveUITestError.failed("macOS14 required") }
     try displayLiveRequire(format.valid, "valid expected format")
-    let frames = try displayLiveSyntheticFrames(path, format: format)
+    let rawFrames = try displayLiveSyntheticFrames(path, format: format)
+    func number(_ value: UInt64, _ bytes: Int = 8) -> Data { Data((0..<bytes).reversed().map { UInt8(truncatingIfNeeded: value >> ($0*8)) }) }
+    let frames = rawFrames.enumerated().map { index, video in Data([6])+number(UInt64(index))+number(100)+number(110)+number(150)+video }
+    func cursor(_ sequence: UInt64, visible: Bool, x: UInt64 = 500_000, y: UInt64 = 500_000) -> Data { Data([7])+number(sequence)+Data([visible ? 1:0,0])+number(x,4)+number(y,4) }
     let outputURL = URL(fileURLWithPath: output).standardizedFileURL
     try displayLiveRequire(output.hasPrefix("/") && outputURL.pathExtension.lowercased() == "png" && outputURL.resolvingSymlinksInPath().path == outputURL.path && !FileManager.default.fileExists(atPath: outputURL.path), "new non-symlink PNG output required")
     let application = NSApplication.shared
@@ -177,6 +180,18 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
 , maximum: 2,stage:"focus return")
     dummy.close()
     try displayLiveRequire(closed == 0 && viewer.receivedFrameCount == 8 && viewer.presentationStats.submitted == 8, "focus return must preserve video")
+    try viewer.acceptCursor(cursor(0, visible:true))
+    try displayLiveRequire(viewer.cursorVisibleForTests && viewer.cursorFrameForTests.width > 0 && viewer.cursorFrameForTests.height > 0, "separate cursor has actual layer and image")
+    let centerCursor = viewer.cursorFrameForTests
+    try viewer.acceptCursor(cursor(1, visible:true, x:750_000, y:250_000))
+    try displayLiveRequire(viewer.cursorFrameForTests.minX > centerCursor.minX && viewer.cursorFrameForTests.minY > centerCursor.minY, "top-left normalized cursor mapped into bottom-left native layer")
+    do { try viewer.acceptCursor(cursor(1, visible:true)); throw DisplayLiveUITestError.failed("duplicate cursor accepted") } catch DisplayVideoError.malformed {}
+    try viewer.acceptCursor(cursor(2, visible:false))
+    try displayLiveRequire(!viewer.cursorVisibleForTests, "explicit hidden cursor removes visible overlay")
+    try viewer.acceptCursor(cursor(3, visible:true))
+    try await pump(until:{!viewer.cursorVisibleForTests},maximum:1,stage:"stale cursor expiry")
+    try viewer.acceptCursor(cursor(4, visible:true))
+    try displayLiveRequire(viewer.cursorVisibleForTests && !viewer.readinessRequestedForTests, "fresh cursor visible and renderer readiness registration drained")
     // Let the WindowServer compositor consume the immediate sample before the
     // known-window capture. This is not a screen-wide screenshot.
     let renderedAt = ProcessInfo.processInfo.systemUptime + 0.25
@@ -193,8 +208,9 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     try displayLiveRequire(closed == 0 && ProcessInfo.processInfo.systemUptime < deadline, "test final state")
     let wasFullscreen=viewer.isFullScreenForTests
     viewer.close()
+    try displayLiveRequire(!viewer.cursorVisibleForTests && !viewer.readinessRequestedForTests, "close clears cursor and renderer request")
     try displayLiveRequire(!ownershipFixture.sourceWindowOwnership.hasStableOwnership,"closed viewer cannot leave stale source ownership or activate HUD")
-    print("PASS native viewer: activationPolicy=\(application.activationPolicy().rawValue) coordinator=true fullscreen=\(wasFullscreen) decoded=8 submitted=8 colorfulSamples=\(colorfulSamples) focusLossCallbacks=\(lost) focusGainCallbacks=\(gained) expectedClose=1 newFrameWhileUnfocused=true; own-window generated-pattern screenshot only; no network, virtual display or input posting")
+    print("PASS native viewer: activationPolicy=\(application.activationPolicy().rawValue) coordinator=true fullscreen=\(wasFullscreen) decoded=8 submitted=8 colorfulSamples=\(colorfulSamples) focusLossCallbacks=\(lost) focusGainCallbacks=\(gained) expectedClose=1 newFrameWhileUnfocused=true stampedFrames=true separateCursor=true cursorExpiry=true; own-window generated-pattern screenshot only; no network, virtual display or input posting")
 }
 
 /// Pure lifecycle regression coverage: no AppKit activation, capture or input.

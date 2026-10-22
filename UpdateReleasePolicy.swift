@@ -16,9 +16,10 @@ struct UpdateVersion:Comparable,Equatable {
     if metadata.count==2,identifiers(String(metadata[1]))==nil{return nil}
     let halves=metadata[0].split(separator:"-",maxSplits:1,omittingEmptySubsequences:false)
     let core=halves[0].split(separator:".",omittingEmptySubsequences:false)
-    guard core.count==3,core.allSatisfy({!$0.isEmpty && ($0.count==1 || $0.first != "0") && $0.utf8.allSatisfy{(48...57).contains($0)}}) else{return nil}
-    let values=core.compactMap{Int($0)};guard values.count==3 else{return nil}
-    numbers=values
+    guard (core.count==3 || core.count==4),core.allSatisfy({!$0.isEmpty && ($0.count==1 || $0.first != "0") && $0.utf8.allSatisfy{(48...57).contains($0)}}) else{return nil}
+    let values=core.compactMap{Int($0)};guard values.count==core.count else{return nil}
+    // Four-component test revisions sort above the base and below the next patch.
+    numbers=values.count==3 ? values+[0]:values
     if halves.count==2 {
       guard let ids=identifiers(String(halves[1])),ids.allSatisfy({!$0.utf8.allSatisfy{(48...57).contains($0)} || $0.count==1 || $0.first != "0"}) else{return nil}
       prerelease=ids

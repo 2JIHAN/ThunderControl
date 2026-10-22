@@ -24,6 +24,7 @@ func runDisplayTransportTests() -> Int {
     let hello = try DisplayChannelCipher.hello(sending: true, nonce: s)
     verify(try DisplayChannelCipher.parseHello(hello, expectSender: true) == s)
     rejects { _ = try DisplayChannelCipher.parseHello(hello, expectSender: false) }
+    var v5Hello=hello;v5Hello[4]=53;rejects{_ = try DisplayChannelCipher.parseHello(v5Hello,expectSender:true)}
     var oldHello=hello;oldHello[4]=50;rejects{_ = try DisplayChannelCipher.parseHello(oldHello,expectSender:true)}
     for n in 0..<hello.count { rejects { _ = try DisplayChannelCipher.parseHello(Data(hello.prefix(n)), expectSender: true) } }
     rejects { _ = try DisplayChannelCipher.parseHello(hello + Data([0]), expectSender: true) }
@@ -88,6 +89,26 @@ func runDisplayTransportTests() -> Int {
     rejects { _ = try inputRX.open(sealedInput) }
     rejects { _ = try wrongInputDirection.open(sealedInput) }
   } catch { failures += 1 }
+  func integer(_ n: UInt64, bytes: Int = 8) -> Data { Data((0..<bytes).reversed().map { UInt8(truncatingIfNeeded: n >> ($0*8)) }) }
+  let video = Data(repeating: 2, count: 10)
+  let stamped = Data([6])+integer(0)+integer(100)+integer(110)+integer(150)+video
+  do {
+    let frame = try DisplayStreamFrame(stamped)
+    verify(frame.capture == 100 && frame.encodeStart == 110 && frame.encodeEnd == 150 && frame.video == video)
+    verify(DisplayChannelCipher.allowedPayload(stamped, fromSender: true))
+    verify(!DisplayChannelCipher.allowedPayload(stamped, fromSender: false))
+    for n in 0..<stamped.count { rejects { _ = try DisplayStreamFrame(Data(stamped.prefix(n))) } }
+    rejects { _ = try DisplayStreamFrame(Data([6])+integer(0)+integer(200)+integer(100)+integer(150)+video) }
+    rejects { _ = try DisplayStreamFrame(Data([6])+integer(0)+integer(1)+integer(2)+integer(30_000_002)+video) }
+    let cursor = Data([7])+integer(0)+Data([1,0])+integer(500_000,bytes:4)+integer(1_000_000,bytes:4)
+    let point = try DisplayCursorMetadata(cursor); verify(point.visible && point.x == 0.5 && point.y == 1)
+    verify(DisplayChannelCipher.allowedPayload(cursor, fromSender: true))
+    verify(!DisplayChannelCipher.allowedPayload(cursor, fromSender: false))
+    for n in 0..<cursor.count {rejects {_ = try DisplayCursorMetadata(Data(cursor.prefix(n)))}}
+    for index in [9,10] {var invalid=cursor;invalid[index]=255;rejects {_ = try DisplayCursorMetadata(invalid)}}
+    rejects {_ = try DisplayCursorMetadata(cursor+Data([0]))}
+    rejects {_ = try DisplayCursorMetadata(Data([7])+integer(0)+Data([1,0])+integer(1_000_001,bytes:4)+integer(0,bytes:4))}
+  } catch {failures += 1}
   let local=UUID().uuidString,peer=UUID().uuidString,other=UUID().uuidString
   if let pair=LayoutDevicePair(localID:local,peerID:peer) {verify(displayPeerBindingMatches(expected:pair,local:local,peer:peer));verify(!displayPeerBindingMatches(expected:pair,local:local,peer:other));verify(!displayPeerBindingMatches(expected:pair,local:peer,peer:local));verify(!displayPeerBindingMatches(expected:pair,local:local,peer:"invalid"))}else{verify(false)}
   print("Display transport offline crypto/framing tests: \(failures == 0 ? "PASS" : "FAIL"); no sockets, Keychain, capture, or input")

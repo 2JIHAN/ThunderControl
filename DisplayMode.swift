@@ -130,7 +130,10 @@ struct OwnedDisplayMonitor {
       guard let self,self.active,self.epoch==token else{return}
       guard self.safe else{self.stop(message:TCText("Screen transmission stopped because the session's safety state changed."));return}
       guard !sending else{self.stop(message:TCText("Received data not allowed on the video-only channel."));return}
-      if data.first==2 {
+      if data.first==7 {
+        do {try self.viewer?.acceptCursor(data)} catch {self.stop(message:TCText("Invalid screen video frame."))};return
+      }
+      if data.first==2 || data.first==6 {
         do {guard let viewer=self.viewer else{throw DisplayVideoError.decoderFailed};try viewer.accept(data);self.receivedFirstFrame=true;self.receivedVideo+=1}
         catch{self.stop(message:TCText("Could not decode incoming video. This video error is separate from the input connection."))}
       }
@@ -228,7 +231,7 @@ struct OwnedDisplayMonitor {
             self.captureVirtualPlacement(now:ProcessInfo.processInfo.systemUptime)
             self.report(TCText("Both connections active: MacBook → Mac mini input maintained / Mac mini → MacBook screen transmission"))
           }
-        } else {guard payload.first==2 else{throw Failure("Unexpected helper packet")}}
+        } else {guard payload.first==6 || payload.first==7 else{throw Failure("Unexpected helper packet")}}
         do {guard let t else{throw Failure("Video transport retired")};try t.send(payload)}
         catch {deliveryFailed=true;DispatchQueue.main.async{guard let self,self.active,self.epoch==token else{return};self.stop(message:TCText("Video connection ended. Cleaning up the display while keeping the input connection."))}}
       }}catch{DispatchQueue.main.async{guard let self,self.active,self.epoch==token else{return};self.stop(message:TCText("Screen transmission stopped because the video helper or extended display setup failed."))}}

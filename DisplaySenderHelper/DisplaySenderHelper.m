@@ -471,6 +471,39 @@ typedef struct {uint64_t next;bool ready[2];uint64_t sequence[2];} EncodedOrderW
 static EncodedOrderWindow outputOrder={0};
 static NSData *pendingEncoded[2];
 static pthread_mutex_t outputMutex=PTHREAD_MUTEX_INITIALIZER;
+static void AppendU64(NSMutableData *data,uint64_t n){n=CFSwapInt64HostToBig(n);[data appendBytes:&n length:8];}
+// Public read-only APIs, sampled on MAIN. No event tap, Accessibility request,
+// cursor warp, hide/unhide, or input ownership change. Unknown shapes use arrow.
+static void PublishCursor(void){
+  static uint64_t sequence=0;static double sampled=0;double now=Now();
+  if(now-sampled<1.0/60.0)return;sampled=now;
+  if(sequence==UINT64_MAX)Fail("cursor sequence exhausted");
+  BOOL visible=NO;uint8_t shape=0;uint32_t x=0,y=0;uint64_t sampledEpoch=atomic_load(&reconfigEpoch);
+  if(SessionSafe() && CanSubmitFrame() && atomic_load(&topologyArmed)){
+    uint64_t topologyBefore=atomic_load(&reconfigEpoch);
+    CGEventRef event=CGEventCreate(NULL);
+    if(event){CGPoint p=CGEventGetLocation(event);CFRelease(event);CGRect b=CGDisplayBounds(ownedID);
+      if(isfinite(p.x)&&isfinite(p.y)&&b.size.width>0&&b.size.height>0&&CGRectContainsPoint(b,p)){
+        visible=YES;x=(uint32_t)llround((p.x-b.origin.x)/b.size.width*1000000);y=(uint32_t)llround((p.y-b.origin.y)/b.size.height*1000000);
+        NSCursor *cursor=NSCursor.currentSystemCursor;
+        if([cursor isEqual:NSCursor.IBeamCursor])shape=1;
+        else if([cursor isEqual:NSCursor.crosshairCursor])shape=2;
+        else if([cursor isEqual:NSCursor.pointingHandCursor])shape=3;
+        else if([cursor isEqual:NSCursor.closedHandCursor])shape=4;
+        if(topologyBefore!=atomic_load(&reconfigEpoch)||!CanSubmitFrame()){visible=NO;shape=0;x=0;y=0;}
+      }
+    }
+  }
+  uint8_t kind=7,v=visible?1:0;NSMutableData *packet=[NSMutableData dataWithBytes:&kind length:1];AppendU64(packet,sequence++);
+  [packet appendBytes:&v length:1];[packet appendBytes:&shape length:1];x=CFSwapInt32HostToBig(x);y=CFSwapInt32HostToBig(y);[packet appendBytes:&x length:4];[packet appendBytes:&y length:4];
+  pthread_mutex_lock(&outputMutex);
+  // A video writer may have held this lock while topology/session changed.
+  // Never emit a formerly-visible cursor based on the pre-lock proof.
+  if(sampledEpoch!=atomic_load(&reconfigEpoch)||!SessionSafe()||!CanSubmitFrame()){
+    uint8_t hidden[10]={0};[packet replaceBytesInRange:NSMakeRange(9,10) withBytes:hidden];
+  }
+  Output(packet);pthread_mutex_unlock(&outputMutex);
+}
 static uint64_t submittedSequence=0;
 typedef struct {double started,capturedAt;uint64_t sequence,captureSequence;} EncodeTicket;
 static BOOL OrderAccept(EncodedOrderWindow *order,uint64_t sequence,unsigned slots){
@@ -517,12 +550,17 @@ static void Encoded(void *ctx,void *source,OSStatus status,VTEncodeInfoFlags fla
     const uint8_t *sps=NULL,*pps=NULL;size_t sn=0,pn=0,count=0;int header=0;
     if(!fmt || CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt,0,&sps,&sn,&count,&header)!=noErr || header!=4 || count<2 || CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt,1,&pps,&pn,NULL,NULL)!=noErr || !sn||!pn||sn>UINT16_MAX||pn>UINT16_MAX)Fail("encoder parameters");
     CMBlockBufferRef block=CMSampleBufferGetDataBuffer(sample);size_t n=block?CMBlockBufferGetDataLength(block):0;
-    if(!n||n>MaxPayload-5-sn-pn)Fail("encoded size");
+    if(!n||n>MaxPayload-38-sn-pn)Fail("encoded size");
     uint8_t kind=2;NSMutableData *packet=[NSMutableData dataWithBytes:&kind length:1];
     uint16_t size=CFSwapInt16HostToBig((uint16_t)sn);[packet appendBytes:&size length:2];[packet appendBytes:sps length:sn];
     size=CFSwapInt16HostToBig((uint16_t)pn);[packet appendBytes:&size length:2];[packet appendBytes:pps length:pn];
     NSUInteger offset=packet.length;[packet increaseLengthBy:n];
     if(CMBlockBufferCopyDataBytes(block,0,n,(uint8_t*)packet.mutableBytes+offset)!=noErr)Fail("encoded copy");
+    if(!synthetic){
+      uint8_t envelopeKind=6;NSMutableData *envelope=[NSMutableData dataWithBytes:&envelopeKind length:1];
+      AppendU64(envelope,ticket.sequence);AppendU64(envelope,(uint64_t)(ticket.capturedAt*1000000));
+      AppendU64(envelope,(uint64_t)(ticket.started*1000000));AppendU64(envelope,(uint64_t)(Now()*1000000));[envelope appendData:packet];packet=envelope;
+    }
     PublishEncoded(packet,ticket,NO);
   }
 }
@@ -1416,7 +1454,7 @@ int main(int argc,const char **argv){@autoreleasepool {
   if(!target||target.width!=StreamWidth||target.height!=StreamHeight || !OwnedSafe())Fail("owned capture display missing");
   fprintf(stderr,"Capture contract: logical=%ux%u physical=%ux%u scale=%u nativeCGVerified=yes SCDisplayPointsVerified=yes\n",StreamWidth,StreamHeight,PixelWidth,PixelHeight,negotiatedFormat->pixelScale);
   SCContentFilter *filter=[[SCContentFilter alloc]initWithDisplay:target excludingWindows:@[]];
-  SCStreamConfiguration *cfg=[SCStreamConfiguration new];cfg.width=PixelWidth;cfg.height=PixelHeight;cfg.pixelFormat=kCVPixelFormatType_32BGRA;cfg.minimumFrameInterval=CMTimeMake(1,targetFPS);cfg.queueDepth=3;cfg.showsCursor=YES;cfg.capturesAudio=NO;
+  SCStreamConfiguration *cfg=[SCStreamConfiguration new];cfg.width=PixelWidth;cfg.height=PixelHeight;cfg.pixelFormat=kCVPixelFormatType_32BGRA;cfg.minimumFrameInterval=CMTimeMake(1,targetFPS);cfg.queueDepth=3;cfg.showsCursor=NO;cfg.capturesAudio=NO;
   FrameSink * __attribute__((objc_precise_lifetime)) sink=[FrameSink new];SCStream * __attribute__((objc_precise_lifetime)) stream=[[SCStream alloc]initWithFilter:filter configuration:cfg delegate:sink];
   frameQueue=dispatch_queue_create("local.ThunderControl.display.capture",DISPATCH_QUEUE_SERIAL);NSError *error=nil;
   if(![stream addStreamOutput:sink type:SCStreamOutputTypeScreen sampleHandlerQueue:frameQueue error:&error])Fail("capture output setup");
@@ -1425,6 +1463,6 @@ int main(int argc,const char **argv){@autoreleasepool {
   // Capture filter identity is locked to ownedID: non-owned displays are never
   // reachable through this stream, regardless of OS topology transients.
   double firstFrameDeadline=Now()+8,encodeDeadline=0;unsigned lastProgress=0;
-  for(;;){Pump(.1);if(!atomic_load(&emitted)&&Now()>firstFrameDeadline)Fail("first frame timeout");if(atomic_load(&inFlight)){unsigned progress=atomic_load(&emitted)+atomic_load(&encoderDropped);if(!encodeDeadline||progress!=lastProgress){encodeDeadline=Now()+5;lastProgress=progress;}if(Now()>encodeDeadline)Fail("encode timeout");}else encodeDeadline=0;}
+  for(;;){Pump(1.0/60.0);PublishCursor();if(!atomic_load(&emitted)&&Now()>firstFrameDeadline)Fail("first frame timeout");if(atomic_load(&inFlight)){unsigned progress=atomic_load(&emitted)+atomic_load(&encoderDropped);if(!encodeDeadline||progress!=lastProgress){encodeDeadline=Now()+5;lastProgress=progress;}if(Now()>encodeDeadline)Fail("encode timeout");}else encodeDeadline=0;}
   (void)display;(void)stream;(void)sink;
 }}

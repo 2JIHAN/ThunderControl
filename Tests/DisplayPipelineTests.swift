@@ -60,6 +60,7 @@ private enum DisplayPipelineTestError: Error { case failed }
         delivered += 1
     }, failure: { decoderFailed = true })
     defer { decoder.clear() }
+    func integer(_ n: UInt64) -> Data { Data((0..<8).reversed().map { UInt8(truncatingIfNeeded:n >> ($0*8)) }) }
     while offset < bytes.count {
         try require(ProcessInfo.processInfo.systemUptime < deadline && offset + 4 <= bytes.count)
         let length = Int(bytes[offset..<(offset + 4)].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }); offset += 4
@@ -69,14 +70,17 @@ private enum DisplayPipelineTestError: Error { case failed }
             try require(plain == Data([1, 0, 0, 0, 0]))
             plain = Data([1, 0, 0, 0, 1]); identitySeen = true
         } else { try require(plain.first == 2 && frames < 8) }
+        if plain.first == 2 { plain = Data([6])+integer(UInt64(frames))+integer(100)+integer(110)+integer(150)+plain }
         try require(DisplayChannelCipher.allowedPayload(plain, fromSender: true))
         let encrypted = try sender.seal(plain)
         if firstEncrypted == nil { firstEncrypted = encrypted }
         let restored = try receiver.open(encrypted)
         try require(restored == plain && DisplayChannelCipher.allowedPayload(restored, fromSender: true))
         if restored.first == 1 { try require(restored == Data([1, 0, 0, 0, 1])); continue }
-        if firstVideo == nil { firstVideo = restored }
-        try decoder.accept(restored); frames += 1
+        let stamped = try DisplayStreamFrame(restored)
+        try require(stamped.sequence == UInt64(frames))
+        if firstVideo == nil { firstVideo = stamped.video }
+        try decoder.accept(stamped.video); frames += 1
         while delivered < frames && !decoderFailed && ProcessInfo.processInfo.systemUptime < deadline {
             RunLoop.current.run(until: Date().addingTimeInterval(0.005))
         }
@@ -122,5 +126,5 @@ private enum DisplayPipelineTestError: Error { case failed }
     let staleDeadline = min(deadline, ProcessInfo.processInfo.systemUptime + 0.15)
     while ProcessInfo.processInfo.systemUptime < staleDeadline { RunLoop.current.run(until: Date().addingTimeInterval(0.005)) }
     try require(staleCallbacks == 0 && ProcessInfo.processInfo.systemUptime < deadline)
-    print("PASS display offline pipeline: helper H264 -> AEAD -> negotiated-size decoder 8/8 nonempty frames; legacy input denied by v5 for both roles; codec memory-only 2/2; replay/tamper/direction rejected 6/6; stale callbacks=0; no real network/window/capture/input posting")
+    print("PASS display offline pipeline: helper H264 -> stamped v6 metadata -> AEAD -> negotiated-size decoder 8/8 nonempty frames; legacy input denied by v5 for both roles; codec memory-only 2/2; replay/tamper/direction rejected 6/6; stale callbacks=0; no real network/window/capture/input posting")
 }

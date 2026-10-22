@@ -1,3 +1,21 @@
+# Verification scope for v0.8.30.1 (build61)
+
+This is a test revision of0.8.30, not a physical two-Mac latency claim. Installed0.8.30 is left unchanged by this release task.
+
+## New display path
+
+TDSP6 and a separately authenticated exact capability echo isolate stamped-frame and cursor metadata. Cursor capture is disabled only in the owned virtual-display SCStream; a separate bounded enum/normalized-coordinate packet drives a viewer overlay. Invalid topology is checked again after the output mutex is acquired. Unknown custom shapes fall back to arrow. The source reports authoritative cursor state, not local prediction.
+
+Stage diagnostics never subtract different hosts' monotonic timestamps. Encoder callbacks, decoder cookies, and the latest presentation buffer are bounded. Socket-write duration is not delivery, renderer enqueue is not panel scanout. The viewer replaces readiness polling with an epoch-guarded callback that stops registration before drain.
+
+## Verification record
+
+Final Developer ID optimized build and full safe regression script passed. Updated version comparison passed299 fixtures. Actual hardware H.264 stamped-envelope/AEAD/production decode passed8/8 at1920x1080 and3024x1900 physical. Native accessory and regular fullscreen fixtures each decoded/submitted8 frames and checked separate cursor image/layer, coordinate movement, duplicate rejection, explicit hide,500ms expiry and close cleanup;703 colorful generated samples per screenshot. A new video frame while another key window held focus also passed. Source stage timestamps in these fixtures are synthetic, not performance measurements. Forced sustained renderer backpressure was not separately tested. One incorrect native CLI flag ordering was rejected before fixture startup; corrected calls passed. A read-only independent source review found and resolved cursor post-mutex topology staleness and protocol compatibility gaps, then found no further production blockers; this is not a security certification. Evidence is recorded in checks-0.8.30.1. No actual two-Mac trial, physical panel latency measurement, or real input posting is performed in these local fixtures. This release does not change the capture backend, H.264 quality policy or network transport family.
+
+Apple notarization for0.8.30.1 Accepted on2026-10-22. Stapled ticket, strict/deep signature and Gatekeeper Notarized Developer ID passed; original signed app-file hashes unchanged.
+
+## Historical 0.8.30 verification
+
 # Verification scope for v0.8.30 (build60)
 
 ## Viewer ownership and presentation

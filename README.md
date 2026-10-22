@@ -12,6 +12,10 @@ v0.8.30 (build 60) is an experimental prerelease for two Apple Silicon Macs. Dis
 
 *Connection diagram, not an app screenshot.*
 
+## Latency and cursor test build: 0.8.30.1
+
+[Experimental test release](https://github.com/2JIHAN/ThunderControl/releases/tag/v0.8.30.1). This is a separate opt-in test revision of 0.8.30, not a measured two-Mac latency guarantee. Both peers must use the test build for new display features. Keep 0.8.30 as a rollback. Existing 0.8.30 update checks accept only three-component versions and may not offer this four-component test tag; use the release link directly. No automatic installation or settings reset is introduced.
+
 ## Viewer and first-layout defaults (0.8.30)
 
 The authenticated video viewer can own the existing input relay focus instead of competing with an invisible key window. Video rendering no longer waits for native full-screen completion or keyboard focus. Local generated-video AppKit tests passed full-screen entry with both normal and hidden-Dock activation policies, and a new frame rendered while another window held focus. Actual two-Mac behavior still needs field verification.

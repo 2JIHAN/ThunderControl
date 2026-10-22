@@ -2,7 +2,7 @@ import Foundation
 import CryptoKit
 import Darwin
 
-// Dedicated v5 video protocol. A bounded format proposal and exact echo are
+// Dedicated v6 video protocol. A bounded format proposal and exact echo are
 // exchanged only after trust confirmation, before streaming. No input packets,
 // new enrollment, PIN, fallback interface, or plaintext format are accepted.
 enum DisplayTransportError: Error { case invalid, stopped, unavailable }
@@ -14,7 +14,7 @@ struct DisplayChannelCipher {
   let direction: UInt32
   private(set) var sequence: UInt64 = 0
   init(root: SymmetricKey, senderNonce: String, receiverNonce: String, senderToReceiver: Bool) {
-    let domain = Data("ThunderControl/display/v5".utf8)
+    let domain = Data("ThunderControl/display/v6".utf8)
     binding = Data(SHA256.hash(data: domain + Data((senderNonce + receiverNonce).utf8)))
     direction = senderToReceiver ? 1 : 2
     key = HKDF<SHA256>.deriveKey(inputKeyMaterial: root, salt: binding,
@@ -48,28 +48,30 @@ struct DisplayChannelCipher {
     guard !data.isEmpty, data.count <= maximumPayload else { return false }
     switch data.first {
     case 1: return data.count == 5 && data.dropFirst().contains(where: { $0 != 0 })
+    case 6: return (try? DisplayStreamFrame(data)) != nil
+    case 7: return (try? DisplayCursorMetadata(data)) != nil
     case 2: return data.count >= 10 // Codec parses parameter sets and NAL bounds before decoding.
     default: return false
     }
   }
   static func validInputPayload(_ data: Data) -> Bool {
-    false // v5 is video-only. Existing authenticated Relay owns ALL input.
+    false // v6 is video-only. Existing authenticated Relay owns ALL input.
   }
   static func allowedPayload(_ data: Data, fromSender: Bool) -> Bool {
     fromSender && validPayload(data)
   }
   static func hello(sending: Bool, nonce: String) throws -> Data {
     guard UUID(uuidString: nonce)?.uuidString == nonce else { throw DisplayTransportError.invalid }
-    return Data("TDSP5".utf8) + Data([sending ? 1 : 2]) + Data(nonce.utf8)
+    return Data("TDSP6".utf8) + Data([sending ? 1 : 2]) + Data(nonce.utf8)
   }
   static func parseHello(_ data: Data, expectSender: Bool) throws -> String {
-    guard data.count == 42, data.prefix(5) == Data("TDSP5".utf8), data[data.startIndex + 5] == (expectSender ? 1 : 2),
+    guard data.count == 42, data.prefix(5) == Data("TDSP6".utf8), data[data.startIndex + 5] == (expectSender ? 1 : 2),
       let nonce = String(data: data.suffix(36), encoding: .utf8), UUID(uuidString: nonce)?.uuidString == nonce
     else { throw DisplayTransportError.invalid }
     return nonce
   }
   static func confirmation(sending: Bool) -> Data {
-    Data([3]) + Data((sending ? "ThunderControl/display/v5/source" : "ThunderControl/display/v5/viewer").utf8)
+    Data([3]) + Data((sending ? "ThunderControl/display/v6/source" : "ThunderControl/display/v6/viewer").utf8)
   }
 }
 
@@ -232,7 +234,7 @@ private final class DisplayTransportRun {
     txLock.lock(); defer { txLock.unlock() }
     state.lock(); let sock = socket; let ready = authenticated; state.unlock()
     guard !context.cancelled, let socket = sock, !requireAuthentication || ready, var cipher = outgoing else { throw DisplayTransportError.stopped }
-    if data.first == 1 || data.first == 2 {
+    if data.first == 1 || data.first == 2 || data.first == 6 || data.first == 7 {
       guard sending, DisplayChannelCipher.validPayload(data),
         data.first == 1 ? !sentDisplayIdentity : sentDisplayIdentity else { throw DisplayTransportError.invalid }
       if data.first == 1 { sentDisplayIdentity = true }
@@ -243,7 +245,11 @@ private final class DisplayTransportRun {
       guard !sending, DisplayChannelCipher.validInputPayload(data) else { throw DisplayTransportError.invalid }
     }
     let frame = try cipher.seal(data); outgoing = cipher
+    let writeStarted = ProcessInfo.processInfo.systemUptime
     try displayWriteFrame(socket.fd, frame)
+    if data.first == 6, let measured = try? DisplayStreamFrame(data), measured.sequence % 120 == 0 {
+      displayStageLog("Display source socketWriteMs=\((ProcessInfo.processInfo.systemUptime-writeStarted)*1000); deliveryNotMeasured=true")
+    }
   }
 }
 
@@ -406,6 +412,11 @@ final class DisplayTransport: @unchecked Sendable {
     let agreedFormat = try displayNegotiateVideoFormat(sending: run.sending, viewerFormat: run.viewerFormat,
       send: { try run.transmit($0, requireAuthentication: false) },
       receive: { try incoming.open(displayReadFrame(fd, maximum: 64)) })
+    // Separate exact authenticated capability echo. Old peers fail closed before
+    // onAuthenticated creates a display/helper; the input Relay is untouched.
+    let capabilities = Data([8]) + Data("TC/display/stages-cursor/1".utf8)
+    try run.transmit(capabilities, requireAuthentication: false)
+    guard try incoming.open(displayReadFrame(fd, maximum: 64)) == capabilities else { throw DisplayTransportError.invalid }
     guard isCurrent(run) else { throw DisplayTransportError.stopped }
     run.state.lock(); run.authenticated = true; run.lastRX = ProcessInfo.processInfo.systemUptime; run.state.unlock()
     run.timer(interval: 1, queue: DispatchQueue(label: "ThunderControl.display.heartbeat")) { [weak self, weak run] in
@@ -437,9 +448,17 @@ final class DisplayTransport: @unchecked Sendable {
         guard payload.first == 1 ? !receivedDisplayIdentity : receivedDisplayIdentity else { throw DisplayTransportError.invalid }
         if payload.first == 1 { receivedDisplayIdentity = true }
       }
-      // v5 delivers video only. Raw Relay is the single input owner.
+      // v6 delivers video and cursor metadata only. Raw Relay is the single input owner.
       // No frame dispatch backlog: next network read waits for main's acceptance.
-      DispatchQueue.main.sync { if self.isCurrent(run) { self.onPayload?(payload) } }
+      let receivedAt = ProcessInfo.processInfo.systemUptime
+      DispatchQueue.main.sync {
+        if self.isCurrent(run) {
+          if payload.first == 6, let measured = try? DisplayStreamFrame(payload), measured.sequence % 120 == 0 {
+            displayStageLog("Display receiver authenticatedReadToMainMs=\((ProcessInfo.processInfo.systemUptime-receivedAt)*1000); oneWayNetworkMs=unknown")
+          }
+          self.onPayload?(payload)
+        }
+      }
     }
   }
 }
