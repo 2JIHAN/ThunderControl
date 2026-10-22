@@ -6,6 +6,7 @@ import CryptoKit
 func runDesktopSystemGestureTests()->Int {
   var failures=0,checks=0
   func check(_ value:Bool,_ note:String){checks+=1;if !value{failures+=1;fputs("DesktopSystemGesture: "+note+"\n",stderr)}}
+  check(Relay.verifyDockFocusReturnForTests(),"actual source focus-return lifecycle")
   let session=UUID().uuidString,token=UUID().uuidString,stream=UUID().uuidString
   let map=ReceiverDesktop(revision:7,mainID:11,displays:[
     ReceiverDisplay(id:11,bounds:CGRect(x:0,y:0,width:1920,height:1080)),
@@ -87,8 +88,48 @@ func runDesktopSystemGestureTests()->Int {
   receiver.prepareDesktopSystemGestureForTests(map:map,point:p,token:token)
   var wrong=bound;wrong.desktopGestureTargetID=11
   receiver.receive(wrong);check(posted.count==3,"actual wrong target rejected")
+  // Production matching cancel terminates only its already-posted stream.
+  // Builder/post hooks observe output, never deliver native OS input.
+  receiver.receive(bound)
+  var changePacket=bound
+  changePacket.dock=DockGestureDescriptor(motion:2,phase:2,progress:-0.25,velocityX:0,velocityY:-1)
+  receiver.receive(changePacket)
+  let beforeStaleCancel=posted.count
+  receiver.receive(Wire(kind:"cancel",session:session,sequence:2,token:UUID().uuidString))
+  check(posted.count==beforeStaleCancel,"stale token cannot cancel an active native stream")
+  let beforeCancel=posted.count
+  receiver.receive(Wire(kind:"cancel",session:session,sequence:2,token:token))
+  check(posted.count==beforeCancel+1 && built.last?.phase==8 && built.last?.progress==0.25 && built.last?.velocityX==0 && built.last?.velocityY==0 && posted.last==p,"matching cancel emits one bound canonical terminal")
+  receiver.receive(Wire(kind:"cancel",session:session,sequence:3,token:token))
+  changePacket.dock=DockGestureDescriptor(motion:2,phase:4,progress:-0.25,velocityX:0,velocityY:0)
+  receiver.receive(changePacket)
+  check(posted.count==beforeCancel+1,"duplicate cancel and old terminal cannot continue")
+  let freshToken=UUID().uuidString
+  receiver.prepareDesktopSystemGestureForTests(map:map,point:p,token:freshToken)
+  var fresh=bound;fresh.token=freshToken
+  for phase in [1,2,4] {fresh.dock=DockGestureDescriptor(motion:2,phase:phase,progress:0.1,velocityX:0,velocityY:0);receiver.receive(fresh)}
+  check(posted.count==beforeCancel+4 && posted.suffix(4).allSatisfy{$0==p},"fresh full stream stays on virtual target after cleanup")
+  receiver.prepareDesktopSystemGestureForTests(map:map,point:p,token:token)
+  receiver.receive(bound)
+  let beforeUnsafe=posted.count
+  receiver.desktopSystemGesturePermissionForTests={false}
+  receiver.receive(Wire(kind:"cancel",session:session,sequence:4,token:token))
+  check(posted.count==beforeUnsafe,"permission loss never manufactures cleanup output")
+  receiver.desktopSystemGesturePermissionForTests={true}
+  receiver.prepareDesktopSystemGestureForTests(map:map,point:p,token:token)
+  receiver.receive(bound)
+  let beforeEpochCancel=posted.count
   receiver.desktopBeforeGateForTests={epoch+=1}
-  receiver.receive(bound);check(posted.count==3,"actual epoch change blocks output at final gate")
+  receiver.receive(Wire(kind:"cancel",session:session,sequence:5,token:token))
+  check(posted.count==beforeEpochCancel,"epoch change before cleanup output fails closed")
+  receiver.desktopBeforeGateForTests=nil
+  receiver.prepareDesktopSystemGestureForTests(map:map,point:p,token:token)
+  receiver.receive(bound)
+  let beforeChangedMap=posted.count
+  let changedMap=ReceiverDesktop(revision:8,mainID:11,displays:[ReceiverDisplay(id:11,bounds:CGRect(x:0,y:0,width:1920,height:1080))])
+  receiver.desktopMapReadForTests={_,_ in changedMap}
+  receiver.receive(Wire(kind:"cancel",session:session,sequence:6,token:token))
+  check(posted.count==beforeChangedMap,"removed virtual target never receives cleanup")
   receiver.desktopBeforeGateForTests=nil
   receiver.contextForTests?.cancel(reason:"DesktopSystemGesture memory fixture end")
   print("Desktop system gesture routing: \(checks) checks, \(failures) failures; no input/window/network/keychain")

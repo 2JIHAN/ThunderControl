@@ -1338,11 +1338,11 @@ final class Relay {
     DispatchQueue.main.async { [weak self] in
       guard let self,self.generation==g,self.pendingForegroundToken==token else{return}
       guard self.handoff.phase == .pending,self.handoff.token==token else{return}
-      guard self.currentSessionBlockReason(forceRefresh:true)==nil,self.localKeys.isEmpty,self.localButtons.isEmpty,self.localFlags.isEmpty else{self.forceLocal();self.status("Handoff cancelled: input/session changed");return}
+      guard self.currentSessionBlockReason(forceRefresh:true)==nil,self.localKeys.isEmpty,self.localButtons.isEmpty,self.localFlags.isEmpty,!self.dockLocalActive,self.dockOrphanMotion==nil else{self.forceLocal();self.status("Handoff cancelled: input/session changed");return}
       guard NSApp.isActive,self.sourceOwnershipConfirmed?()==true else{self.retrySourceOwnership(token:token,generation:g);return}
       DispatchQueue.main.async { [weak self] in
         guard let self,self.generation==g,self.pendingForegroundToken==token,self.handoff.phase == .pending,self.handoff.token==token else{return}
-        guard self.currentSessionBlockReason(forceRefresh:true)==nil,self.localKeys.isEmpty,self.localButtons.isEmpty,self.localFlags.isEmpty,!physicalInputsHeld() else{self.forceLocal();self.status("Handoff cancelled: input/session changed on confirmation turn");return}
+        guard self.currentSessionBlockReason(forceRefresh:true)==nil,self.localKeys.isEmpty,self.localButtons.isEmpty,self.localFlags.isEmpty,!self.dockLocalActive,self.dockOrphanMotion==nil,!physicalInputsHeld() else{self.forceLocal();self.status("Handoff cancelled: input/session changed on confirmation turn");return}
         guard NSApp.isActive,self.sourceOwnershipConfirmed?()==true else{self.retrySourceOwnership(token:token,generation:g);return}
         self.sourceActivationCheckScheduled=false;self.pendingForegroundToken=nil
         if (self.multiDisplayDesktopCompatible ? self.sendDesktopBeginControl(token:token) : self.control("begin",token:token,edge:self.selectedEdge,y:self.handoff.offset)){self.status("Handoff: stable source foreground; begin queued without fixed dwell")}
@@ -1695,6 +1695,52 @@ final class Relay {
   private var dockReceiver=DockTransferState()
   private var dockSourceDesktopTarget:DesktopSystemGestureTarget?
   private var dockReceiverDesktopTarget:DesktopSystemGestureTarget?
+  private struct PostedDockStream {
+    let descriptor:DockGestureDescriptor
+    let point:CGPoint
+    let target:DesktopSystemGestureTarget
+    let token:String
+    let stream:String
+    let session:String
+    let generation:UUID
+  }
+  private var postedDockStream:PostedDockStream?
+  // Terminate only an already-posted canonical stream on its still-valid
+  // display. Never copy/replay opaque HID or manufacture a new begin.
+  private func cancelPostedDockStream() {
+    guard let posted=postedDockStream else{return}
+    postedDockStream=nil // consume before any gate can synchronously restore
+    guard !sender,authenticated,!lockedTransportOnly,inject,experimental,gestureCompatible,
+      multiDisplayDesktopCompatible,desktopSystemGestureCompatible,
+      posted.generation==generation,posted.session==session,
+      handoff.token==posted.token,acceptsToken(handoff,posted.token),dockReceiver.id==posted.stream,
+      dockReceiverDesktopTarget==posted.target,
+      (desktopSystemGesturePermissionForTests?() ?? AXIsProcessTrusted()),
+      currentSessionBlockReason(forceRefresh:true)==nil,displayBarrier==nil,
+      !receiverCursorLocalOverride,receiverActivationPendingToken==nil,
+      desktopReceiverPreviousPointer==posted.point,
+      let desktop=currentRoutingDesktop(),desktop.revision==posted.target.revision,
+      desktopHandoffRevision==posted.target.revision,
+      desktop.displays.contains(where:{$0.id==posted.target.displayID && ReceiverDesktop.has($0.bounds,posted.point)}) else {
+      status("System gesture cleanup skipped: active session, consent or exact display proof unavailable")
+      return
+    }
+    let terminal=DockGestureDescriptor(motion:posted.descriptor.motion,phase:8,progress:posted.descriptor.progress,velocityX:0,velocityY:0)
+    let projected=receiverDockProjection(terminal,invertVertical:invertVerticalSystemGestures,invertHorizontal:invertHorizontalSystemGestures)
+    guard let event=desktopSystemGestureBuildForTests?(projected) ?? makeDock(projected) else {
+      status("System gesture cleanup skipped: canonical cancellation builder unavailable");return
+    }
+    event.location=posted.point
+    guard finalDesktopInjectionGate(),dockReceiver.accept(terminal,id:posted.stream,now:ProcessInfo.processInfo.systemUptime) else {
+      status("System gesture cleanup skipped: final epoch or stream proof changed");return
+    }
+    event.timestamp=DispatchTime.now().uptimeNanoseconds
+    event.setIntegerValueField(.eventSourceUserData,value:marker)
+    if let post=desktopSystemGesturePostForTests {post(event)} else {event.post(tap:.cgSessionEventTap)}
+    gestureTrace.recordDock(stage:.rxPosted,descriptor:projected,stream:posted.stream,inverted:terminal.motion==1 ? invertHorizontalSystemGestures:invertVerticalSystemGestures)
+    status("System gesture canonical cancellation queued before local restore; native completion unverified")
+  }
+
   // Memory-only seams: never selected from network data or UI.
   var desktopSystemGesturePermissionForTests:(()->Bool)?
   var desktopSystemGestureBuildForTests:((DockGestureDescriptor)->CGEvent?)?
@@ -2040,7 +2086,7 @@ final class Relay {
     let result = cursorResources.restore(point: point, expectedLeaseID: lease)
     noteRecovery(result)
     if dockSource.active {dockOrphanMotion=dockSource.motion}
-    dockSource.reset();dockReceiver.reset();dockSourceDesktopTarget=nil;dockReceiverDesktopTarget=nil
+    dockSource.reset();dockReceiver.reset();dockSourceDesktopTarget=nil;dockReceiverDesktopTarget=nil;postedDockStream=nil
     sourceGesture.forceLocal();receiverAppGesture.reset()
     _ = handoff.reset()
     releaseInputs()
@@ -2252,6 +2298,74 @@ final class Relay {
     let g=subject.generation
     subject.receiveControl(Wire(kind:"active",session:UUID().uuidString,sequence:1,token:UUID().uuidString))
     return subject.context === ctx && !ctx.cancelled && subject.generation==g && subject.handoff.phase == .local
+  }
+  // Actual Dock routing + focus-loss + active-ack transitions; all outputs,
+  // cursor resources and platform observations are inert fixture replacements.
+  static func verifyDockFocusReturnForTests()->Bool {
+    final class Mock:CursorRecoveryAPI {
+      func associate(_ associated:Bool)->CGError{.success}
+      func hide(display:CGDirectDisplayID)->CGError{.success}
+      func show(display:CGDirectDisplayID)->CGError{.success}
+      func warp(to point:CGPoint)->CGError{.success}
+    }
+    let r=Relay(cursorResources:CursorRecoveryController(api:Mock()))
+    let socket=OwnedSocket(-1),ctx=SessionContext(OwnedSocket(-1))
+    defer{ctx.cancel(reason:"Dock focus return fixture end")}
+    r.context=ctx;r.connection=socket;r.key=SymmetricKey(size:.bits256)
+    r.sender=true;r.auto=true;r.experimental=true;r.gestureCompatible=true
+    r.receiverGestureAvailable=true;r.multiDisplayDesktopCompatible=true;r.desktopSystemGestureCompatible=true
+    r.safetyObserversInstalled=true;r.gestureTrace.setEnabled(false)
+    let topology=DisplayTopologySnapshot(mainID:1,activeIDs:[1],bounds:CGRect(x:0,y:0,width:1200,height:800))
+    r.topology=topology;r.desktopSourceReadForTests={topology}
+    var owned=true,frames=[Wire]()
+    r.desktopFocusSafetyForTests={owned};r.desktopPhysicalInputsForTests={false}
+    r.desktopEnqueueForTests={frames.append($0);return true}
+    let map=ReceiverDesktop(revision:7,mainID:11,displays:[ReceiverDisplay(id:11,bounds:CGRect(x:0,y:0,width:1920,height:1080)),ReceiverDisplay(id:99,bounds:CGRect(x:-1512,y:-945,width:1512,height:945))],virtualDisplayID:99)
+    let p=CGPoint(x:-400,y:-300),generation=r.generation
+    let begin=DockGestureDescriptor(motion:2,phase:1,progress:0,velocityX:0,velocityY:0)
+    let change=DockGestureDescriptor(motion:2,phase:2,progress:0.2,velocityX:0,velocityY:1)
+    let end=DockGestureDescriptor(motion:2,phase:4,progress:0.3,velocityX:0,velocityY:0)
+    func arm()->String {
+      let token=UUID().uuidString
+      r.desktopPrepareFocusForTests(map:map,origin:CGPoint(x:-2712,y:-945),point:p)
+      r.desktopPortal=map.portals(sourceRect:CGRect(x:-2712,y:-945,width:1200,height:800)).first
+      r.handoff.token=token
+      return token
+    }
+    let old=arm()
+    guard r.routeDockGesture(begin)==true,r.routeDockGesture(change)==true else{return false}
+    owned=false
+    // Reproduce viewer focus loss before the asynchronous callback, while
+    // app activation alone could still report true. Old stream is quarantined.
+    guard r.routeDockGesture(change)==true,r.handoff.phase == .local,r.auto,
+      r.dockOrphanMotion==2,r.context === ctx,!ctx.cancelled else{return false}
+    let count=frames.filter{$0.kind=="dock"}.count
+    _ = r.routeDockGesture(end)
+    guard r.dockOrphanMotion==nil else{return false}
+    // A local begin arriving during ownership negotiation must cancel the
+    // active acknowledgement, not turn its terminal into remote no-begin.
+    owned=true
+    let pending=arm();r.handoff.phase = .committed
+    _ = r.routeDockGesture(begin)
+    r.receiveControl(Wire(kind:"active",session:r.session,sequence:1,token:pending))
+    guard r.handoff.phase == .local,r.dockLocalActive,r.auto,!ctx.cancelled else{return false}
+    _ = r.routeDockGesture(end)
+    guard !r.dockLocalActive else{return false}
+    let fresh=arm()
+    // Delayed callbacks/packets from the previous ownership token cannot
+    // revoke the fresh stream; production token guards must sit them out.
+    r.receiveControl(Wire(kind:"cancel",session:r.session,sequence:2,token:old))
+    r.receiveControl(Wire(kind:"active",session:r.session,sequence:3,token:pending))
+    for descriptor in [begin,change,end] {guard r.routeDockGesture(descriptor)==true else{return false}}
+    let dock=frames.filter{$0.kind=="dock"}
+    guard dock.count==count+3,dock.suffix(3).allSatisfy({$0.token==fresh && $0.desktopGestureTargetID==99 && $0.desktopMapRevision==7}),
+      dock.suffix(3).compactMap({$0.dock?.phase}) == [1,2,4],!r.dockSource.active,
+      r.generation==generation,r.context === ctx,!ctx.cancelled else{return false}
+    r.experimental=false
+    let before=frames.count
+    guard r.routeDockGesture(begin)==true,frames.count==before else{return false}
+    print("PASS Relay Dock focus return: local-stream negotiation race, focus-loss orphan drain, fresh target/token rearm, stale controls and consent; no OS posting")
+    return true
   }
   static func verifyForegroundPausePreservesConnectionForTests() -> Bool {
     final class Mock: CursorRecoveryAPI {
@@ -3206,19 +3320,35 @@ final class Relay {
   }
   private func handleDockGesture(_ event:CGEvent)->Bool? {
     guard sender,let d=inspectDock(event) else{return nil}
+    return routeDockGesture(d)
+  }
+  // Shared by the native classifier and memory-only transition fixtures.
+  // No opaque payload replay and no test-specific routing decisions.
+  private func routeDockGesture(_ d:DockGestureDescriptor)->Bool? {
     if let orphan=dockOrphanMotion,orphan==d.motion {
       if d.phase==4 || d.phase==8 {dockOrphanMotion=nil;if context==nil {removeCaptureIfClean()}}
       return true
     }
     guard context != nil else{return nil}
     let remote=auto && handoff.phase == .remote
-    if !remote {dockLocalActive=d.phase==1 || d.phase==2;if d.phase==1 {status("Native DockSwipe recognized locally (no remote injection)")};return nil}
+    // A gesture that began while local stays local even if an asynchronous
+    // active acknowledgement races its terminal. Never reinterpret its tail
+    // as a fresh remote stream or stop the authenticated session for no begin.
+    if dockLocalActive || !remote {
+      if dockLocalActive && remote {pauseSourceForForegroundLoss()}
+      dockLocalActive=d.phase==1 || d.phase==2
+      if d.phase==1 {status("Native DockSwipe recognized locally (no remote injection)")}
+      return nil
+    }
+    // Window ownership can disappear while this app remains active (viewer
+    // resignation). Do not wait for the deferred ownership callback or timer.
+    guard desktopFocusSafety else {pauseSourceForForegroundLoss();return true}
     if multiDisplayDesktopCompatible && !desktopSystemGestureCompatible {
       if d.phase==1 {status(TCText("Multi-display system gestures require updated apps on both Macs and matching OS builds."))}
       guard dockSource.beginSource(d,now:ProcessInfo.processInfo.systemUptime) != nil else{return true}
       if d.phase==4 || d.phase==8 {finishReturnIfDrained()};return true
     }
-    guard experimental,gestureCompatible,receiverGestureAvailable else{return nil}
+    guard experimental,gestureCompatible,receiverGestureAvailable else{return true}
     guard let token=handoff.token else{return true}
     var packet=Wire(kind:"dock",session:session,sequence:0,token:token,dock:d)
     var target:DesktopSystemGestureTarget?
@@ -3235,7 +3365,7 @@ final class Relay {
       stop(reason:"System gesture lacks a valid begin; lift all fingers before retrying");return true
     }
     packet.dockID=id
-    guard enqueue(packet) else{stop(reason:lastEnqueueFailure);return true}
+    guard (desktopEnqueueForTests ?? enqueue)(packet) else{stop(reason:lastEnqueueFailure);return true}
     if d.phase==1 {dockSourceDesktopTarget=target}
     if d.phase==4 || d.phase==8 {dockSourceDesktopTarget=nil}
     if d.phase==1 {status("System gesture begin queued")}
@@ -3273,6 +3403,10 @@ final class Relay {
     gestureTrace.recordNative(stage:.rxBuilt,event:event,sequence:w.sequence,stream:id)
     if let post=desktopSystemGesturePostForTests {post(event)} else {event.post(tap:.cgSessionEventTap)}
     gestureTrace.recordDock(stage:.rxPosted,descriptor:projected,sequence:w.sequence,stream:id,inverted:d.motion==1 ? invertHorizontalSystemGestures:invertVerticalSystemGestures)
+    if let target,let destination,dockReceiver.active {
+      postedDockStream=PostedDockStream(descriptor:d,point:destination,target:target,token:token,stream:id,session:session,generation:generation)
+    } else {postedDockStream=nil}
+
     if d.phase==1 || d.phase==4 || d.phase==8 {status("System gesture phase delivered to session queue")}
   }
   func receiveControl(_ w: Wire) {
@@ -3360,7 +3494,7 @@ final class Relay {
         status("Display topology changed before commit")
         return
       }
-      guard auto, !sourceGesture.blockAuto, localKeys.isEmpty, localButtons.isEmpty, localFlags.isEmpty, !(desktopPhysicalInputsForTests?() ?? physicalInputsHeld())
+      guard auto, !sourceGesture.blockAuto, !dockLocalActive, dockOrphanMotion==nil, localKeys.isEmpty, localButtons.isEmpty, localFlags.isEmpty, !(desktopPhysicalInputsForTests?() ?? physicalInputsHeld())
       else {
         if handoff.token == token {
           _ = control("cancel", token: token)
@@ -3419,7 +3553,7 @@ final class Relay {
             + recoveryNotice)
         return
       }
-      guard auto, !sourceGesture.blockAuto, localKeys.isEmpty, localButtons.isEmpty, localFlags.isEmpty, !(desktopPhysicalInputsForTests?() ?? physicalInputsHeld())
+      guard auto, !sourceGesture.blockAuto, !dockLocalActive, dockOrphanMotion==nil, localKeys.isEmpty, localButtons.isEmpty, localFlags.isEmpty, !(desktopPhysicalInputsForTests?() ?? physicalInputsHeld())
       else {
         if handoff.token == token {
           _ = control("cancel", token: token)
@@ -3465,7 +3599,7 @@ final class Relay {
       if handoff.phase == .returning && handoff.token == token {let started=receiverReturnRequestAt;receiverReturnRequestAt=nil;restoreLocal();if let started {connectionLog("Return request-to-ACK ms=\((ProcessInfo.processInfo.systemUptime-started)*1000)")}}
     case "cancel":
       status("Handoff: cancel received")
-      if handoff.token == token { forceLocal() }
+      if handoff.token == token { cancelPostedDockStream();forceLocal() }
     default: break
     }
   }
