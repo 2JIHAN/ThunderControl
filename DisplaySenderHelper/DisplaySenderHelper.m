@@ -225,6 +225,16 @@ static BOOL SavedOriginValid(OwnedOrigin saved,VideoFormat format,const Placemen
   }
   return sharesEdge;
 }
+// Pure first-use default: owned virtual screen left of all physical bounds,
+// vertically centered on the original physical main. No physical writes.
+static OwnedOrigin DefaultOwnedOrigin(VideoFormat format,const PlacementPhysical *physical,uint32_t count,CGRect main){
+  OwnedOrigin none={NO,0,0};
+  if(!FormatValid(format)||!physical||!count||count>8||!PlacementRectSane(main))return none;
+  double left=INFINITY;for(uint32_t i=0;i<count;i++){if(!PlacementRectSane(physical[i].bounds))return none;left=fmin(left,CGRectGetMinX(physical[i].bounds));}
+  double x=left-format.width,y=round(CGRectGetMidY(main)-(double)format.height/2);
+  if(!isfinite(x)||!isfinite(y)||x!=round(x)||x<INT32_MIN||x>INT32_MAX||y<INT32_MIN||y>INT32_MAX)return none;
+  OwnedOrigin result={YES,(int32_t)x,(int32_t)y};return SavedOriginValid(result,format,physical,count)?result:none;
+}
 static int targetFPS=60;
 static pid_t parentPID=0;
 static double latencies[1024],frameAges[1024];
@@ -972,6 +982,18 @@ static int SelfTest(void){
   CHECK(!SavedOriginValid(adjacentOrigins[0],placementFormat,&invalidExtent,1),"origin-geometry-reject-physical-extent");
   CHECK(!SavedOriginValid(adjacentOrigins[0],(VideoFormat){641,480,1},&placementRoot,1),"origin-geometry-reject-invalid-mode");
 
+
+  OwnedOrigin defaultLeft=DefaultOwnedOrigin(placementFormat,&placementRoot,1,placementRoot.bounds);
+  CHECK(defaultLeft.requested && defaultLeft.x==-640 && defaultLeft.y==0,"default-owned-left-centered");
+  const PlacementPhysical oddRoot={CGRectMake(-1000,-501,1200,901),YES,YES};
+  OwnedOrigin oddLeft=DefaultOwnedOrigin((VideoFormat){800,600,2},&oddRoot,1,oddRoot.bounds);
+  CHECK(oddLeft.requested && oddLeft.x==-1800 && fabs((double)oddLeft.y+350.5)<=0.5,"default-owned-logical-negative-odd-center");
+  CHECK(!DefaultOwnedOrigin(placementFormat,&inactiveRoot,1,inactiveRoot.bounds).requested,"default-owned-no-inactive-anchor");
+  const PlacementPhysical staggered[]={placementRoot,{CGRectMake(-640,2000,640,480),YES,YES}};
+  CHECK(!DefaultOwnedOrigin(placementFormat,staggered,2,placementRoot.bounds).requested,"default-owned-staggered-no-valid-portal");
+  const PlacementPhysical edgeRoot={CGRectMake(-1000000,0,640,480),YES,YES};
+  CHECK(!DefaultOwnedOrigin(placementFormat,&edgeRoot,1,edgeRoot.bounds).requested,"default-owned-bounded-overflow-reject");
+
   // Bounded invalid-owned window: 0 -> never fatal; <=5s -> non-fatal; >5s fatal.
   CHECK(!BoundedInvalidFatal(0,0),"invalid-never-when-zero");
   CHECK(!BoundedInvalidFatal(100,100),"invalid-non-fatal-same-time");
@@ -1179,9 +1201,14 @@ int main(int argc,const char **argv){@autoreleasepool {
   // Early lifecycle contract line: parent reads stderr via launchHelper and
   // logs each line. State the bounded contract as counts/booleans only; no
   // display IDs, origins, counts of specific displays or geometry are logged.
-  fprintf(stderr,"Bounded display helper 0.8.29: startupHiDPIModePhase=postDetach ownedModeTxn=ownedOnly physicalBaselineBounded=yes preservesPhysicalSettings=yes reassertPrecreateOnlyInOwnStartupTxn=yes postStartPhysicalReplay=no setupScope=session ownedResolutionSessionFixed=yes ownedNonMirroredRequired=yes reconfigFatal=no newFrameSubmissionSuspendedDuringInvalid=yes encodedOwnedFramesInFlightEmitted=yes capturesPhysicalOtherDisplay=no rollsBackUserGeometryOnExit=no\n");
+  fprintf(stderr,"Bounded display helper 0.8.30: startupHiDPIModePhase=postDetach ownedModeTxn=ownedOnly physicalBaselineBounded=yes preservesPhysicalSettings=yes reassertPrecreateOnlyInOwnStartupTxn=yes postStartPhysicalReplay=no setupScope=session ownedResolutionSessionFixed=yes ownedNonMirroredRequired=yes reconfigFatal=no newFrameSubmissionSuspendedDuringInvalid=yes encodedOwnedFramesInFlightEmitted=yes capturesPhysicalOtherDisplay=no rollsBackUserGeometryOnExit=no\n");
   StartWatchdog();
   if(!BaselineSupported())Fail("unsupported physical display baseline");
+  PlacementPhysical placementPhysical[8];
+  for(uint32_t i=0;i<baselineCount;i++)placementPhysical[i]=(PlacementPhysical){baseline[i].bounds,baseline[i].active,baseline[i].mirror==kCGNullDirectDisplay};
+  const BOOL savedOriginApplied=SavedOriginValid(savedOrigin,sessionFormat,placementPhysical,baselineCount);
+  const OwnedOrigin ownedOrigin=savedOriginApplied?savedOrigin:DefaultOwnedOrigin(sessionFormat,placementPhysical,baselineCount,originalBounds);
+  if(!ownedOrigin.requested)Fail("no safe default owned display placement");
   [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];[NSApp finishLaunching];
   void (^stop)(NSNotification*)=^(NSNotification *note){(void)note;Fail("session notification");};
   [NSWorkspace.sharedWorkspace.notificationCenter addObserverForName:NSWorkspaceWillSleepNotification object:nil queue:nil usingBlock:stop];
@@ -1229,11 +1256,8 @@ int main(int argc,const char **argv){@autoreleasepool {
   if(negotiatedFormat->pixelScale==2)OwnedHiDPIDiagnostic("before_detach",NO);
   // Validate only against authoritative PRE-CREATE baseline geometry. The
   // exact-set creation gate above remains mandatory; stale saved placement
-  // merely falls back to the original default and never writes physical modes.
-  PlacementPhysical placementPhysical[8];
-  for(uint32_t i=0;i<baselineCount;i++)placementPhysical[i]=(PlacementPhysical){
-    baseline[i].bounds,baseline[i].active,baseline[i].mirror==kCGNullDirectDisplay};
-  const BOOL savedOriginApplied=SavedOriginValid(savedOrigin,sessionFormat,placementPhysical,baselineCount);
+  // falls back to the safe centered-left default and never writes physical modes.
+  // Placement was validated against the pre-create snapshot before creation.
   // First startup transaction. 0.8.19 proven path, generalized to multiple
   // pre-create roots. No physical mode writes (OS restores modes once mirror group
   // roots are restored; mode writes on inactive aliases are rejected).
@@ -1241,7 +1265,7 @@ int main(int argc,const char **argv){@autoreleasepool {
   //   S2. origin for every pre-create ROOT at its pre-create bounds.origin
   //   S3. mirrorOf(baseline[i].mirror) for every pre-create ALIAS
   //   S4. owned mirrorOf(NULL)
-  //   S5. owned validated saved origin, otherwise outside originalUnion
+  //   S5. owned validated saved origin, otherwise centered left default
   //   S6. CGComplete
   // No hardcoded mirror-to-main policy; alias root targets come from the
   // captured baseline[i].mirror as-is. Stage + CGError are logged on
@@ -1266,7 +1290,7 @@ int main(int argc,const char **argv){@autoreleasepool {
     ce=CGConfigureDisplayMirrorOfDisplay(config,ownedID,kCGNullDirectDisplay);
   }
   if(ce==kCGErrorSuccess){stage="S5:ownedOrigin";
-    int32_t ox=savedOriginApplied?savedOrigin.x:(int32_t)CGRectGetMaxX(originalUnion),oy=savedOriginApplied?savedOrigin.y:(int32_t)originalUnion.origin.y;
+    int32_t ox=ownedOrigin.x,oy=ownedOrigin.y;
     ce=CGConfigureDisplayOrigin(config,ownedID,ox,oy);
   }
   if(ce!=kCGErrorSuccess){fprintf(stderr,"Display sender configure failure stage=%s cgErrorCode=%d\n",stage,ce);CGCancelDisplayConfiguration(config);Fail("owned+baseline configuration");}
@@ -1322,7 +1346,7 @@ int main(int argc,const char **argv){@autoreleasepool {
           else {
             CGError modeError=CGConfigureDisplayWithDisplayMode(modeConfig,ownedID,requested,NULL);
             if(modeError==kCGErrorSuccess){
-              int32_t ox=savedOriginApplied?savedOrigin.x:(int32_t)CGRectGetMaxX(originalUnion),oy=savedOriginApplied?savedOrigin.y:(int32_t)originalUnion.origin.y;
+              int32_t ox=ownedOrigin.x,oy=ownedOrigin.y;
               modeError=CGConfigureDisplayOrigin(modeConfig,ownedID,ox,oy);
             }
             if(modeError!=kCGErrorSuccess){CGCancelDisplayConfiguration(modeConfig);postFail="owned HiDPI configuration";}

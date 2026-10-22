@@ -1605,8 +1605,8 @@ final class Relay {
   }
   /// Sender-side map adoption. Rejects decode errors, invalid maps, stale
   /// revisions, or oversized payloads. On the first authenticated map, tries
-  /// to restore a saved per-pair placement; otherwise snaps to the right edge
-  /// of the main receiver display. Mapped geometry changes anchor the current
+  /// to restore a saved per-pair placement; otherwise attaches left of the virtual display
+  /// (or physical main before the virtual exists), vertically centered. Mapped geometry changes anchor the current
   /// origin without automatically persisting a new placement.
   private func adoptReceiverDesktopFromPeer(_ data:Data) {
     guard sender,authenticated,multiDisplayDesktopCompatible,!data.isEmpty,data.count<=8192 else{return}
@@ -1636,14 +1636,14 @@ final class Relay {
       if let pair=layoutDevicePair,let saved=savedDesktopPlacements.restored(for:pair,sourceSize:size,desktop:decoded) {
         restored=saved
       } else {
-        restored=decoded.defaultSourceOrigin(size:size,preferRight:true)
+        restored=decoded.defaultSourceOrigin(size:size)
       }
       if let p=restored,let accepted=decoded.snappedSourceOrigin(proposed:p,size:size) {
         sourceOrigin=accepted
       } else {
         sourceOrigin=nil
       }
-    } else if geometryChanged, let origin=sourceOrigin {
+    } else if geometryChanged {
       // Actual receiver geometry change. Prefer the per-pair saved anchor+
       // tangent-offset restore (the store relativises against stable identity
       // so an OS main or origin change does not silently switch the user's
@@ -1652,8 +1652,17 @@ final class Relay {
       // absolute origin still has a portal, keep it; otherwise snap defensively.
       if let pair=layoutDevicePair,let saved=savedDesktopPlacements.restored(for:pair,sourceSize:size,desktop:decoded) {
         sourceOrigin=saved
-      } else if decoded.portals(sourceRect:CGRect(origin:origin,size:size)).isEmpty {
-        sourceOrigin=decoded.snappedSourceOrigin(proposed:origin,size:size) ?? decoded.defaultSourceOrigin(size:size,preferRight:true)
+      } else if sourceOrigin == nil {
+        // Physical-only maps may have no valid left attachment yet. Once the
+        // virtual appears, retry only the defined collision-free default.
+        sourceOrigin=decoded.defaultSourceOrigin(size:size)
+      } else if let origin=sourceOrigin,previous?.virtualDisplayID == nil,decoded.virtualDisplayID != nil,
+        previous?.defaultSourceOrigin(size:size) == origin {
+        // The initial physical-only default must move left of the newly-owned
+        // virtual display. Saved/manual anchors above always take precedence.
+        sourceOrigin=decoded.defaultSourceOrigin(size:size)
+      } else if let origin=sourceOrigin,decoded.portals(sourceRect:CGRect(origin:origin,size:size)).isEmpty {
+        sourceOrigin=decoded.snappedSourceOrigin(proposed:origin,size:size) ?? decoded.defaultSourceOrigin(size:size)
       }
     }
     if previous != receiverDesktop || sourceOrigin != nil {onReceiverDesktopChanged?()}
@@ -3666,6 +3675,7 @@ final class PasteCommandProbe: NSResponder {
   override convenience init() {self.init(relay:Relay())}
   init(relay:Relay,sharingStore:SavedSharingStateStore=SavedSharingStateStore()) {self.relay=relay;self.sharingStore=sharingStore;super.init()}
   lazy var ownershipHUD = SourceOwnershipHUD()
+  lazy var sourceWindowOwnership = SourceWindowOwnershipCoordinator(hud:ownershipHUD)
   lazy var receiverCursorFocus=ReceiverCursorFocusController(window:window)
   let discovery = BridgeDiscovery()
   var discoveredPeers: [BridgePeer] = []
@@ -4194,7 +4204,9 @@ final class PasteCommandProbe: NSResponder {
     relay.cancelReceiverCursorFocus = {[weak self] in self?.receiverCursorFocus.release()}
     relay.receiverLocalUserIntent = {[weak self] in self?.receiverCursorFocus.localUserOverride()}
     relay.prepareReceiverInputTarget = {[weak self] stillNeeded,completion in guard let self else{completion(false);return};self.receiverCursorFocus.prepareInputTarget(stillNeeded:stillNeeded,completion:completion)}
-    relay.sourceOwnershipConfirmed = { [weak self] in self?.ownershipHUD.hasStableOwnership == true }
+    sourceWindowOwnership.eligibleViewer = {[weak self] in self?.displayMode.sourceOwnershipViewer}
+    displayMode.viewerOwnershipLost = {[weak self] in guard let self,self.relay.inputIsSender,self.relay.isTransferring || self.relay.forward else{return};self.relay.pauseSourceForForegroundLoss()}
+    relay.sourceOwnershipConfirmed = { [weak self] in self?.sourceWindowOwnership.hasStableOwnership == true }
     relay.requestSourceActivation = { [weak self] in
       guard let self, self.relay.sessionAllowed else { return }
       let front = NSWorkspace.shared.frontmostApplication
@@ -4203,7 +4215,7 @@ final class PasteCommandProbe: NSResponder {
       }
       self.sourceWindowWasVisible = self.sourceWindowWasVisible || self.window.isVisible
       self.window.endEditing(for:nil);self.window.makeFirstResponder(nil)
-      self.ownershipHUD.present { [weak self] in self?.stop() }
+      self.sourceWindowOwnership.request { [weak self] in self?.stop() }
       self.window.orderOut(nil)
     }
     relay.restoreSourceActivation = { [weak self] in
@@ -4211,10 +4223,10 @@ final class PasteCommandProbe: NSResponder {
       let old = self.previousForeground
       let mayRestorePreviousApp=NSApp.isActive
       self.previousForeground = nil
-      self.ownershipHUD.dismiss()
+      let keepsViewer=self.sourceWindowOwnership.restore()
       if self.sourceWindowWasVisible && self.connectedWindowVisibility.mayRestoreMainWindow { self.window.orderBack(nil) }
       self.sourceWindowWasVisible = false
-      if mayRestorePreviousApp && self.relay.sessionAllowed,let old,!old.isTerminated {
+      if !keepsViewer && mayRestorePreviousApp && self.relay.sessionAllowed,let old,!old.isTerminated {
         self.sourceReturnFocusStarted=ProcessInfo.processInfo.systemUptime;self.sourceReturnFocusTarget=old.processIdentifier
         old.activate(options:[.activateIgnoringOtherApps])
       }
@@ -5101,7 +5113,7 @@ struct ThunderControlMain {
       guard !NSRunningApplication.runningApplications(withBundleIdentifier:"local.experimental.ThunderControl").contains(where:{$0.processIdentifier != ProcessInfo.processInfo.processIdentifier}) else{fputs("Quit ThunderControl before resetting its local state.\n",stderr);exit(2)}
       do {try TrustedPairingStore.resetForFirstSetup();print("ThunderControl-only trust and preferences reset. Other apps untouched.")}catch{fputs("ThunderControl local reset failed; no permission reset performed.\n",stderr);exit(1)}
     } else if let i=CommandLine.arguments.firstIndex(of:"--display-viewer-ui-test") ?? CommandLine.arguments.firstIndex(of:"--display-viewer-fullscreen-test"),i+2<CommandLine.arguments.count {
-      let application=NSApplication.shared;application.setActivationPolicy(.regular)
+      let application=NSApplication.shared;application.setActivationPolicy(CommandLine.arguments.contains("--accessory-viewer") ? .accessory:.regular)
       Task { @MainActor in
         do {let format=try displayTestFormat(arguments:CommandLine.arguments,after:i+3);try await runDisplayViewerUITests(path:CommandLine.arguments[i+1],output:CommandLine.arguments[i+2],format:format,startsFullScreen:CommandLine.arguments[i]=="--display-viewer-fullscreen-test");exit(0)}
         catch {fputs("Display native viewer test failed: \(error)\n",stderr);exit(1)}

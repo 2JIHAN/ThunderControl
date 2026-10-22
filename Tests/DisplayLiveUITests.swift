@@ -98,10 +98,12 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     let outputURL = URL(fileURLWithPath: output).standardizedFileURL
     try displayLiveRequire(output.hasPrefix("/") && outputURL.pathExtension.lowercased() == "png" && outputURL.resolvingSymlinksInPath().path == outputURL.path && !FileManager.default.fileExists(atPath: outputURL.path), "new non-symlink PNG output required")
     let application = NSApplication.shared
+    let previousApp=NSWorkspace.shared.frontmostApplication
+    defer {if let previousApp,previousApp.processIdentifier != ProcessInfo.processInfo.processIdentifier,!previousApp.isTerminated {previousApp.activate(options:[])}}
     try displayLiveRequire(application.delegate == nil && application.windows.allSatisfy { !$0.isVisible }, "standalone test application required")
     // AppKit may return false when the process is already regular. Actual
     // active/key visible-window state is required below instead.
-    _ = application.setActivationPolicy(.regular)
+    _ = application.setActivationPolicy(CommandLine.arguments.contains("--accessory-viewer") ? .accessory:.regular)
     if !application.isRunning {application.finishLaunching()}
     let initialWindowIDs = Set(application.windows.map(\.windowNumber))
     let viewer = DisplayViewer(format: format, targetScreen: targetScreen);viewer.acceptsViewerInput=false;viewer.startsFullScreen=startsFullScreen
@@ -109,7 +111,10 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     viewer.onFocusGained = { gained += 1 }
     viewer.onFocusLost = { lost += 1 }
     viewer.onClose = { closed += 1 }
-    let deadline = ProcessInfo.processInfo.systemUptime + 20
+    let ownershipFixture=App(relay:Relay())
+    ownershipFixture.sourceWindowOwnership.eligibleViewer={viewer.isOpenForSourceOwnership ? viewer:nil}
+    viewer.onWillClose={ownershipFixture.relay.pauseSourceForForegroundLoss()}
+    let deadline = ProcessInfo.processInfo.systemUptime + 25
     func pump(until condition: () -> Bool, maximum: Double,stage:String) async throws {
         let end = min(deadline, ProcessInfo.processInfo.systemUptime + maximum)
         while !condition() && ProcessInfo.processInfo.systemUptime < end {
@@ -123,12 +128,15 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     try displayLiveRequire(created.count == 1, "exact own viewer window")
     let window = created[0]
     if startsFullScreen {
-        try displayLiveRequire(!viewer.isVideoPresentationReadyForTests && window.alphaValue == 0 && viewer.presentationStats.submitted == 0, "no decorated-window/video flash before native fullscreen confirmation")
+        try displayLiveRequire(viewer.isVideoPresentationReadyForTests && window.alphaValue == 1 && viewer.presentationStats.submitted == 0, "usable visible video surface before native fullscreen confirmation")
         viewer.show()
-        try displayLiveRequire(!viewer.isVideoPresentationReadyForTests && window.alphaValue == 0, "re-show while pending must not reveal window or issue another fullscreen toggle")
+        try displayLiveRequire(viewer.isVideoPresentationReadyForTests && window.alphaValue == 1, "re-show pending viewer stays visible without a second toggle")
     } else {
         try displayLiveRequire(viewer.isVideoPresentationReadyForTests && window.alphaValue == 1, "explicit windowed mode starts visibly without fullscreen wait")
     }
+    // Drive the same coordinator methods as production App callbacks. No input
+    // Relay is connected; these windows own only generated fixture pixels.
+    ownershipFixture.sourceWindowOwnership.request(stop:{})
     var enteredFullScreen = false
     let fullScreenObserver = NotificationCenter.default.addObserver(forName: NSWindow.didEnterFullScreenNotification, object: window, queue: .main) { _ in
         enteredFullScreen = true
@@ -137,13 +145,17 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     try displayLiveRequire(window.contentAspectRatio == format.size, "negotiated content aspect")
     if let targetScreen { try displayLiveRequire(targetScreen.visibleFrame.contains(window.frame), "preferred screen bounds") }
     if startsFullScreen {
-        try await pump(until: { enteredFullScreen && viewer.isFullScreenForTests }, maximum: 5, stage: "native fullscreen entry")
+        try await pump(until: { enteredFullScreen && viewer.isFullScreenForTests }, maximum: 10, stage: "native fullscreen entry")
         // Re-showing an existing viewer must not toggle it back out of fullscreen.
         viewer.show()
         try displayLiveRequire(viewer.isFullScreenForTests && viewer.isVideoPresentationReadyForTests && window.alphaValue == 1, "existing viewer remains fullscreen and visible only after confirmed entry")
     }
     try await pump(until: { window.isKeyWindow && application.isActive && gained > 0 }, maximum: 3,stage:"initial active key viewer")
-    for (index, packet) in frames.enumerated() {
+    try displayLiveRequire(ownershipFixture.sourceWindowOwnership.hasStableOwnership,"actual coordinator recognizes exact key viewer")
+    ownershipFixture.sourceWindowOwnership.request(stop:{})
+    try displayLiveRequire(window.isKeyWindow && ownershipFixture.sourceWindowOwnership.hasStableOwnership,"HUD must not steal viewer key ownership")
+    try displayLiveRequire(ownershipFixture.sourceWindowOwnership.restore() && window.isVisible,"local return keeps viewer visible")
+    for (index, packet) in frames.prefix(7).enumerated() {
         try displayLiveRequire(closed == 0, "viewer unexpectedly closed")
         try viewer.accept(packet)
         try await pump(until: { viewer.receivedFrameCount == index + 1 && viewer.presentationStats.submitted == UInt64(index + 1) }, maximum: 1,stage:"decode and submit frame \(index+1)")
@@ -155,9 +167,14 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     let gainsBefore = gained, lossesBefore = lost
     dummy.makeKeyAndOrderFront(nil)
     try await pump(until: { dummy.isKeyWindow && lost > lossesBefore }, maximum: 2,stage:"focus loss")
-    try displayLiveRequire(closed == 0 && viewer.receivedFrameCount == 8 && viewer.presentationStats.submitted == 8 && window.isVisible, "focus loss must preserve viewer/video")
+    try displayLiveRequire(closed == 0 && viewer.receivedFrameCount == 7 && viewer.presentationStats.submitted == 7 && window.isVisible, "focus loss must preserve viewer/video")
+    try displayLiveRequire(!ownershipFixture.sourceWindowOwnership.hasStableOwnership,"arbitrary dummy key window cannot own source input")
+    try viewer.accept(frames[7])
+    try await pump(until:{viewer.receivedFrameCount==8 && viewer.presentationStats.submitted==8},maximum:1,stage:"new video while viewer lacks key focus")
+    try displayLiveRequire(dummy.isKeyWindow,"video arrival must not steal keyboard focus")
     window.makeKeyAndOrderFront(nil)
-    try await pump(until: { window.isKeyWindow && gained > gainsBefore }, maximum: 2,stage:"focus return")
+    try await pump(until: { window.isKeyWindow && gained > gainsBefore }
+, maximum: 2,stage:"focus return")
     dummy.close()
     try displayLiveRequire(closed == 0 && viewer.receivedFrameCount == 8 && viewer.presentationStats.submitted == 8, "focus return must preserve video")
     // Let the WindowServer compositor consume the immediate sample before the
@@ -174,7 +191,10 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     try displayLiveRequire(capture.terminationStatus == 0, "own-window screencapture")
     let colorfulSamples = try displayLiveVerifyScreenshot(outputURL.path)
     try displayLiveRequire(closed == 0 && ProcessInfo.processInfo.systemUptime < deadline, "test final state")
-    print("PASS native viewer: fullscreen=\(viewer.isFullScreenForTests) decoded=8 submitted=8 colorfulSamples=\(colorfulSamples) focusLossCallbacks=\(lost) focusGainCallbacks=\(gained) unexpectedCloses=0; own-window generated-pattern screenshot only; no network, virtual display or input posting")
+    let wasFullscreen=viewer.isFullScreenForTests
+    viewer.close()
+    try displayLiveRequire(!ownershipFixture.sourceWindowOwnership.hasStableOwnership,"closed viewer cannot leave stale source ownership or activate HUD")
+    print("PASS native viewer: activationPolicy=\(application.activationPolicy().rawValue) coordinator=true fullscreen=\(wasFullscreen) decoded=8 submitted=8 colorfulSamples=\(colorfulSamples) focusLossCallbacks=\(lost) focusGainCallbacks=\(gained) expectedClose=1 newFrameWhileUnfocused=true; own-window generated-pattern screenshot only; no network, virtual display or input posting")
 }
 
 /// Pure lifecycle regression coverage: no AppKit activation, capture or input.
@@ -183,10 +203,10 @@ func displayViewerStartupLifecycleTests() throws {
     var startup = DisplayViewerStartup()
     try displayLiveRequire(!startup.mayPresentVideo, "idle viewer must not present video")
     startup.begin(fullScreen: true)
-    try displayLiveRequire(startup.isPending && !startup.mayPresentVideo, "fullscreen startup holds video")
+    try displayLiveRequire(startup.isPending && startup.mayPresentVideo, "fullscreen startup does not hold video")
     try displayLiveRequire(!startup.requestIfReady(windowReady: false), "wait for native key/active window readiness")
     try displayLiveRequire(startup.requestIfReady(windowReady: true), "ready window requests fullscreen once")
-    try displayLiveRequire(!startup.requestIfReady(windowReady: true) && !startup.mayPresentVideo, "in-flight transition must not toggle again or render")
+    try displayLiveRequire(!startup.requestIfReady(windowReady: true) && startup.mayPresentVideo, "in-flight transition renders without another toggle")
     startup.didEnterFullScreen()
     try displayLiveRequire(startup.mayPresentVideo && !startup.isPending && !startup.useWindowedFallback(), "confirmed entry cannot be downgraded by stale timeout")
     startup.close(); startup.didEnterFullScreen()

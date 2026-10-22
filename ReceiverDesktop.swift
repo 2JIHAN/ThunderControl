@@ -244,8 +244,25 @@ struct ReceiverDesktop: Codable, Equatable {
         return candidates.filter { !portals(sourceRect:CGRect(origin:$0,size:size)).isEmpty }.min {hypot($0.x-p.x,$0.y-p.y) < hypot($1.x-p.x,$1.y-p.y)}
     }
     func defaultSourceOrigin(size: CGSize, preferRight: Bool = false) -> CGPoint? {
-        guard valid, let main=displays.first(where:{$0.id == mainID}) else{return nil}
-        return snappedSourceOrigin(proposed:CGPoint(x:preferRight ? main.bounds.maxX : main.bounds.minX-size.width,y:main.bounds.midY-size.height/2),size:size)
+        guard valid,Self.sane(CGRect(origin:.zero,size:size)),let anchor=displays.first(where:{$0.id == virtualDisplayID}) ?? displays.first(where:{$0.id == mainID}) else{return nil}
+        let point=CGPoint(x:preferRight ? anchor.bounds.maxX : anchor.bounds.minX-size.width,y:anchor.bounds.midY-size.height/2)
+        if !portals(sourceRect:CGRect(origin:point,size:size)).isEmpty{return point}
+        // Saved virtual placement may occupy the right side. Preserve it and
+        // place source outside the whole map rather than leaving Auto unarmed.
+        if let left=displays.map({$0.bounds.minX}).min() {
+            let outside=CGPoint(x:left-size.width,y:point.y)
+            if !portals(sourceRect:CGRect(origin:outside,size:size)).isEmpty{return outside}
+        }
+        return snappedSourceOrigin(proposed:point,size:size)
+    }
+    /// Owned virtual screen only. Physical monitor coordinates remain untouched.
+    /// Integer OS origins round an odd-height center by at most half a point.
+    func defaultOwnedVirtualOrigin(size:CGSize)->CGPoint? {
+        guard valid,virtualDisplayID==nil,Self.sane(CGRect(origin:.zero,size:size)),
+          let main=displays.first(where:{$0.id==mainID}),let left=displays.map({$0.bounds.minX}).min() else{return nil}
+        let point=CGPoint(x:left-size.width,y:(main.bounds.midY-size.height/2).rounded(.toNearestOrAwayFromZero))
+        guard point.x.rounded()==point.x,point.y.rounded()==point.y else{return nil}
+        return portals(sourceRect:CGRect(origin:point,size:size)).isEmpty ? nil:point
     }
 }
 

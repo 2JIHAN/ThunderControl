@@ -1,5 +1,11 @@
 # Apple notarization
 
+## Published v0.8.30 download
+
+Apple notarization Accepted on 2026-10-22 (status code 0, Ready for distribution, no listed issues). The ticket is stapled and validated. Strict/deep code signature verification passed and Gatekeeper reports accepted, source=Notarized Developer ID. All signed app files remained unchanged after submission.
+
+Submission ID: `16ef6f20-909d-42a0-ad01-4075fd155688`. Release assets include ZIP checksums and NOTARIZATION.txt.
+
 ## Published v0.8.29 download
 
 Apple notarization Accepted on2026-10-22, status code0, Ready for distribution, no listed issues. The ticket is stapled and validated. Strict/deep signature verification passed and Gatekeeper reports accepted, source=Notarized Developer ID. All signed app files remained unchanged after submission.

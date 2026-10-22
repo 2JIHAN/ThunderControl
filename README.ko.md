@@ -4,13 +4,19 @@
 
 Thunderbolt로 두 Mac을 직접 연결하고, MacBook의 키보드와 트랙패드, 화면으로 Mac mini에서 작업하세요.
 
-**[Apple Silicon용 다운로드](https://github.com/2JIHAN/ThunderControl/releases/download/v0.8.29/ThunderControl-0.8.29-macOS-arm64.zip)** | [릴리스 안내와 체크섬](https://github.com/2JIHAN/ThunderControl/releases/tag/v0.8.29)
+**[Apple Silicon용 다운로드](https://github.com/2JIHAN/ThunderControl/releases/download/v0.8.30/ThunderControl-0.8.30-macOS-arm64.zip)** | [릴리스 안내와 체크섬](https://github.com/2JIHAN/ThunderControl/releases/tag/v0.8.30)
 
-v0.8.29(빌드 59)은 Apple Silicon Mac 두 대를 위한 실험용 사전 릴리스입니다. 화면 공유에는 macOS 14 이상이 필요합니다. 전체 빌드·메모리 회귀 테스트·Developer ID 엄격 서명 검증은 통과했습니다. 2026-10-22 Apple 공증을 받았고 공개 ZIP에 공증 티켓을 부착했습니다. 공개 파일을 다시 내려받아 체크섬, 엄격 서명 검증, 티켓과 Gatekeeper의 Notarized Developer ID 판정을 확인했습니다.
+v0.8.30(빌드 60)은 Apple Silicon Mac 두 대를 위한 실험용 사전 릴리스입니다. 화면 공유에는 macOS 14 이상이 필요합니다. 전체 빌드·메모리 회귀 테스트·Developer ID 엄격 서명 검증은 통과했습니다. 2026-10-22 Apple 공증을 받았고 공개 ZIP에 공증 티켓을 부착했습니다. 공개 파일을 다시 내려받아 체크섬, 엄격 서명 검증, 티켓과 Gatekeeper의 Notarized Developer ID 판정을 확인했습니다.
 
 ![MacBook의 키보드와 포인터 입력은 Mac mini로, Mac mini의 확장 화면은 Thunderbolt Bridge를 통해 MacBook으로 전달됩니다.](docs/assets/overview-ko.svg)
 
 *앱 스크린샷이 아닌 연결 개념도입니다.*
+
+## 뷰어와 첫 배치 기본값 (0.8.30)
+
+인증된 영상 뷰어가 기존 입력 연결의 포커스도 소유하도록 해 투명 창과 경쟁하지 않게 했습니다. 영상 표시는 전체화면 완료나 키보드 포커스를 기다리지 않습니다. 생성한 시험 영상으로 Dock 표시와 숨김 상태 모두 실제 전체화면 진입을 확인했고, 다른 창이 포커스를 가진 동안에도 새 프레임이 표시됐습니다. 실제 두 Mac 동작은 현장 확인이 필요합니다.
+
+저장된 배치가 없는 첫 연결의 기본 순서는 **송신 화면 → 수신 맥의 가상 확장 화면 → 수신 맥의 실제 모니터**이며 높이는 중앙 정렬입니다. 기존 송신 화면과 가상 화면의 저장 배치는 유지하고, 실제 모니터 배치는 바꾸지 않습니다.
 
 ## 공유 시작 문제 수정 (0.8.29)
 

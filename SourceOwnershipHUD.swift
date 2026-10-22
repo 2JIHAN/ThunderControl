@@ -22,3 +22,24 @@ import AppKit
   var hasStableOwnership:Bool {panel.isVisible && panel.isKeyWindow && NSApp.isActive && panel.alphaValue==0 && panel.ignoresMouseEvents}
   func dismiss(){panel.orderOut(nil)}
 }
+
+/// Only the authenticated display viewer or the dedicated HUD may own source
+/// input. A pending viewer is never replaced with a competing key HUD.
+@MainActor final class SourceWindowOwnershipCoordinator {
+  private let hud:SourceOwnershipHUD
+  var eligibleViewer:()->DisplayViewer? = {nil}
+  init(hud:SourceOwnershipHUD){self.hud=hud}
+  var hasStableOwnership:Bool {
+    if let viewer=eligibleViewer(){return viewer.hasStableSourceOwnership}
+    return hud.hasStableOwnership
+  }
+  func request(stop:@escaping()->Void) {
+    if let viewer=eligibleViewer(){hud.dismiss();viewer.requestSourceOwnership();return}
+    hud.present(stop:stop)
+  }
+  /// Keep the viewer ordered/fullscreen when input returns locally. Do not
+  /// activate it again or restore another app merely because a handoff ended.
+  @discardableResult func restore()->Bool {
+    hud.dismiss();return eligibleViewer() != nil
+  }
+}

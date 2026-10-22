@@ -4,13 +4,19 @@
 
 Use your MacBook's keyboard, trackpad and screen to work on your Mac mini over a direct Thunderbolt connection.
 
-**[Download for Apple Silicon](https://github.com/2JIHAN/ThunderControl/releases/download/v0.8.29/ThunderControl-0.8.29-macOS-arm64.zip)** | [Release notes and checksums](https://github.com/2JIHAN/ThunderControl/releases/tag/v0.8.29)
+**[Download for Apple Silicon](https://github.com/2JIHAN/ThunderControl/releases/download/v0.8.30/ThunderControl-0.8.30-macOS-arm64.zip)** | [Release notes and checksums](https://github.com/2JIHAN/ThunderControl/releases/tag/v0.8.30)
 
-v0.8.29 (build 59) is an experimental prerelease for two Apple Silicon Macs. Display sharing requires macOS 14 or later. The full build, memory-only regression suites and strict/deep Developer ID signature validation passed. Apple accepted notarization on 2026-10-22. The published ZIP contains the stapled ticket; checksum, strict/deep code signature, ticket validation and Gatekeeper Notarized Developer ID were verified again after downloading the public assets.
+v0.8.30 (build 60) is an experimental prerelease for two Apple Silicon Macs. Display sharing requires macOS 14 or later. The full build, memory-only regression suites and strict/deep Developer ID signature validation passed. Apple accepted notarization on 2026-10-22. The published ZIP contains the stapled ticket; checksum, strict/deep code signature, ticket validation and Gatekeeper Notarized Developer ID were verified again after downloading the public assets.
 
 ![MacBook sends keyboard and pointer input to Mac mini; Mac mini sends its extended display back over Thunderbolt Bridge.](docs/assets/overview-en.svg)
 
 *Connection diagram, not an app screenshot.*
+
+## Viewer and first-layout defaults (0.8.30)
+
+The authenticated video viewer can own the existing input relay focus instead of competing with an invisible key window. Video rendering no longer waits for native full-screen completion or keyboard focus. Local generated-video AppKit tests passed full-screen entry with both normal and hidden-Dock activation policies, and a new frame rendered while another window held focus. Actual two-Mac behavior still needs field verification.
+
+For pairs without saved placements: **Sender screen → Receiver virtual screen → Receiver physical monitor**, vertically center-aligned. Saved source/virtual/legacy placements are preserved. Physical monitor positions are not rearranged.
 
 ## Sharing startup fix (0.8.29)
 

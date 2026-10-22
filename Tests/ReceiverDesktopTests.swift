@@ -432,6 +432,33 @@ private func nativeReadNote() -> String {
     }
 }
 
+
+private func firstDefaultLayoutTests() {
+    let physical=mk(11,0,0,1920,1080)
+    let map=desktop(11,[physical])
+    let virtualSize=CGSize(width:1512,height:950),sourceSize=CGSize(width:1280,height:800)
+    let owned=map.defaultOwnedVirtualOrigin(size:virtualSize)
+    check(owned==CGPoint(x:-1512,y:65),"first virtual left of physical centered")
+    let virtual=mk(12,-1512,65,1512,950)
+    let extended=desktop(11,[physical,virtual],12,2)
+    let source=extended.defaultSourceOrigin(size:sourceSize)
+    check(source==CGPoint(x:-2792,y:140),"first sender left of virtual centered")
+    check(owned.map{$0.y+virtualSize.height/2}==physical.bounds.midY,"virtual/physical center match")
+    check(source.map{$0.y+sourceSize.height/2}==virtual.bounds.midY,"sender/virtual center match")
+    check(map.defaultSourceOrigin(size:sourceSize)==CGPoint(x:-1280,y:140),"pre-virtual source centered left of physical")
+    let negative=desktop(21,[mk(21,-1000,-501,1200,901)])
+    let odd=negative.defaultOwnedVirtualOrigin(size:CGSize(width:800,height:600))
+    check(odd==CGPoint(x:-1800,y:-351),"odd center rounded to integer negative origin")
+    check(odd.map{abs($0.y+300-negative.displays[0].bounds.midY)<=0.5}==true,"odd center at most half point error")
+    let blocked=desktop(1,[mk(1,0,0,640,480),mk(2,-640,2000,640,480)])
+    check(blocked.defaultOwnedVirtualOrigin(size:CGSize(width:640,height:480))==nil,"staggered leftmost without portal rejected")
+    check(map.defaultOwnedVirtualOrigin(size:CGSize(width:CGFloat.nan,height:600))==nil,"nonfinite owned size rejected")
+    check(extended.defaultOwnedVirtualOrigin(size:virtualSize)==nil,"physical-only map required for owned default")
+    let rightVirtual=desktop(11,[physical,mk(12,1920,65,1512,950)],12)
+    check(rightVirtual.defaultSourceOrigin(size:sourceSize)==CGPoint(x:-1280,y:140),"saved right virtual keeps valid source outside whole map")
+    check(map.displays==[physical],"default geometry never mutates physical map")
+}
+
 /// Returns the number of failing assertions. 0 means every assertion passed.
 /// Total assertions executed is written to stderr alongside each failure.
 @discardableResult
@@ -445,6 +472,7 @@ public func runReceiverDesktopTests() -> Int {
     movementTests()
     portalTests()
     portalBoundaryTests()
+    firstDefaultLayoutTests()
     _ = nativeReadNote()
     FileHandle.standardError.write(Data("ReceiverDesktopTests: \(_asserts) assertions, \(_fails.count) failures\n".utf8))
     for f in _fails { FileHandle.standardError.write(Data("FAIL: \(f)\n".utf8)) }

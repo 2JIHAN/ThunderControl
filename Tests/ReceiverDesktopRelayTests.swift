@@ -180,6 +180,63 @@ import CryptoKit
     check(fresh.receiverDesktop==beforeInvalid,"invalid payload leaves accepted desktop")
     check(callbackCount==callbackBeforeInvalid,"invalid payload does not fire callback")
 
+
+    // Actual default adoption: initial physical-only source origin migrates to
+    // the virtual-left edge when the owned display arrives, not an arbitrary snap.
+    do {
+        let defaultPair=LayoutDevicePair(localID:UUID().uuidString,peerID:UUID().uuidString)!
+        let staged=Relay(desktopPlacementStore:store)
+        staged.senderForTests=true;staged.connectionForTests=OwnedSocket(-1);staged.keyForTests=SymmetricKey(size:.bits256)
+        staged.multiDisplayDesktopCompatibleForTests=true;staged.layoutDevicePairForTests=defaultPair
+        staged.pendingInitialSourceOriginRestoreForTests=true
+        staged.topologyForTests=DisplayTopologySnapshot(mainID:1,activeIDs:[1],bounds:CGRect(x:0,y:0,width:1200,height:800))
+        staged.adoptReceiverDesktopPayloadForTests(try mapPayload(firstMap))
+        check(staged.sourceOrigin==CGPoint(x:-1200,y:140),"initial default source left centered")
+        let virt=ReceiverDisplay(id:12,bounds:CGRect(x:-1512,y:65,width:1512,height:950),stableIdentity:UUID().uuidString)
+        let full=ReceiverDesktop(revision:6,mainID:11,displays:[mainReceiverDisplay,virt],virtualDisplayID:12)
+        staged.adoptReceiverDesktopPayloadForTests(try mapPayload(full))
+        check(staged.sourceOrigin==CGPoint(x:-2712,y:140),"virtual arrival migrates unsaved default to virtual left")
+        check(store.restored(for:defaultPair,sourceSize:CGSize(width:1200,height:800),desktop:full)==nil,"automatic default adoption does not persist user source intent")
+        let manual=CGPoint(x:1920,y:140)
+        check(store.save(origin:manual,sourceSize:CGSize(width:1200,height:800),desktop:full,for:defaultPair),"save unrelated manual right attachment")
+        let changed=ReceiverDesktop(revision:7,mainID:11,displays:[mainReceiverDisplay,virt],virtualDisplayID:12)
+        staged.adoptReceiverDesktopPayloadForTests(try mapPayload(changed))
+        // Same geometry/revision update need not reapply an external preference;
+        // a new authenticated session proves saved placement wins over defaults.
+        let restoredRelay=Relay(desktopPlacementStore:store)
+        restoredRelay.senderForTests=true;restoredRelay.connectionForTests=OwnedSocket(-1);restoredRelay.keyForTests=SymmetricKey(size:.bits256)
+        restoredRelay.multiDisplayDesktopCompatibleForTests=true;restoredRelay.layoutDevicePairForTests=defaultPair
+        restoredRelay.pendingInitialSourceOriginRestoreForTests=true;restoredRelay.topologyForTests=staged.topologyForTests
+        restoredRelay.adoptReceiverDesktopPayloadForTests(try mapPayload(full))
+        check(restoredRelay.sourceOrigin==manual,"saved source placement wins over virtual-left default")
+
+        let blockedPair=LayoutDevicePair(localID:UUID().uuidString,peerID:UUID().uuidString)!
+        let blockedRelay=Relay(desktopPlacementStore:store)
+        blockedRelay.senderForTests=true;blockedRelay.connectionForTests=OwnedSocket(-1);blockedRelay.keyForTests=SymmetricKey(size:.bits256)
+        blockedRelay.multiDisplayDesktopCompatibleForTests=true;blockedRelay.layoutDevicePairForTests=blockedPair
+        blockedRelay.pendingInitialSourceOriginRestoreForTests=true;blockedRelay.topologyForTests=staged.topologyForTests
+        let p=ReceiverDisplay(id:31,bounds:CGRect(x:0,y:0,width:640,height:480)),l=ReceiverDisplay(id:32,bounds:CGRect(x:-640,y:0,width:640,height:480))
+        let blockedMap=ReceiverDesktop(revision:1,mainID:31,displays:[p,l])
+        blockedRelay.adoptReceiverDesktopPayloadForTests(try mapPayload(blockedMap))
+        check(blockedRelay.sourceOrigin==CGPoint(x:-1840,y:-160),"physical-only main obstruction uses safe outside-map default")
+        let newVirtual=ReceiverDisplay(id:33,bounds:CGRect(x:-1280,y:0,width:640,height:480))
+        blockedRelay.adoptReceiverDesktopPayloadForTests(try mapPayload(ReceiverDesktop(revision:2,mainID:31,displays:[p,l,newVirtual],virtualDisplayID:33)))
+        check(blockedRelay.sourceOrigin==CGPoint(x:-2480,y:-160),"virtual arrival moves outside-map default left of virtual")
+
+        let rightPair=LayoutDevicePair(localID:UUID().uuidString,peerID:UUID().uuidString)!
+        let rightRelay=Relay(desktopPlacementStore:store)
+        rightRelay.senderForTests=true;rightRelay.connectionForTests=OwnedSocket(-1);rightRelay.keyForTests=SymmetricKey(size:.bits256)
+        rightRelay.multiDisplayDesktopCompatibleForTests=true;rightRelay.layoutDevicePairForTests=rightPair
+        rightRelay.pendingInitialSourceOriginRestoreForTests=true;rightRelay.topologyForTests=staged.topologyForTests
+        let savedRightVirtual=ReceiverDisplay(id:12,bounds:CGRect(x:1920,y:65,width:1512,height:950),stableIdentity:UUID().uuidString)
+        let rightMap=ReceiverDesktop(revision:1,mainID:11,displays:[mainReceiverDisplay,savedRightVirtual],virtualDisplayID:12)
+        rightRelay.adoptReceiverDesktopPayloadForTests(try mapPayload(rightMap))
+        check(rightRelay.sourceOrigin==CGPoint(x:-1200,y:140),"saved right virtual without saved source still seeds usable origin")
+        check(rightRelay.sourceOrigin.map{!rightMap.portals(sourceRect:CGRect(origin:$0,size:CGSize(width:1200,height:800))).isEmpty}==true,"saved right virtual fallback has valid nonoverlapping portal")
+
+
+    } catch {failures+=1}
+
     print("Receiver desktop relay integration: \(checks) checks failures=\(failures); no input, network, capture or keychain effects")
     return failures
 }

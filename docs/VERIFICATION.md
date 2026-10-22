@@ -1,4 +1,22 @@
-# Verification scope for v0.8.29 (build59)
+# Verification scope for v0.8.30 (build60)
+
+## Viewer ownership and presentation
+
+The authenticated view-only display viewer may serve as source input ownership via a coordinator shared by production request/restore callbacks. The invisible HUD is used only when there is no eligible viewer. Arbitrary key windows are not accepted. Viewer closure/focus loss uses the existing local-return/input-drain path; no second viewer input-forwarding path is added.
+
+Video rendering is no longer gated on native full-screen completion or active keyboard ownership. The viewer stays usable while native readiness/entry are pending or fall back. Native readiness and entry have separate bounded deadlines, one request per viewer lifetime, and distinct diagnostic reasons. Focus lifecycle observation is independent of optional viewer-local input monitors.
+
+## First default layout
+
+Unsaved pairs default to Sender screen, Receiver owned virtual display and Receiver physical monitor from left to right with vertical centers aligned. Only owned virtual origins and the logical Sender map attachment change; physical monitor positions are not rearranged. A default Sender attachment moves from the physical-only map to the virtual-left edge when the virtual arrives. Saved per-pair and legacy source/virtual placements win; a saved right-side virtual retains a valid collision-free source fallback. Geometry fixtures passed288 assertions and the helper offline suite238 checks before the final combined build. No physical display configuration was changed by these fixtures.
+
+The final combined optimized Developer ID build and complete safe regressions passed: geometry 288 assertions, actual Relay map adoption 42, sharing lifecycle 44, localization 772, display preference 48 and updater policy 160, plus helper offline 238 and recovery/ownership/desktop-map/local PIN fixtures. English/Korean offscreen AppKit checks passed. The final binary entered native fullscreen under both regular and production accessory activation policies, recognized the exact viewer as input owner, rejected another key window, rendered a new eighth frame while that other window held focus, and rejected closed-viewer ownership. Screenshots contain generated video only; no user desktop was captured. Physical two-Mac input/video and real display reconfiguration were not exercised by these fixtures.
+
+Apple notarization Accepted on 2026-10-22 (status code 0, Ready for distribution, no listed issues). The ticket is stapled and validated. Strict/deep code signature verification passed and Gatekeeper reports accepted, source=Notarized Developer ID. All signed app files remained unchanged after submission.
+
+One earlier immediate windowed fixture after a full-screen test missed its3s activation bound; an isolated retry passed. Final combined regular/accessory full-screen tests both passed. Physical MacBook/two-Mac input/video behavior remains unverified by local fixtures. Do not treat the prior report's suspected focus conflict as a fully instrumented field root-cause determination.
+
+## Historical0.8.29 evidence
 
 ## Sharing startup regression
 

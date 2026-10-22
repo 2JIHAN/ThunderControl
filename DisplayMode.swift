@@ -66,6 +66,11 @@ struct OwnedDisplayMonitor {
   private(set) var active=false,cleaning=false
   var status:((String)->Void)?
   var userStopped:(()->Void)?
+  var viewerOwnershipLost:(()->Void)?
+  var sourceOwnershipViewer:DisplayViewer? {
+    guard active,!sending,authenticatedAt != nil,inputBindingValid?()==true,let viewer,viewer.isOpenForSourceOwnership else{return nil}
+    return viewer
+  }
   var sharingSending:Bool? {active ? sending:nil}
   var sessionPermitted:(()->Bool)?
   var inputBindingValid:(()->Bool)?
@@ -116,6 +121,8 @@ struct OwnedDisplayMonitor {
         let v=DisplayViewer(format:format,targetScreen:viewerTarget?.screen);v.acceptsViewerInput=false
         v.onUserClose={[weak self] in self?.userStopped?()}
         v.onClose={[weak self] in guard let self,self.epoch==token else{return};self.stop()}
+        v.onWillClose={[weak self] in self?.viewerOwnershipLost?()}
+        v.onFocusLost={[weak self] in self?.viewerOwnershipLost?()}
         self.viewer=v;v.show();self.report(TCText("Screen authentication complete. Using the existing MacBook → Mac mini input connection."))
       }
     }
@@ -182,7 +189,10 @@ struct OwnedDisplayMonitor {
       let physical=try? readReceiverDesktop(revision:1)
       let origin=physical.flatMap{virtualPlacementStore.restored(for:pair,size:videoFormat.size,physicalDesktop:$0)}
       placementSession=VirtualDisplayPlacementSession(pair:pair,requestedOrigin:origin,hadSaved:virtualPlacementStore.hasSaved(for:pair))
-      if let origin {arguments += ["--origin",String(Int(origin.x)),String(Int(origin.y))]}
+      // Keep requestedOrigin as the actual saved restore, so an obstructed old
+      // record is not overwritten merely because the default was used this run.
+      let requested=origin ?? physical?.defaultOwnedVirtualOrigin(size:videoFormat.size)
+      if let requested {arguments += ["--origin",String(Int(requested.x)),String(Int(requested.y))]}
     }
     let process=Process(),input=Pipe(),output=Pipe(),errors=Pipe();process.executableURL=url;process.arguments=arguments;process.standardInput=input;process.standardOutput=output;process.standardError=errors
     try process.run();helper=process;heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))

@@ -349,7 +349,7 @@ func displayVideoInitialContentRect(format: DisplayVideoFormat = .standard, visi
 struct DisplayViewerStartup {
     enum Phase: Equatable { case idle, waitingForWindow, enteringFullScreen, fullScreen, windowed, closed }
     private(set) var phase: Phase = .idle
-    var mayPresentVideo: Bool { phase == .fullScreen || phase == .windowed }
+    var mayPresentVideo: Bool { phase != .idle && phase != .closed }
     var isPending: Bool { phase == .waitingForWindow || phase == .enteringFullScreen }
     mutating func begin(fullScreen: Bool) { phase = fullScreen ? .waitingForWindow : .windowed }
     mutating func requestIfReady(windowReady: Bool) -> Bool {
@@ -378,9 +378,11 @@ struct DisplayViewerStartup {
     private var startup = DisplayViewerStartup()
     private var startupTimer: Timer?
     private var startupDeadline: TimeInterval = 0
+    private var entryDeadline: TimeInterval?
     var isVideoPresentationReadyForTests: Bool { startup.mayPresentVideo }
     var acceptsViewerInput=true
     var onClose: (() -> Void)?
+    var onWillClose: (() -> Void)?
     /// Only explicit native-window close or locally handled Escape, never codec teardown.
     var onUserClose: (() -> Void)?
     /// Synchronous MAIN-thread local event. Return true ONLY if accepted for remote
@@ -403,6 +405,18 @@ struct DisplayViewerStartup {
     private var closing = false
     private(set) var receivedFrameCount = 0
     var isFullScreenForTests: Bool { viewerWindow?.styleMask.contains(.fullScreen) == true }
+    var isOpenForSourceOwnership:Bool { !closing && viewerWindow != nil }
+    var hasStableSourceOwnership:Bool {
+        !closing && viewerWindow?.isVisible == true && viewerWindow?.isKeyWindow == true && NSApp.isActive
+    }
+    func requestSourceOwnership() {
+        guard !closing,let window=viewerWindow else{return}
+        if !window.isKeyWindow {window.makeKeyAndOrderFront(nil)}
+        if !NSApp.isActive {NSApp.activate(ignoringOtherApps:true)}
+    }
+    private func startupDiagnostic(_ reason:String,_ window:NSWindow) {
+        connectionLog("Viewer fullscreen reason=\(reason) phase=\(startup.phase) active=\(NSApp.isActive) key=\(window.isKeyWindow) visible=\(window.isVisible) fullscreen=\(window.styleMask.contains(.fullScreen))")
+    }
     func show() {
         if let viewerWindow { viewerWindow.makeKeyAndOrderFront(nil); return }
         guard format.valid else { return }
@@ -419,9 +433,8 @@ struct DisplayViewerStartup {
         window.escapeCloses=acceptsViewerInput
         window.title = TCText("Mac mini Extended Display")
         window.backgroundColor = .black; window.isReleasedWhenClosed = false
-        // Native fullscreen needs an ordered/key window; do not expose its small
-        // decorated startup frame, or submit video before the Space is ready.
-        window.alphaValue = startup.mayPresentVideo ? 1 : 0
+        // Keep video visible independently of native fullscreen/keyboard ownership.
+        window.alphaValue = 1
         window.acceptsMouseMovedEvents = true
         window.collectionBehavior = [.fullScreenPrimary]; window.contentMinSize = NSSize(width: min(320, content.width), height: min(320, content.width) * CGFloat(format.height) / CGFloat(format.width))
         window.contentAspectRatio = format.size
@@ -429,14 +442,15 @@ struct DisplayViewerStartup {
         view.autoresizingMask = [.width, .height]; view.wantsLayer = true
         view.layer?.backgroundColor = NSColor.black.cgColor
         window.contentView = view; window.delegate = self
-        surface = view; viewerWindow = window;if acceptsViewerInput{installLocalInputMonitor()}
+        surface = view; viewerWindow = window;installFocusObservers();if acceptsViewerInput{installLocalInputMonitor()}
         // Center the decorated frame on the preferred screen, not NSWindow.center().
         var frame = window.frame
         frame.origin = CGPoint(x: available.midX - frame.width / 2, y: available.midY - frame.height / 2)
         window.setFrame(frame, display: false); window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         if startsFullScreen {
-            startupDeadline = ProcessInfo.processInfo.systemUptime + 5
+            startupDeadline = ProcessInfo.processInfo.systemUptime + 5; entryDeadline=nil
+            startupDiagnostic("waiting-window",window)
             let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self, weak window] _ in
                 MainActor.assumeIsolated {
                     guard let self, let window, !self.closing, self.windowEpoch == epoch,
@@ -449,16 +463,22 @@ struct DisplayViewerStartup {
     }
     private func advanceFullScreenStartup(_ window: NSWindow) {
         guard startup.isPending else { return }
-        if ProcessInfo.processInfo.systemUptime >= startupDeadline {
-            finishFullScreenFallback(window); return
+        let now=ProcessInfo.processInfo.systemUptime
+        if let deadline=entryDeadline,now>=deadline {
+            finishFullScreenFallback(window,reason:"entry-timeout");return
+        }
+        if entryDeadline==nil,now>=startupDeadline {
+            finishFullScreenFallback(window,reason:"window-readiness-timeout");return
         }
         if startup.requestIfReady(windowReady: window.isVisible && window.isKeyWindow && NSApp.isActive) {
-            // Advance state before AppKit: delegate callbacks may be synchronous.
+            entryDeadline=now+8
+            startupDiagnostic("native-request",window)
             window.toggleFullScreen(nil)
         }
     }
-    private func finishFullScreenFallback(_ window: NSWindow) {
+    private func finishFullScreenFallback(_ window: NSWindow,reason:String) {
         guard startup.useWindowedFallback() else { return }
+        startupDiagnostic(reason,window)
         startupTimer?.invalidate(); startupTimer = nil
         window.alphaValue = 1
         window.title = TCText("Mac mini Extended Display") + " (" + TCText("Full screen unavailable; using a window") + ")"
@@ -468,13 +488,14 @@ struct DisplayViewerStartup {
     func windowDidEnterFullScreen(_ notification: Notification) {
         guard let window = notification.object as? NSWindow, window === viewerWindow, !closing else { return }
         startup.didEnterFullScreen()
+        startupDiagnostic("entered",window)
         startupTimer?.invalidate(); startupTimer = nil
         window.title = TCText("Mac mini Extended Display"); window.alphaValue = 1
         drainPresentation()
     }
     func windowDidFailToEnterFullScreen(_ window: NSWindow) {
         guard window === viewerWindow, !closing else { return }
-        finishFullScreenFallback(window)
+        finishFullScreenFallback(window,reason:"appkit-rejected")
     }
     func accept(_ payload: Data) throws {
         guard viewerWindow != nil, !closing else { throw DisplayVideoError.decoderFailed }
@@ -526,7 +547,7 @@ struct DisplayViewerStartup {
         }
     }
     func close() {
-        guard !closing else { return }; closing = true
+        guard !closing else { return }; onWillClose?(); closing = true
         startup.close(); startupTimer?.invalidate(); startupTimer = nil
         removeLocalInputMonitor(); reportFocusLost()
         clear()
@@ -541,6 +562,8 @@ struct DisplayViewerStartup {
         localInputMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
             guard let self else { return event }; return self.handleLocalInput(event)
         }
+    }
+    private func installFocusObservers() {
         let center = NotificationCenter.default
         center.addObserver(self, selector: #selector(appDidResignActive), name: NSApplication.didResignActiveNotification, object: NSApp)
         center.addObserver(self, selector: #selector(appDidBecomeActive), name: NSApplication.didBecomeActiveNotification, object: NSApp)
@@ -598,7 +621,7 @@ struct DisplayViewerStartup {
         }
     }
     func windowWillClose(_ notification: Notification) {
-        guard !closing else { return }; closing = true
+        guard notification.object as? NSWindow === viewerWindow,!closing else { return }; onWillClose?(); closing = true
         startup.close(); startupTimer?.invalidate(); startupTimer = nil
         removeLocalInputMonitor(); reportFocusLost()
         clear(); viewerWindow?.delegate = nil; viewerWindow = nil; surface = nil
