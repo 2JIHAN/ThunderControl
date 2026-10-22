@@ -48,7 +48,7 @@ struct DisplayChannelCipher {
     guard !data.isEmpty, data.count <= maximumPayload else { return false }
     switch data.first {
     case 1: return data.count == 5 && data.dropFirst().contains(where: { $0 != 0 })
-    case 6: return (try? DisplayStreamFrame(data)) != nil
+    case 6: return (try? DisplayStreamFrameHeader(data)) != nil
     case 7: return (try? DisplayCursorMetadata(data)) != nil
     case 2: return data.count >= 10 // Codec parses parameter sets and NAL bounds before decoding.
     default: return false
@@ -247,7 +247,7 @@ private final class DisplayTransportRun {
     let frame = try cipher.seal(data); outgoing = cipher
     let writeStarted = ProcessInfo.processInfo.systemUptime
     try displayWriteFrame(socket.fd, frame)
-    if data.first == 6, let measured = try? DisplayStreamFrame(data), measured.sequence % 120 == 0 {
+    if data.first == 6, let measured = try? DisplayStreamFrameHeader(data), measured.sequence % 120 == 0 {
       displayStageLog("Display source socketWriteMs=\((ProcessInfo.processInfo.systemUptime-writeStarted)*1000); deliveryNotMeasured=true")
     }
   }
@@ -430,6 +430,8 @@ final class DisplayTransport: @unchecked Sendable {
     }
     DispatchQueue.main.sync { if self.isCurrent(run) { self.onAuthenticated?(agreedFormat) } }
     var receivedDisplayIdentity = false
+    var frameReadCadence = DisplayCadenceStats()
+    var lastCadenceLog = ProcessInfo.processInfo.systemUptime
     while isCurrent(run) {
       let payload = try incoming.open(displayReadFrame(fd, maximum: run.sending ? 4096 + 24 : DisplayChannelCipher.maximumFrame))
       run.state.lock(); run.lastRX = ProcessInfo.processInfo.systemUptime; run.state.unlock()
@@ -451,9 +453,16 @@ final class DisplayTransport: @unchecked Sendable {
       // v6 delivers video and cursor metadata only. Raw Relay is the single input owner.
       // No frame dispatch backlog: next network read waits for main's acceptance.
       let receivedAt = ProcessInfo.processInfo.systemUptime
+      if payload.first == 6 {
+        frameReadCadence.observe(receivedAt)
+        if receivedAt - lastCadenceLog >= 2 {
+          lastCadenceLog = receivedAt
+          displayStageLog("Display cadence read: \(frameReadCadence.summary); contentMayBeIdle=true panelUnmeasured=true")
+        }
+      }
       DispatchQueue.main.sync {
         if self.isCurrent(run) {
-          if payload.first == 6, let measured = try? DisplayStreamFrame(payload), measured.sequence % 120 == 0 {
+          if payload.first == 6, let measured = try? DisplayStreamFrameHeader(payload), measured.sequence % 120 == 0 {
             displayStageLog("Display receiver authenticatedReadToMainMs=\((ProcessInfo.processInfo.systemUptime-receivedAt)*1000); oneWayNetworkMs=unknown")
           }
           self.onPayload?(payload)

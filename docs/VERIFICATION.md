@@ -1,3 +1,9 @@
+# Verification scope for v0.8.30.2 (build62)
+
+Preserves separate cursor and TDSP6 compatibility while removing video-body unwrap copies from transport validation/logging and bounding helper Pump by its actual remaining deadline. Adds fixed-memory per-frame cadence and distinct drop/replacement/readiness counters, normally logged at most every2sec. Gap counts may reflect idle content; renderer enqueue is not panel scanout. No codec/quality/capture-backend/inflight-policy changes. User settings are not reset; installation is a separate explicit action. Native readiness fixtures now assert already-ready/no-pending-buffer preconditions, exactly one callback, subsequent-pump stability and pending-close cleanup. Final DeveloperID build/full regression passed;100026 synthetic cadence checks;1080p/3024x1900 H264-AEAD-decoder8/8; native accessory/regular fullscreen each8decoded/submitted, source timings8/8, cursor checks, exactly one empty readiness callback, further-pump stability and pending-close late-callback cleanup passed. Final cancellation summary includes cancelled=1. Apple notarization Accepted on2026-10-22. The new stapled ticket, strict/deep signature and Gatekeeper Notarized Developer ID checks passed. All15 originally signed files remained unchanged; only the obsolete prior stapled ticket metadata was replaced. Future builds remove that metadata before compiling. Public-download and installation checks are recorded separately. Details: checks-0.8.30.2/. Real stutter improvement remains unverified.
+
+## Published0.8.30.1 verification history
+
 # Verification scope for v0.8.30.1 (build61)
 
 This is a test revision of0.8.30, not a physical two-Mac latency claim. Installed0.8.30 is left unchanged by this release task.

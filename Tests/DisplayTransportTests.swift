@@ -93,6 +93,44 @@ func runDisplayTransportTests() -> Int {
   let video = Data(repeating: 2, count: 10)
   let stamped = Data([6])+integer(0)+integer(100)+integer(110)+integer(150)+video
   do {
+    let header = try DisplayStreamFrameHeader(stamped)
+    verify(header.sequence == 0 && header.capture == 100 && header.encodeStart == 110 && header.encodeEnd == 150)
+    // Exact TDSP6 envelope bytes and decoder body remain unchanged.
+    verify(stamped.count == 43 && stamped[0] == 6 && stamped[33] == 2)
+    for n in 0..<stamped.count { rejects { _ = try DisplayStreamFrameHeader(Data(stamped.prefix(n))) } }
+    func envelope(_ kind: UInt8, _ capture: UInt64, _ start: UInt64, _ end: UInt64, _ body: Data) -> Data {
+      var packet = Data([kind]); packet.append(integer(0)); packet.append(integer(capture))
+      packet.append(integer(start)); packet.append(integer(end)); packet.append(body); return packet
+    }
+    let invalidEnvelopes: [Data] = [
+      envelope(5,100,110,150,video), envelope(6,0,110,150,video),
+      envelope(6,200,100,150,video), envelope(6,100,151,150,video),
+      envelope(6,1,2,30_000_002,video), envelope(6,100,110,150,Data(repeating: 3,count: 10))
+    ]
+    for invalid in invalidEnvelopes {
+      rejects { _ = try DisplayStreamFrameHeader(invalid) }
+      rejects { _ = try DisplayStreamFrame(invalid) }
+      verify(!DisplayChannelCipher.validPayload(invalid))
+    }
+    let exactDuration = Data([6])+integer(UInt64.max)+integer(1)+integer(1)+integer(30_000_001)+video
+    let durationHeader = try DisplayStreamFrameHeader(exactDuration)
+    verify(durationHeader.sequence == UInt64.max && durationHeader.encodeEnd-durationHeader.capture == 30_000_000)
+    let maxTimestamps = Data([6])+integer(120)+integer(UInt64.max)+integer(UInt64.max)+integer(UInt64.max)+video
+    verify(try DisplayStreamFrameHeader(maxTimestamps).encodeEnd == UInt64.max)
+    // Data slices may have a nonzero startIndex; header offsets remain relative.
+    let padded = Data([255])+stamped
+    let sliced = padded.dropFirst()
+    verify(sliced.startIndex != 0)
+    verify(try DisplayStreamFrameHeader(sliced).capture == 100)
+    verify(try DisplayStreamFrame(sliced).video == video)
+    var largest = stamped
+    largest.append(Data(repeating: 0,count: DisplayChannelCipher.maximumPayload-stamped.count))
+    verify(try DisplayStreamFrameHeader(largest).encodeEnd == 150)
+    verify(DisplayChannelCipher.validPayload(largest))
+    largest.append(0)
+    rejects { _ = try DisplayStreamFrameHeader(largest) }
+    rejects { _ = try DisplayStreamFrame(largest) }
+    verify(!DisplayChannelCipher.validPayload(largest))
     let frame = try DisplayStreamFrame(stamped)
     verify(frame.capture == 100 && frame.encodeStart == 110 && frame.encodeEnd == 150 && frame.video == video)
     verify(DisplayChannelCipher.allowedPayload(stamped, fromSender: true))

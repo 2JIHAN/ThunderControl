@@ -12,9 +12,11 @@ v0.8.30 (build 60) is an experimental prerelease for two Apple Silicon Macs. Dis
 
 *Connection diagram, not an app screenshot.*
 
-## Latency and cursor test build: 0.8.30.1
+## Cadence and overhead test build: 0.8.30.2
 
-[Experimental test release](https://github.com/2JIHAN/ThunderControl/releases/tag/v0.8.30.1). This is a separate opt-in test revision of 0.8.30, not a measured two-Mac latency guarantee. Both peers must use the test build for new display features. Keep 0.8.30 as a rollback. Existing 0.8.30 update checks accept only three-component versions and may not offer this four-component test tag; use the release link directly. No automatic installation or settings reset is introduced.
+[Experimental test release](https://github.com/2JIHAN/ThunderControl/releases/tag/v0.8.30.2). This revision keeps the separate cursor, avoids repeated video-body copies in transport validation/logging, fixes the helper runloop's unconditional 25ms wait, and adds constant-memory per-frame cadence and distinct drop/replacement/readiness diagnostics. Logs are aggregated, not written every frame. Actual two-Mac stutter improvement is not yet established.
+
+TDSP6 bytes and capabilities are unchanged from 0.8.30.1; this is not another display-protocol upgrade. Use 0.8.30.2 on the MacBook for the new receiver diagnostics. 0.8.30 is still incompatible with TDSP6 video. Keep the previous version for rollback. Existing 0.8.30 update checks ignore four-component test tags, so use the release link directly. No automatic installation or settings reset is introduced.
 
 ## Viewer and first-layout defaults (0.8.30)
 

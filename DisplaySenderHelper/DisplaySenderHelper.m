@@ -668,7 +668,22 @@ static BOOL API(void){
   NSDictionary *m=@{@"CGVirtualDisplayDescriptor":@[@"setVendorID:",@"setProductID:",@"setSerialNum:",@"setSerialNumber:",@"setName:",@"setMaxPixelsWide:",@"setMaxPixelsHigh:",@"setSizeInMillimeters:",@"setQueue:",@"setRedPrimary:",@"setGreenPrimary:",@"setBluePrimary:",@"setWhitePoint:"],@"CGVirtualDisplayMode":@[@"initWithWidth:height:refreshRate:"],@"CGVirtualDisplaySettings":@[@"setHiDPI:",@"setRotation:",@"setModes:"],@"CGVirtualDisplay":@[@"initWithDescriptor:",@"applySettings:",@"displayID"]};
   for(NSString *name in m){Class c=NSClassFromString(name);if(!c)return NO;for(NSString *sel in m[name])if(!class_getInstanceMethod(c,NSSelectorFromString(sel)))return NO;}return YES;
 }
-static void Pump(double t){@autoreleasepool {NSDate *end=[NSDate dateWithTimeIntervalSinceNow:t];while(end.timeIntervalSinceNow>0){Guard();[NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.025]];}}}
+// Pure monotonic deadline policy. Guard work consumes the requested budget too.
+static double PumpWait(double deadline,double now){
+  if(!isfinite(deadline)||!isfinite(now))return 0;
+  double remaining=deadline-now;
+  return remaining>0?fmin(0.025,remaining):0;
+}
+static void Pump(double t){@autoreleasepool {
+  if(!isfinite(t)||t<=0)return;
+  double deadline=Now()+t;
+  while(PumpWait(deadline,Now())>0){
+    Guard();
+    double remaining=PumpWait(deadline,Now());
+    if(remaining<=0)break;
+    [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:remaining]];
+  }
+}}
 static void StartWatchdog(void){
   pid_t parent=getppid();parentPID=parent;if(parent<=1)Fail("parent unavailable");
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE,0),^{@autoreleasepool {
@@ -853,6 +868,13 @@ static bool MockOnlineExact(const uint32_t *baseIDs,uint32_t baseCount,uint32_t 
 static int SelfTest(void){
   int failures=0;
   #define CHECK(cond,name) do{if(!(cond)){fprintf(stderr,"FAIL %s\n",name);failures++;}else fprintf(stderr,"PASS %s\n",name);}while(0)
+
+  CHECK(PumpWait(1,0)==0.025,"pump-long-wait-capped-25ms");
+  CHECK(PumpWait(1,1)==0 && PumpWait(1,2)==0 && PumpWait(-1,0)==0,"pump-expired-negative-no-wait");
+  CHECK(PumpWait(INFINITY,0)==0 && PumpWait(NAN,0)==0 && PumpWait(1,INFINITY)==0 && PumpWait(1,NAN)==0 && PumpWait(-INFINITY,0)==0,"pump-nonfinite-fails-closed");
+  CHECK(fabs(PumpWait(1.0/60.0,0)-1.0/60.0)<1e-12,"pump-60hz-not-rounded-to-25ms");
+  CHECK(fabs(PumpWait(1.0/60.0,0.010)-(1.0/60.0-0.010))<1e-12,"pump-guard-cost-consumes-deadline");
+  CHECK(PumpWait(1.0/60.0,0.020)==0 && fabs(PumpWait(0.030,0.025)-0.005)<1e-12,"pump-final-leftover-no-oversleep");
 
   CHECK(SessionValuesSafe(@YES,@YES,@NO,NO) && SessionValuesSafe(@YES,@YES,@NO,YES),"password-secure-input-preserves-video");
   CHECK(!SessionValuesSafe(@YES,@YES,@YES,NO) && !SessionValuesSafe(@YES,@YES,@YES,YES),"screen-lock-still-stops-video");
@@ -1239,7 +1261,7 @@ int main(int argc,const char **argv){@autoreleasepool {
   // Early lifecycle contract line: parent reads stderr via launchHelper and
   // logs each line. State the bounded contract as counts/booleans only; no
   // display IDs, origins, counts of specific displays or geometry are logged.
-  fprintf(stderr,"Bounded display helper 0.8.30: startupHiDPIModePhase=postDetach ownedModeTxn=ownedOnly physicalBaselineBounded=yes preservesPhysicalSettings=yes reassertPrecreateOnlyInOwnStartupTxn=yes postStartPhysicalReplay=no setupScope=session ownedResolutionSessionFixed=yes ownedNonMirroredRequired=yes reconfigFatal=no newFrameSubmissionSuspendedDuringInvalid=yes encodedOwnedFramesInFlightEmitted=yes capturesPhysicalOtherDisplay=no rollsBackUserGeometryOnExit=no\n");
+  fprintf(stderr,"Bounded display helper 0.8.30.2: startupHiDPIModePhase=postDetach ownedModeTxn=ownedOnly physicalBaselineBounded=yes preservesPhysicalSettings=yes reassertPrecreateOnlyInOwnStartupTxn=yes postStartPhysicalReplay=no setupScope=session ownedResolutionSessionFixed=yes ownedNonMirroredRequired=yes reconfigFatal=no newFrameSubmissionSuspendedDuringInvalid=yes encodedOwnedFramesInFlightEmitted=yes capturesPhysicalOtherDisplay=no rollsBackUserGeometryOnExit=no\n");
   StartWatchdog();
   if(!BaselineSupported())Fail("unsupported physical display baseline");
   PlacementPhysical placementPhysical[8];

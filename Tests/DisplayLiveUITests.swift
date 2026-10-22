@@ -180,6 +180,10 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
 , maximum: 2,stage:"focus return")
     dummy.close()
     try displayLiveRequire(closed == 0 && viewer.receivedFrameCount == 8 && viewer.presentationStats.submitted == 8, "focus return must preserve video")
+    try displayLiveRequire(viewer.receivedCadenceCountForTests == 8 && viewer.submittedCadenceCountForTests == 8 && viewer.sourceEncodeSamplesForTests == 8, "all frame cadence points counted")
+    let readinessBefore = viewer.readinessCallbacksForTests
+    try displayLiveRequire(viewer.requestReadinessForTests(), "register actual native renderer readiness callback")
+    try await pump(until:{viewer.readinessCallbacksForTests == readinessBefore+1 && !viewer.readinessRequestedForTests}, maximum:2, stage:"one-shot readiness callback with no pending pixel")
     try viewer.acceptCursor(cursor(0, visible:true))
     try displayLiveRequire(viewer.cursorVisibleForTests && viewer.cursorFrameForTests.width > 0 && viewer.cursorFrameForTests.height > 0, "separate cursor has actual layer and image")
     let centerCursor = viewer.cursorFrameForTests
@@ -206,11 +210,16 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     try displayLiveRequire(capture.terminationStatus == 0, "own-window screencapture")
     let colorfulSamples = try displayLiveVerifyScreenshot(outputURL.path)
     try displayLiveRequire(closed == 0 && ProcessInfo.processInfo.systemUptime < deadline, "test final state")
+    try displayLiveRequire(viewer.readinessCallbacksForTests == readinessBefore+1 && !viewer.readinessRequestedForTests, "no repeated empty readiness callbacks after further native pumping")
     let wasFullscreen=viewer.isFullScreenForTests
+    try displayLiveRequire(viewer.requestReadinessForTests(), "pending readiness before close")
     viewer.close()
     try displayLiveRequire(!viewer.cursorVisibleForTests && !viewer.readinessRequestedForTests, "close clears cursor and renderer request")
     try displayLiveRequire(!ownershipFixture.sourceWindowOwnership.hasStableOwnership,"closed viewer cannot leave stale source ownership or activate HUD")
-    print("PASS native viewer: activationPolicy=\(application.activationPolicy().rawValue) coordinator=true fullscreen=\(wasFullscreen) decoded=8 submitted=8 colorfulSamples=\(colorfulSamples) focusLossCallbacks=\(lost) focusGainCallbacks=\(gained) expectedClose=1 newFrameWhileUnfocused=true stampedFrames=true separateCursor=true cursorExpiry=true; own-window generated-pattern screenshot only; no network, virtual display or input posting")
+    let closedSettle = ProcessInfo.processInfo.systemUptime + 0.1
+    try await pump(until:{ProcessInfo.processInfo.systemUptime >= closedSettle},maximum:0.5,stage:"closed readiness late callback")
+    try displayLiveRequire(!viewer.readinessRequestedForTests && viewer.readinessCallbacksForTests == 0, "no callback resurrects closed viewer readiness counters")
+    print("PASS native viewer: activationPolicy=\(application.activationPolicy().rawValue) coordinator=true fullscreen=\(wasFullscreen) decoded=8 submitted=8 colorfulSamples=\(colorfulSamples) focusLossCallbacks=\(lost) focusGainCallbacks=\(gained) expectedClose=1 newFrameWhileUnfocused=true stampedFrames=true separateCursor=true cursorExpiry=true cadence=true readinessCallbackOneShot=true; own-window generated-pattern screenshot only; no network, virtual display or input posting")
 }
 
 /// Pure lifecycle regression coverage: no AppKit activation, capture or input.
