@@ -38,6 +38,7 @@ private enum DisplayPipelineTestError: Error { case failed }
     var reverseSender = channel(false), reverseReceiver = channel(false)
     var offset = 0, frames = 0, delivered = 0, identitySeen = false, decoderFailed = false
     var firstVideo: Data?, firstEncrypted: Data?
+    var startupFrames: [Data] = []
     let decoder = DisplayH264Decoder(format: format, output: { pixel in
         guard CVPixelBufferGetWidth(pixel) == format.pixelWidth, CVPixelBufferGetHeight(pixel) == format.pixelHeight,
               CVPixelBufferGetPixelFormatType(pixel) == kCVPixelFormatType_32BGRA,
@@ -80,14 +81,18 @@ private enum DisplayPipelineTestError: Error { case failed }
         let stamped = try DisplayStreamFrame(restored)
         try require(stamped.sequence == UInt64(frames))
         if firstVideo == nil { firstVideo = stamped.video }
-        try decoder.accept(stamped.video); frames += 1
-        while delivered < frames && !decoderFailed && ProcessInfo.processInfo.systemUptime < deadline {
-            RunLoop.current.run(until: Date().addingTimeInterval(0.005))
-        }
-        try require(!decoderFailed && delivered == frames)
+        startupFrames.append(stamped.video); frames += 1
     }
-    try require(identitySeen && frames == 8 && delivered == 8)
-    guard let originalCiphertext = firstEncrypted, let firstVideo else { throw DisplayPipelineTestError.failed }
+    try require(identitySeen && frames == 8)
+    // One actor turn: no per-frame waits, compressed references must all complete.
+    for frame in startupFrames { try decoder.accept(frame) }
+    try require(decoder.inFlightFrameCount == 4 && decoder.pendingFrameCount == 4)
+    while decoder.completedSubmissions < 8 && !decoderFailed && ProcessInfo.processInfo.systemUptime < deadline {
+        RunLoop.current.run(until: Date().addingTimeInterval(0.005))
+    }
+    try require(!decoderFailed && decoder.completedSubmissions == 8 && delivered > 0 && delivered <= 8)
+    try require(decoder.inFlightFrameCount == 0 && decoder.pendingFrameCount == 0)
+    guard let originalCiphertext = firstEncrypted, firstVideo != nil else { throw DisplayPipelineTestError.failed }
     var rejected = 0
     do { _ = try receiver.open(originalCiphertext) } catch { rejected += 1 }
     var damaged = originalCiphertext; damaged[damaged.count - 1] ^= 1
@@ -122,9 +127,12 @@ private enum DisplayPipelineTestError: Error { case failed }
     decoder.clear()
     var staleCallbacks = 0
     let retired = DisplayH264Decoder(format: format, output: { _ in staleCallbacks += 1 }, failure: { staleCallbacks += 1 })
-    try retired.accept(firstVideo); retired.clear()
+    for frame in startupFrames { try retired.accept(frame) }
+    try require(retired.inFlightFrameCount == 4 && retired.pendingFrameCount == 4)
+    retired.clear()
+    try require(retired.inFlightFrameCount == 0 && retired.pendingFrameCount == 0)
     let staleDeadline = min(deadline, ProcessInfo.processInfo.systemUptime + 0.15)
     while ProcessInfo.processInfo.systemUptime < staleDeadline { RunLoop.current.run(until: Date().addingTimeInterval(0.005)) }
     try require(staleCallbacks == 0 && ProcessInfo.processInfo.systemUptime < deadline)
-    print("PASS display offline pipeline: helper H264 -> stamped v6 metadata -> AEAD -> negotiated-size decoder 8/8 nonempty frames; legacy input denied by v5 for both roles; codec memory-only 2/2; replay/tamper/direction rejected 6/6; stale callbacks=0; no real network/window/capture/input posting")
+    print("PASS display offline pipeline: helper H264 -> stamped v6 metadata -> AEAD -> negotiated-size decoder startup burst 8/8 completed with nonempty latest-only output; legacy input denied by v5 for both roles; codec memory-only 2/2; replay/tamper/direction rejected 6/6; stale callbacks=0; no real network/window/capture/input posting")
 }

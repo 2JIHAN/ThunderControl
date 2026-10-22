@@ -17,6 +17,8 @@ import CryptoKit
     var failures=0,checks=0
     func check(_ condition:Bool,_ note:String="unlabeled"){checks+=1;if !condition{failures+=1;fputs("ReceiverDesktopRelay check failed: \(note)\n",stderr)}}
 
+    check(Relay.verifyReceiverSingleMapReadForTests(),"actual receiver single-map input path")
+
     // Simple pair identity utility.
     let localID=UUID().uuidString,peerID=UUID().uuidString
     guard let pair=LayoutDevicePair(localID:localID,peerID:peerID) else{failures+=1;return failures}

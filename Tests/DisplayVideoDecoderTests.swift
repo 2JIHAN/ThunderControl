@@ -28,6 +28,40 @@ func runDisplayVideoDecoderTests() -> Int {
         data.append(UInt8(pps.count >> 8)); data.append(UInt8(pps.count & 255)); data.append(pps)
         var length = UInt32(nal.count).bigEndian; withUnsafeBytes(of: &length) { data.append(contentsOf: $0) }; data.append(nal); return data
     }
+    // Deterministic saturation, FIFO, byte accounting and stale completion policy proof.
+    var admission = DisplayDecodeAdmission<Int>()
+    let epoch = admission.epoch
+    do {
+        for n in 0..<4 { try admission.enqueue(n, bytes: 10); check(admission.submit(sequence: Int64(n)) == n) }
+        for n in 4..<12 { try admission.enqueue(n, bytes: 10) }
+        check(admission.active.count == 4 && admission.pending.count == 8 && admission.pendingBytes == 80)
+        check(admission.submit(sequence: 12) == nil)
+        do { try admission.enqueue(12, bytes: 1); check(false) } catch { check(true) }
+        check(admission.pending.count == 8 && admission.pendingBytes == 80)
+        check(admission.complete(sequence: 1, epoch: epoch))
+        check(!admission.complete(sequence: 1, epoch: epoch))
+        check(admission.submit(sequence: 4) == 4)
+        check(admission.active.count == 4 && admission.pending.first?.packet == 5)
+        for n in [0, 2, 3, 4] { check(admission.complete(sequence: Int64(n), epoch: epoch)) }
+        for n in 5..<12 {
+            check(admission.submit(sequence: Int64(n)) == n)
+            check(admission.complete(sequence: Int64(n), epoch: epoch))
+        }
+        check(admission.pendingBytes == 0 && admission.pending.isEmpty && admission.active.isEmpty)
+        try admission.enqueue(1, bytes: 8 * 1024 * 1024)
+        do { try admission.enqueue(2, bytes: 1); check(false) } catch { check(true) }
+        check(admission.pending.count == 1 && admission.pendingBytes == 8 * 1024 * 1024)
+        admission.clear()
+        check(admission.pendingBytes == 0 && admission.pending.isEmpty && admission.active.isEmpty)
+        try admission.enqueue(99, bytes: 1); check(admission.submit(sequence: 0) == 99)
+        check(!admission.complete(sequence: 0, epoch: epoch))
+        check(admission.active.count == 1)
+        admission.clear()
+        for bad in [0, -1, Int.max] {
+            do { try admission.enqueue(0, bytes: bad); check(false) } catch { check(true) }
+        }
+        check(admission.pending.isEmpty && admission.pendingBytes == 0)
+    } catch { check(false) }
     let valid = packet()
     check(!rejected(valid))
     do { let parsed = try DisplayH264Packet(valid); check(parsed.isKeyFrame); check(parsed.avcc.count == 6) } catch { check(false) }

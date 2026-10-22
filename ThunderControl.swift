@@ -1147,6 +1147,30 @@ final class Relay {
   var desktopClockForTests:(()->Double)?
   var desktopEnqueueForTests:((Wire)->Bool)?
   var desktopPhysicalInputsForTests:(()->Bool)?
+  var desktopInputPermissionForTests:(()->Bool)?
+  var desktopInputPostForTests:((CGEvent)->Void)?
+  private var inputTimingGeneration:UUID?
+  private var inputQueueTiming=DisplayTimingStats(),inputMapTiming=DisplayTimingStats(),inputPostTiming=DisplayTimingStats()
+  private var inputTimingLoggedAt:Double=0
+  private func prepareInputTiming() {
+    if inputTimingGeneration != generation {
+      inputTimingGeneration=generation;inputQueueTiming=DisplayTimingStats();inputMapTiming=DisplayTimingStats();inputPostTiming=DisplayTimingStats()
+      inputTimingLoggedAt=ProcessInfo.processInfo.systemUptime
+    }
+  }
+  private func noteInputQueue(_ w:Wire,queuedAt:Double) {
+    guard !sender,w.kind=="event",let raw=w.raw,[UInt32(5),6,7,27].contains(raw) else{return}
+    prepareInputTiming();inputQueueTiming.record((ProcessInfo.processInfo.systemUptime-queuedAt)*1000)
+  }
+  private func noteMousePost(_ raw:UInt32,startedAt:Double) {
+    guard !sender,[UInt32(5),6,7,27].contains(raw) else{return}
+    prepareInputTiming();let now=ProcessInfo.processInfo.systemUptime
+    inputPostTiming.record((now-startedAt)*1000)
+    if now-inputTimingLoggedAt>=2 {
+      inputTimingLoggedAt=now
+      connectionLog("Input receiver timing: mainQueue[\(inputQueueTiming.summary)] freshMap[\(inputMapTiming.summary)] receiveToPost[\(inputPostTiming.summary)]; hostLocal=true networkAndPhysicalCursorLatencyUnmeasured=true")
+    }
+  }
   var desktopGenerationForTests:UUID {generation}
   var desktopSourceReadForTests:(()->DisplayTopologySnapshot?)?
   private var desktopNow:Double {desktopClockForTests?() ?? ProcessInfo.processInfo.systemUptime}
@@ -1581,7 +1605,8 @@ final class Relay {
       desktopObserverActive=true
     }
     let epoch=desktopEpoch
-    if detectReceiverMapTransition() {return nil}
+    // One fresh full map is sufficient here; the guard below performs the
+    // same mismatch pause and retains the before/after/final epoch checks.
     guard !sender,receiverDesktopPublishRevision>0,
       displayBarrier == nil,let fresh=freshReceiverDesktop(receiverDesktopPublishRevision),
       fresh.valid,desktopFingerprintForPublication(fresh)==receiverDesktopPublishedFingerprint else{_ = pauseReceiverTopologyFailure();return nil}
@@ -2301,6 +2326,51 @@ final class Relay {
   }
   // Actual Dock routing + focus-loss + active-ack transitions; all outputs,
   // cursor resources and platform observations are inert fixture replacements.
+  static func verifyReceiverSingleMapReadForTests()->Bool {
+    final class Mock:CursorRecoveryAPI {
+      func associate(_ associated:Bool)->CGError{.success}
+      func hide(display:CGDirectDisplayID)->CGError{.success}
+      func show(display:CGDirectDisplayID)->CGError{.success}
+      func warp(to point:CGPoint)->CGError{.success}
+    }
+    let map=ReceiverDesktop(revision:7,mainID:11,displays:[ReceiverDisplay(id:11,bounds:CGRect(x:0,y:0,width:1920,height:1080)),ReceiverDisplay(id:99,bounds:CGRect(x:-1512,y:-945,width:1512,height:945))],virtualDisplayID:99)
+    for origin in [CGPoint(x:500,y:200),CGPoint(x:-800,y:-300)] {
+      let r=Relay(cursorResources:CursorRecoveryController(api:Mock()))
+      let ctx=SessionContext(OwnedSocket(-1));defer{ctx.cancel(reason:"single-map fixture end")}
+      r.connection=OwnedSocket(-1);r.context=ctx;r.key=SymmetricKey(size:.bits256)
+      r.safetyObserversInstalled=true;r.gestureTrace.setEnabled(false)
+      var reads=0,posts=0,epoch:UInt64=0
+      r.desktopMapReadForTests={_,_ in reads+=1;return map}
+      r.desktopEpochForTests={epoch};r.desktopInputPermissionForTests={true}
+      r.desktopInputPostForTests={_ in posts+=1}
+      let token=UUID().uuidString
+      r.prepareDesktopSystemGestureForTests(map:map,point:origin,token:token)
+      func packet(_ point:CGPoint,token:String)->Wire? {
+        guard let event=CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:point,mouseButton:.left) else{return nil}
+        event.flags=[];event.setDoubleValueField(.mouseEventDeltaX,value:1);event.setDoubleValueField(.mouseEventDeltaY,value:0)
+        guard let bytes=event.data else{return nil}
+        return Wire(kind:"event",session:r.session,sequence:1,raw:5,data:bytes as Data,token:token,desktopMapRevision:7,desktopGlobalX:point.x,desktopGlobalY:point.y)
+      }
+      func freshSession(){r.sessionSnapshot=SessionSafetySnapshot(onConsole:true,loginDone:true,screenLocked:false);r.lastSessionPoll=ProcessInfo.processInfo.systemUptime}
+      for n in 1...100 {
+        freshSession()
+        guard let w=packet(CGPoint(x:origin.x+CGFloat(n),y:origin.y),token:token) else{return false}
+        r.receive(w)
+        guard reads==n,posts==n else{fputs("Receiver single-map fixture: read/post count mismatch\n",stderr);return false}
+      }
+      let next=CGPoint(x:origin.x+101,y:origin.y)
+      guard let stale=packet(next,token:UUID().uuidString),let valid=packet(next,token:token) else{return false}
+      freshSession();r.receive(stale)
+      guard reads==100,posts==100 else{return false}
+      r.desktopInputPermissionForTests={false};freshSession();r.receive(valid)
+      guard reads==100,posts==100 else{return false}
+      r.desktopInputPermissionForTests={true}
+      r.desktopBeforeGateForTests={epoch+=1};freshSession();r.receive(valid)
+      guard reads==101,posts==100,r.displayTopologyTransitionActive else{return false}
+    }
+    print("PASS receiver mouse: exactly one fresh map per event on physical/virtual targets; stale token, permission loss and epoch race reject; no OS posting")
+    return true
+  }
   static func verifyDockFocusReturnForTests()->Bool {
     final class Mock:CursorRecoveryAPI {
       func associate(_ associated:Bool)->CGError{.success}
@@ -2805,9 +2875,11 @@ final class Relay {
           guard self.inbound.wait(timeout: .now()) == .success else {
             throw Failure("Inbound queue overload")
           }
+          let inputQueuedAt=ProcessInfo.processInfo.systemUptime
           DispatchQueue.main.async {
             defer { self.inbound.signal() }
             guard self.generation == g, !sessionContext.cancelled else { return }
+            self.noteInputQueue(w,queuedAt:inputQueuedAt)
             self.receive(w)
           }
         }
@@ -3620,13 +3692,16 @@ final class Relay {
     _ = control("active",token:token)
   }
   func receive(_ w: Wire) {
+    let inputStartedAt=ProcessInfo.processInfo.systemUptime
     if lockedTransportOnly {lastInput=ProcessInfo.processInfo.systemUptime;return}
     if let reason = currentSessionBlockReason() {
       sessionBecameUnsafe(reason,origin:polledSessionSuspensionOrigin)
       return
     }
     lastInput = ProcessInfo.processInfo.systemUptime
-    let mapPaused=detectReceiverMapTransition()
+    // Ordinary input validates the fresh map once in currentRoutingDesktop,
+    // after decoding and before any modifier reconciliation or OS posting.
+    let mapPaused = w.kind == "event" ? displayBarrier != nil : detectReceiverMapTransition()
     if mapPaused,["event","dock","appGesture","begin","commit"].contains(w.kind) {return}
     if displayBarrier != nil,["event","dock","appGesture"].contains(w.kind) {return}
     if !multiDisplayDesktopCompatible && displayLease != nil && displayBarrier == nil && !topologyUnchanged() {safetyStop("Owned display topology changed before input");return}
@@ -3644,7 +3719,7 @@ final class Relay {
     } else {
       guard handoff.phase == .local else { return }
     }
-    guard receiverActivationPendingToken == nil,inject, AXIsProcessTrusted(), let t = w.raw,
+    guard receiverActivationPendingToken == nil,inject, (desktopInputPermissionForTests?() ?? AXIsProcessTrusted()), let t = w.raw,
       allowed(t, experimental && gestureCompatible), let d = w.data,
       let decoded = CGEvent(withDataAllocator: nil, data: d as CFData),
       decoded.type.rawValue == t
@@ -3653,6 +3728,15 @@ final class Relay {
             == t)
     else { return }
     var e = decoded
+    let eventDesktop:ReceiverDesktop?
+    if multiDisplayDesktopCompatible {
+      prepareInputTiming()
+      let queryStartedAt=ProcessInfo.processInfo.systemUptime
+      let fresh=currentRoutingDesktop()
+      inputMapTiming.record((ProcessInfo.processInfo.systemUptime-queryStartedAt)*1000)
+      guard let fresh,finalDesktopInjectionGate() else{return}
+      eventDesktop=fresh
+    } else {eventDesktop=nil}
     guard validMouseCoordinates(w), validFields(e, t) else {
       stop()
       status("Invalid authenticated input fields")
@@ -3675,7 +3759,7 @@ final class Relay {
     var desktopReverse:(DesktopPortal,CGPoint)?=nil
     if multiDisplayDesktopCompatible {
       // Drop before modifier reconciliation or any other OS event posting.
-      guard let desktop=currentRoutingDesktop(),let revision=desktopHandoffRevision,
+      guard let desktop=eventDesktop,let revision=desktopHandoffRevision,
         let previous=desktopReceiverPreviousPointer,let portal=desktopPortal,
         let p=DesktopHandoffRouting.eventPoint(w,desktop:desktop,revision:revision,previous:previous,
           delta:CGVector(dx:e.getDoubleValueField(.mouseEventDeltaX),dy:e.getDoubleValueField(.mouseEventDeltaY)),moving:[5,6,7,27].contains(t)),
@@ -3753,7 +3837,8 @@ final class Relay {
     }
     // The final gate above precedes bookkeeping and post, but WindowServer
     // asynchronous dispatch still has an unavoidable OS-level residual race.
-    e.post(tap: replayTapLocation(for: t))
+    if let post=desktopInputPostForTests {post(e)} else {e.post(tap: replayTapLocation(for: t))}
+    noteMousePost(t,startedAt:inputStartedAt)
     if multiDisplayDesktopCompatible {
       if let back=desktopReverse,let token=handoff.token,let revision=desktopHandoffRevision,handoff.phase == .targetActive {
         handoff.phase = .returning;handoff.deadline=ProcessInfo.processInfo.systemUptime+1.5

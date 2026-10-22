@@ -18,6 +18,36 @@ enum DisplayVideoError: Error, LocalizedError {
     }
 }
 
+/// Pure admission accounting. Compressed reference frames are never evicted.
+/// Completion cookies and epochs make duplicate/retired callbacks inert.
+struct DisplayDecodeAdmission<Packet> {
+    static var submissionLimit: Int { 4 }
+    static var pendingLimit: Int { 8 }
+    static var byteLimit: Int { 8 * 1024 * 1024 }
+    private(set) var epoch: UInt64 = 0
+    private(set) var pending: [(packet: Packet, bytes: Int)] = []
+    private(set) var pendingBytes = 0
+    private(set) var active: Set<Int64> = []
+    var hasSpace: Bool { active.count < Self.submissionLimit }
+    mutating func enqueue(_ packet: Packet, bytes: Int) throws {
+        guard bytes > 0, bytes <= Self.byteLimit, pending.count < Self.pendingLimit,
+              pendingBytes <= Self.byteLimit - bytes else { throw DisplayVideoError.backlog }
+        pending.append((packet, bytes)); pendingBytes += bytes
+    }
+    mutating func submit(sequence: Int64) -> Packet? {
+        guard hasSpace, !pending.isEmpty, !active.contains(sequence) else { return nil }
+        let entry = pending.removeFirst(); pendingBytes -= entry.bytes; active.insert(sequence)
+        return entry.packet
+    }
+    @discardableResult mutating func complete(sequence: Int64, epoch: UInt64) -> Bool {
+        guard epoch == self.epoch else { return false }
+        return active.remove(sequence) != nil
+    }
+    mutating func clear() {
+        epoch &+= 1; pending.removeAll(); pendingBytes = 0; active.removeAll()
+    }
+}
+
 private struct DisplayH264Bits {
     let bytes: [UInt8]
     var bit = 0
@@ -139,7 +169,10 @@ struct DisplayH264Packet {
                     nalUnitHeaderLength: 4, formatDescriptionOut: &result)
             }}
         }}
-        guard status == noErr, let result else { throw DisplayVideoError.malformed }
+        guard status == noErr, let result else {
+            displayStageLog("Display decoder failure error=malformed stage=formatDescription status=\(status) expected=\(format.pixelWidth)x\(format.pixelHeight)")
+            throw DisplayVideoError.malformed
+        }
         let dimensions = CMVideoFormatDescriptionGetDimensions(result)
         guard dimensions.width == Int32(format.pixelWidth), dimensions.height == Int32(format.pixelHeight) else { throw DisplayVideoError.unsupportedFormat }
         return result
@@ -158,27 +191,36 @@ private final class DisplayDecodeMailbox {
     var latestCallbackAt: Double?
     var deliver: ((CVPixelBuffer) -> Void)?
     var failure: (() -> Void)?
+    var space: (([Int64]) -> Void)?
+    private var completed: [Int64] = []
+    private var failureDetail: String?
     private var callbackCadence = DisplayCadenceStats()
     private var decodeTiming = DisplayTimingStats(), callbackToMain = DisplayTimingStats()
     private var mailboxReplacements: UInt64 = 0, droppedCallbacks: UInt64 = 0
     private var lastLoggedAt = ProcessInfo.processInfo.systemUptime
-    init(format: DisplayVideoFormat, deliver: @escaping (CVPixelBuffer) -> Void, failure: @escaping () -> Void) { self.format = format; self.deliver = deliver; self.failure = failure }
+    init(format: DisplayVideoFormat, deliver: @escaping (CVPixelBuffer) -> Void, failure: @escaping () -> Void, space: @escaping ([Int64]) -> Void) { self.format = format; self.deliver = deliver; self.failure = failure; self.space = space }
     func reserve(sequence: Int64) -> Bool {
         lock.lock(); defer { lock.unlock() }
         guard valid, !failed, inFlight < 4, submittedAt.count < 4 else { return false }; inFlight += 1; submittedAt[sequence] = ProcessInfo.processInfo.systemUptime; return true
     }
     func complete(status: OSStatus, flags: VTDecodeInfoFlags, pixel: CVPixelBuffer?, sequence: Int64) {
         let now = ProcessInfo.processInfo.systemUptime
-        lock.lock(); inFlight = max(0, inFlight - 1)
-        guard valid else { lock.unlock(); return }
-        if let started = submittedAt.removeValue(forKey: sequence) { decodeTiming.record((now-started)*1000) }
+        lock.lock()
+        guard valid, let started = submittedAt.removeValue(forKey: sequence) else { lock.unlock(); return }
+        inFlight -= 1; completed.append(sequence)
+        decodeTiming.record((now-started)*1000)
         if flags.contains(.frameDropped) { droppedCallbacks &+= 1 }
         if status == noErr, let pixel, CVPixelBufferGetWidth(pixel) == format.pixelWidth,
            CVPixelBufferGetHeight(pixel) == format.pixelHeight, CVPixelBufferGetPixelFormatType(pixel) == kCVPixelFormatType_32BGRA {
             callbackCadence.observe(now)
             if latest != nil { mailboxReplacements &+= 1 }
             latest = pixel; latestCallbackAt = now
-        } else if !flags.contains(.frameDropped) { failed = true; latest = nil; latestCallbackAt = nil }
+        } else if status != noErr || pixel != nil || !flags.contains(.frameDropped) {
+            if !failed {
+                failureDetail = "error=decoderFailed stage=callback status=\(status) flags=\(flags.rawValue) dimensions=\(pixel.map { "\(CVPixelBufferGetWidth($0))x\(CVPixelBufferGetHeight($0))" } ?? "none") expected=\(format.pixelWidth)x\(format.pixelHeight) inFlight=\(inFlight) limit=4"
+            }
+            failed = true; latest = nil; latestCallbackAt = nil
+        }
         let enqueue = !scheduled; scheduled = true; lock.unlock()
         if enqueue { DispatchQueue.main.async { [self] in drain() } }
     }
@@ -191,18 +233,25 @@ private final class DisplayDecodeMailbox {
         let image = valid && !failed ? latest : nil
         let output = valid ? deliver : nil
         let error = valid && failed ? failure : nil
+        let ready = valid && !failed ? space : nil
+        let finished = completed; completed.removeAll(keepingCapacity: true)
+        let detail = failureDetail; failureDetail = nil
         if image != nil, let readyAt = latestCallbackAt { callbackToMain.record((now-readyAt)*1000) }
         let summary: String?
         if valid, callbackCadence.count > 0, now-lastLoggedAt >= 2 { summary = summaryLocked(); lastLoggedAt = now } else { summary = nil }
         latest = nil; latestCallbackAt = nil; scheduled = false
         lock.unlock()
         if let summary { displayStageLog(summary) }
-        if let error { error() } else if let image { output?(image) }
+        if let detail { displayStageLog("Display decoder failure "+detail) }
+        if let error { error() } else {
+            if let image { output?(image) }
+            ready?(finished)
+        }
     }
     func invalidate() {
         lock.lock()
         let summary = valid && callbackCadence.count > 0 ? summaryLocked() : nil
-        valid = false; submittedAt.removeAll(); latest = nil; latestCallbackAt = nil; deliver = nil; failure = nil
+        valid = false; submittedAt.removeAll(); latest = nil; latestCallbackAt = nil; deliver = nil; failure = nil; space = nil; completed.removeAll(); failureDetail = nil
         lock.unlock()
         if let summary { displayStageLog(summary+" final=true") }
     }
@@ -224,29 +273,73 @@ private let displayDecodeCallback: VTDecompressionOutputCallback = { reference, 
     private var parameters: (Data, Data)?
     private var mailbox: DisplayDecodeMailbox?
     private var sequence: Int64 = 0
+    private var admission = DisplayDecodeAdmission<DisplayH264Packet>()
+    private(set) var completedSubmissions = 0
+    var pendingFrameCount: Int { admission.pending.count }
+    var inFlightFrameCount: Int { admission.active.count }
     private let output: (CVPixelBuffer) -> Void
     private let failure: () -> Void
     init(format: DisplayVideoFormat = .standard, output: @escaping (CVPixelBuffer) -> Void, failure: @escaping () -> Void) { self.format = format; self.output = output; self.failure = failure }
     deinit {
         mailbox?.invalidate()
+        // Teardown retains the callback box through the existing VT drain boundary.
         if let session { VTDecompressionSessionInvalidate(session); VTDecompressionSessionWaitForAsynchronousFrames(session) }
+        withExtendedLifetime(mailbox) {}
     }
     func clear() {
-        mailbox?.invalidate()
+        admission.clear(); completedSubmissions = 0
+        retireSession()
+        sequence = 0
+    }
+    private func retireSession() {
+        let oldBox = mailbox
+        oldBox?.invalidate()
         if let session { VTDecompressionSessionInvalidate(session); VTDecompressionSessionWaitForAsynchronousFrames(session) }
-        session = nil; description = nil; parameters = nil; mailbox = nil; sequence = 0
+        withExtendedLifetime(oldBox) {}
+        session = nil; description = nil; parameters = nil; mailbox = nil
+    }
+    private func logFailure(_ error: Error, stage: String, status: OSStatus? = nil, flags: VTDecodeInfoFlags = []) {
+        displayStageLog("Display decoder failure error=\(String(describing: error)) stage=\(stage) status=\(status.map(String.init) ?? "none") flags=\(flags.rawValue) expected=\(format.pixelWidth)x\(format.pixelHeight) inFlight=\(admission.active.count)/4 pending=\(admission.pending.count)/8 pendingBytes=\(admission.pendingBytes)/8388608")
     }
     func accept(_ payload: Data) throws {
-        do { try decode(payload) } catch { clear(); throw error }
+        do {
+            let packet = try DisplayH264Packet(payload, format: format)
+            try admission.enqueue(packet, bytes: packet.sps.count + packet.pps.count + packet.avcc.count)
+            try drainPending()
+        } catch { logFailure(error, stage: "accept"); clear(); throw error }
     }
-    private func decode(_ payload: Data) throws {
-        let packet = try DisplayH264Packet(payload, format: format)
+    private func callbacksCompleted(_ sequences: [Int64], epoch: UInt64) {
+        guard epoch == admission.epoch else { return }
+        for sequence in sequences {
+            if admission.complete(sequence: sequence, epoch: epoch) { completedSubmissions += 1 }
+        }
+        do { try drainPending() }
+        catch { logFailure(error, stage: "drain"); clear(); failure() }
+    }
+    private func drainPending() throws {
+        while admission.hasSpace, let next = admission.pending.first?.packet {
+            let changed = parameters?.0 != next.sps || parameters?.1 != next.pps
+            // Finish every old reference before switching descriptions, without a wait.
+            if changed && !admission.active.isEmpty { return }
+            guard sequence >= 0, sequence < Int64.max else { throw DisplayVideoError.backlog }
+            guard let packet = admission.submit(sequence: sequence) else { return }
+            try submit(packet)
+            sequence += 1
+        }
+    }
+    private func submit(_ packet: DisplayH264Packet) throws {
         if parameters?.0 != packet.sps || parameters?.1 != packet.pps {
             guard packet.isKeyFrame else { throw DisplayVideoError.malformed }
             let configurationStarted = ProcessInfo.processInfo.systemUptime
-            clear()
+            retireSession()
             let description = try packet.formatDescription()
-            let box = DisplayDecodeMailbox(format: format, deliver: output, failure: failure)
+            let epoch = admission.epoch
+            let box = DisplayDecodeMailbox(format: format, deliver: { [weak self] pixel in
+                guard let self, self.admission.epoch == epoch else { return }; self.output(pixel)
+            }, failure: { [weak self] in
+                guard let self, self.admission.epoch == epoch else { return }
+                self.logFailure(DisplayVideoError.decoderFailed, stage: "callback"); self.clear(); self.failure()
+            }, space: { [weak self] completed in self?.callbacksCompleted(completed, epoch: epoch) })
             var callback = VTDecompressionOutputCallbackRecord(decompressionOutputCallback: displayDecodeCallback,
                 decompressionOutputRefCon: Unmanaged.passUnretained(box).toOpaque())
             var created: VTDecompressionSession?
@@ -256,30 +349,32 @@ private let displayDecodeCallback: VTDecompressionOutputCallback = { reference, 
                     kCVPixelBufferWidthKey: format.pixelWidth, kCVPixelBufferHeightKey: format.pixelHeight,
                     kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary,
                 outputCallback: &callback, decompressionSessionOut: &created)
-            guard status == noErr, let created else { throw DisplayVideoError.decoderFailed }
+            guard status == noErr, let created else { logFailure(DisplayVideoError.decoderFailed, stage: "configure", status: status); throw DisplayVideoError.decoderFailed }
             session = created; self.description = description; parameters = (packet.sps, packet.pps); mailbox = box
             _ = VTSessionSetProperty(created, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
             displayStageLog("Display decoder configuration setupMs=\((ProcessInfo.processInfo.systemUptime-configurationStarted)*1000); reconfigurationNotSteadyState=true")
         }
         guard let session, let description, let mailbox else { throw DisplayVideoError.decoderFailed }
         var block: CMBlockBuffer?
-        guard CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil,
+        let blockStatus = CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil,
             blockLength: packet.avcc.count, blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
-            offsetToData: 0, dataLength: packet.avcc.count, flags: 0, blockBufferOut: &block) == noErr, let block else { throw DisplayVideoError.decoderFailed }
+            offsetToData: 0, dataLength: packet.avcc.count, flags: 0, blockBufferOut: &block)
+        guard blockStatus == noErr, let block else { logFailure(DisplayVideoError.decoderFailed, stage: "block", status: blockStatus); throw DisplayVideoError.decoderFailed }
         let copied = packet.avcc.withUnsafeBytes {
             CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block, offsetIntoDestination: 0, dataLength: packet.avcc.count)
         }
-        guard copied == noErr else { throw DisplayVideoError.decoderFailed }
+        guard copied == noErr else { logFailure(DisplayVideoError.decoderFailed, stage: "copy", status: copied); throw DisplayVideoError.decoderFailed }
         var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 30), presentationTimeStamp: CMTime(value: sequence, timescale: 30), decodeTimeStamp: .invalid)
         var size = packet.avcc.count
         var sample: CMSampleBuffer?
-        guard CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: description,
+        let sampleStatus = CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: description,
             sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
-            sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &sample) == noErr, let sample else { throw DisplayVideoError.decoderFailed }
+            sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &sample)
+        guard sampleStatus == noErr, let sample else { logFailure(DisplayVideoError.decoderFailed, stage: "sample", status: sampleStatus); throw DisplayVideoError.decoderFailed }
         guard sequence >= 0, sequence < Int64.max, mailbox.reserve(sequence: sequence) else { throw DisplayVideoError.backlog }
-        let status = VTDecompressionSessionDecodeFrame(session, sampleBuffer: sample, flags: [._EnableAsynchronousDecompression], frameRefcon: UnsafeMutableRawPointer(bitPattern: UInt(sequence) + 1), infoFlagsOut: nil)
-        guard status == noErr else { throw DisplayVideoError.decoderFailed }
-        sequence += 1
+        var infoFlags: VTDecodeInfoFlags = []
+        let status = VTDecompressionSessionDecodeFrame(session, sampleBuffer: sample, flags: [._EnableAsynchronousDecompression], frameRefcon: UnsafeMutableRawPointer(bitPattern: UInt(sequence) + 1), infoFlagsOut: &infoFlags)
+        guard status == noErr else { logFailure(DisplayVideoError.decoderFailed, stage: "submit", status: status, flags: infoFlags); throw DisplayVideoError.decoderFailed }
     }
 }
 
