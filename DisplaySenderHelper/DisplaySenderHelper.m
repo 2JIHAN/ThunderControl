@@ -447,19 +447,50 @@ static void Reconfigured(CGDirectDisplayID display,CGDisplayChangeSummaryFlags f
   atomic_compare_exchange_strong(&ownedInvalidSinceNS,&expected,now);
   pthread_mutex_unlock(&publishMutex);
 }
-static void Output(NSData *payload){
+// Only byte framing is protected by this lock. Never query WindowServer while held.
+static pthread_mutex_t writeMutex=PTHREAD_MUTEX_INITIALIZER;
+static int outputFD=STDOUT_FILENO; // changed only by isolated offline selftest
+static atomic_uint cursorBusyDropped=0,cursorPipeDropped=0,capturesReplacedBeforeEncode=0;
+typedef struct {double guardMs,lockMs,pipeMs;} OutputTiming;
+static _Thread_local OutputTiming outputTiming;
+static void OutputWithGuard(NSData *payload,void (^guard)(void),int fd){
   if(!payload.length || payload.length>MaxPayload)Fail("frame bounds");
-  Guard();uint32_t be=CFSwapInt32HostToBig((uint32_t)payload.length);
+  double guardStarted=Now();
+  guard(); // fresh safety check BEFORE acquiring the byte writer
+  outputTiming.guardMs=(Now()-guardStarted)*1000;
+  uint32_t be=CFSwapInt32HostToBig((uint32_t)payload.length);
   NSMutableData *framed=[NSMutableData dataWithBytes:&be length:4];[framed appendData:payload];
+  double lockStarted=Now();pthread_mutex_lock(&writeMutex);
+  double pipeStarted=Now();outputTiming.lockMs=(pipeStarted-lockStarted)*1000;
   const uint8_t *p=framed.bytes;size_t left=framed.length;double deadline=Now()+2;
   while(left){
     FastGuard();if(Now()>deadline)Fail("output stalled");
-    ssize_t n=write(STDOUT_FILENO,p,left);
+    ssize_t n=write(fd,p,left);
     if(n>0){p+=n;left-=(size_t)n;continue;}
     if(n<0&&errno==EINTR)continue;
-    if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK)){struct pollfd fd={STDOUT_FILENO,POLLOUT,0};if(poll(&fd,1,50)<0&&errno!=EINTR)Fail("output poll");continue;}
+    if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK)){struct pollfd pollFD={fd,POLLOUT,0};if(poll(&pollFD,1,50)<0&&errno!=EINTR)Fail("output poll");continue;}
     Fail("output closed");
   }
+  outputTiming.pipeMs=(Now()-pipeStarted)*1000;
+  pthread_mutex_unlock(&writeMutex);
+}
+static void Output(NSData *payload){OutputWithGuard(payload,^{Guard();},outputFD);}
+// Cursor metadata is a 23-byte framed message, below POSIX's minimum PIPE_BUF.
+// One nonblocking atomic write, or skip: cursor traffic never waits behind video.
+static BOOL TryCursorOutput(NSData *packet,uint64_t sampledEpoch,void (^guard)(void),int fd){
+  _Static_assert(23<=_POSIX_PIPE_BUF,"cursor message must be an atomic pipe write");
+  if(packet.length!=19)Fail("cursor frame bounds");
+  guard(); // no OS calls after the try-lock, and no waiting that ages this proof
+  int result=pthread_mutex_trylock(&writeMutex);
+  if(result==EBUSY){atomic_fetch_add(&cursorBusyDropped,1);return NO;}
+  if(result!=0)Fail("cursor writer lock");
+  uint8_t bytes[23];uint32_t size=CFSwapInt32HostToBig(19);memcpy(bytes,&size,4);memcpy(bytes+4,packet.bytes,19);
+  if(sampledEpoch!=atomic_load(&reconfigEpoch)||!CanSubmitFrame())memset(bytes+13,0,10);
+  FastGuard();ssize_t count=write(fd,bytes,sizeof(bytes));int error=errno;
+  pthread_mutex_unlock(&writeMutex);
+  if(count==(ssize_t)sizeof(bytes))return YES;
+  if(count<0&&(error==EAGAIN||error==EWOULDBLOCK||error==EINTR)){atomic_fetch_add(&cursorPipeDropped,1);return NO;}
+  Fail("cursor atomic output");return NO;
 }
 // Only frameQueue owns this PRE-ENCODE mailbox. Encoded dependency frames are never discarded.
 static unsigned encodingSlots=1;
@@ -479,7 +510,7 @@ static void PublishCursor(void){
   if(now-sampled<1.0/60.0)return;sampled=now;
   if(sequence==UINT64_MAX)Fail("cursor sequence exhausted");
   BOOL visible=NO;uint8_t shape=0;uint32_t x=0,y=0;uint64_t sampledEpoch=atomic_load(&reconfigEpoch);
-  if(SessionSafe() && CanSubmitFrame() && atomic_load(&topologyArmed)){
+  if(CanSubmitFrame() && atomic_load(&topologyArmed)){
     uint64_t topologyBefore=atomic_load(&reconfigEpoch);
     CGEventRef event=CGEventCreate(NULL);
     if(event){CGPoint p=CGEventGetLocation(event);CFRelease(event);CGRect b=CGDisplayBounds(ownedID);
@@ -496,13 +527,9 @@ static void PublishCursor(void){
   }
   uint8_t kind=7,v=visible?1:0;NSMutableData *packet=[NSMutableData dataWithBytes:&kind length:1];AppendU64(packet,sequence++);
   [packet appendBytes:&v length:1];[packet appendBytes:&shape length:1];x=CFSwapInt32HostToBig(x);y=CFSwapInt32HostToBig(y);[packet appendBytes:&x length:4];[packet appendBytes:&y length:4];
-  pthread_mutex_lock(&outputMutex);
-  // A video writer may have held this lock while topology/session changed.
-  // Never emit a formerly-visible cursor based on the pre-lock proof.
-  if(sampledEpoch!=atomic_load(&reconfigEpoch)||!SessionSafe()||!CanSubmitFrame()){
-    uint8_t hidden[10]={0};[packet replaceBytesInRange:NSMakeRange(9,10) withBytes:hidden];
-  }
-  Output(packet);pthread_mutex_unlock(&outputMutex);
+  // Guard inside TryCursorOutput retains the authoritative live session check.
+  // Its atomic owned-epoch recheck hides any stale cursor before output.
+  (void)TryCursorOutput(packet,sampledEpoch,^{Guard();},outputFD);
 }
 static uint64_t submittedSequence=0;
 typedef struct {double started,capturedAt;uint64_t sequence,captureSequence;} EncodeTicket;
@@ -520,25 +547,53 @@ static BOOL ReserveEncoding(void){
   while(count<encodingSlots){if(atomic_compare_exchange_weak(&inFlight,&count,count+1)){atomic_store(&maximumInFlight,MAX(atomic_load(&maximumInFlight),count+1));return YES;}}
   return NO;
 }
+static dispatch_queue_t WriterQueue(void){
+  static dispatch_queue_t queue;static dispatch_once_t once;
+  dispatch_once(&once,^{queue=dispatch_queue_create("local.ThunderControl.display.writer",dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,QOS_CLASS_USER_INITIATED,0));});
+  return queue;
+}
+typedef struct {uint64_t count;double sum,max;} SourceTiming;
+static void RecordSourceTiming(SourceTiming *s,double ms){s->count++;s->sum+=ms;s->max=fmax(s->max,ms);}
+static SourceTiming writerWaitTiming,writerGuardTiming,writerLockTiming,writerPipeTiming,writerCadence;
+static uint64_t outputGaps25=0,outputGaps50=0;static double previousOutputAt=0,lastSourceLogAt=0;
+static void FinishEncoded(NSData *ready,uint64_t sequence,double captured,double completedAt){
+  // Only this serial queue runs blocking session checks and framed video I/O.
+  // Queued/writing frames retain their existing two-slot inFlight budget.
+  if(ready){
+    if(benchmark){double at=Now();if(lastReadyAt>0 && sequence>=60){double span=at-lastReadyAt;ageArea+=(lastReadyAt-lastReadyCaptureAt)*span+span*span/2;ageDuration+=span;}lastReadyAt=at;lastReadyCaptureAt=captured;}
+    double outputStarted=Now();if(!benchmark)Output(ready);
+    if(!synthetic){
+      double at=Now();RecordSourceTiming(&writerWaitTiming,(outputStarted-completedAt)*1000);
+      RecordSourceTiming(&writerGuardTiming,outputTiming.guardMs);RecordSourceTiming(&writerLockTiming,outputTiming.lockMs);RecordSourceTiming(&writerPipeTiming,outputTiming.pipeMs);
+      if(previousOutputAt>0){double gap=(at-previousOutputAt)*1000;RecordSourceTiming(&writerCadence,gap);if(gap>25)outputGaps25++;if(gap>50)outputGaps50++;}previousOutputAt=at;
+    }
+    atomic_fetch_add(&emitted,1);
+  } else atomic_fetch_add(&encoderDropped,1);
+  if(atomic_fetch_sub(&inFlight,1)==0)Fail("encoding count underflow");
+  if(frameQueue)dispatch_async(frameQueue,^{@autoreleasepool{DrainCapture();}});
+  double at=Now();if(!synthetic && ready && at-lastSourceLogAt>=2){
+    lastSourceLogAt=at;
+    fprintf(stderr,"Source output aggregate: sequence=%llu frames=%u callbackToWriterMs[mean=%.3f max=%.3f] guardMs[mean=%.3f max=%.3f] byteLockMs[mean=%.3f max=%.3f] pipeMs[mean=%.3f max=%.3f] outputIntervalMs[mean=%.3f max=%.3f] gapsOver25=%llu gapsOver50=%llu replacedBeforeEncode=%u cursorBusySkipped=%u cursorPipeSkipped=%u inFlight=%u slots=%u contentMayBeIdle=true panelUnmeasured=true\n",(unsigned long long)sequence,atomic_load(&emitted),writerWaitTiming.sum/writerWaitTiming.count,writerWaitTiming.max,writerGuardTiming.sum/writerGuardTiming.count,writerGuardTiming.max,writerLockTiming.sum/writerLockTiming.count,writerLockTiming.max,writerPipeTiming.sum/writerPipeTiming.count,writerPipeTiming.max,writerCadence.count?writerCadence.sum/writerCadence.count:0,writerCadence.max,(unsigned long long)outputGaps25,(unsigned long long)outputGaps50,atomic_load(&capturesReplacedBeforeEncode),atomic_load(&cursorBusyDropped),atomic_load(&cursorPipeDropped),atomic_load(&inFlight),encodingSlots);
+  }
+}
+static double pendingCompletedAt[2];
 static void PublishEncoded(NSData *packet,EncodeTicket ticket,BOOL dropped){
-  // VT may complete on different callback threads. Publish in submission order
-  // and retain at most TWO compressed packets. No dependency frame is dropped.
+  // At most TWO encoded outputs (including queued/writing) exist. Submissions
+  // are not released until their ordered pipe write completes. No reference
+  // frame is evicted and no OS/pipe wait runs under this ordering mutex.
   pthread_mutex_lock(&outputMutex);
   if(!OrderAccept(&outputOrder,ticket.sequence,encodingSlots))Fail("encoded ordering");
-  pendingEncoded[ticket.sequence%2]=packet;pendingCaptureAt[ticket.sequence%2]=ticket.capturedAt;
+  unsigned slot=ticket.sequence%2;
+  pendingEncoded[slot]=packet;pendingCaptureAt[slot]=ticket.capturedAt;pendingCompletedAt[slot]=Now();
   if(benchmark && !dropped && latencyCount<1024){latencies[latencyCount]=(Now()-ticket.started)*1000;frameAges[latencyCount]=(Now()-ticket.capturedAt)*1000;latencyCount++;lastCaptureSequence=MAX(lastCaptureSequence,ticket.captureSequence);}
   uint64_t sequence=0;
   while(OrderTake(&outputOrder,&sequence)){
     unsigned index=sequence%2;NSData *ready=pendingEncoded[index];pendingEncoded[index]=nil;
-    if(ready){
-      if(benchmark){double at=Now(),captured=pendingCaptureAt[index];if(lastReadyAt>0 && sequence>=60){double span=at-lastReadyAt;ageArea+=(lastReadyAt-lastReadyCaptureAt)*span+span*span/2;ageDuration+=span;}lastReadyAt=at;lastReadyCaptureAt=captured;}
-      if(!benchmark)Output(ready);atomic_fetch_add(&emitted,1);
-    }
-    else atomic_fetch_add(&encoderDropped,1);
-    if(atomic_fetch_sub(&inFlight,1)==0)Fail("encoding count underflow");
+    double captured=pendingCaptureAt[index],completedAt=pendingCompletedAt[index];
+    // Dispatch while still ordered; jobs retain packets, not capture buffers.
+    dispatch_async(WriterQueue(),^{@autoreleasepool{FinishEncoded(ready,sequence,captured,completedAt);}});
   }
   pthread_mutex_unlock(&outputMutex);
-  if(frameQueue)dispatch_async(frameQueue,^{@autoreleasepool{DrainCapture();}});
 }
 static void Encoded(void *ctx,void *source,OSStatus status,VTEncodeInfoFlags flags,CMSampleBufferRef sample){
   (void)ctx;
@@ -645,7 +700,7 @@ static void OfferCaptureAt(CVPixelBufferRef pixel,CMTime pts,double capturedAt){
   // At most one pending source image; replacement occurs BEFORE H264 encoding.
   // Keeping the last damage frame also prevents a frozen final cursor/window
   // position when ScreenCaptureKit sends only idle frames after motion stops.
-  if(latestCapture)CVPixelBufferRelease(latestCapture);
+  if(latestCapture){atomic_fetch_add(&capturesReplacedBeforeEncode,1);CVPixelBufferRelease(latestCapture);}
   latestCapture=CVPixelBufferRetain(pixel);latestCapturePTS=pts;latestCaptureAt=capturedAt;DrainCapture();
 }
 static void OfferCapture(CVPixelBufferRef pixel,CMTime pts){OfferCaptureAt(pixel,pts,Now());}
@@ -865,9 +920,74 @@ static bool MockOnlineExact(const uint32_t *baseIDs,uint32_t baseCount,uint32_t 
 // Exercises BoundedInvalidFatal / BoundedHeartbeatFatal + Reconfigured
 // invariants + CanSubmitFrame transitions + preservation-policy field
 // coverage on a simulated clock and mocked baseline snapshots.
+// Offline pipe/concurrency fixtures. No display, capture, session or input APIs.
+static BOOL TestReadExact(int fd,void *bytes,size_t length){
+  uint8_t *p=bytes;double deadline=Now()+2;
+  while(length && Now()<deadline){ssize_t n=read(fd,p,length);if(n>0){p+=n;length-=(size_t)n;continue;}if(n==0)return NO;if(errno==EINTR)continue;if(errno!=EAGAIN&&errno!=EWOULDBLOCK)return NO;struct pollfd pf={fd,POLLIN,0};if(poll(&pf,1,20)<0&&errno!=EINTR)return NO;}
+  return length==0;
+}
+static NSData *TestReadPacket(int fd){uint32_t be=0;if(!TestReadExact(fd,&be,4))return nil;uint32_t n=CFSwapInt32BigToHost(be);if(!n||n>64)return nil;NSMutableData *data=[NSMutableData dataWithLength:n];return TestReadExact(fd,data.mutableBytes,n)?data:nil;}
+static BOOL TestPipe(int fd[2]){if(pipe(fd))return NO;for(int n=0;n<2;n++)if(fcntl(fd[n],F_SETFL,fcntl(fd[n],F_GETFL)|O_NONBLOCK)<0){close(fd[0]);close(fd[1]);return NO;}return YES;}
+static NSData *TestCursorPacket(void){uint8_t bytes[19]={7};bytes[9]=1;bytes[10]=2;return [NSData dataWithBytes:bytes length:19];}
+static BOOL TestCursorGuardIsolation(void){
+  int fd[2];if(!TestPipe(fd))return NO;
+  dispatch_semaphore_t entered=dispatch_semaphore_create(0),release=dispatch_semaphore_create(0);
+  dispatch_group_t done=dispatch_group_create();__block BOOL cursor=NO;int writeFD=fd[1];
+  dispatch_group_async(done,dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{@autoreleasepool{
+    cursor=TryCursorOutput(TestCursorPacket(),atomic_load(&reconfigEpoch),^{dispatch_semaphore_signal(entered);dispatch_semaphore_wait(release,dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC));},writeFD);
+  }});
+  BOOL ok=dispatch_semaphore_wait(entered,dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC))==0;
+  uint8_t video[2]={2,42};OutputWithGuard([NSData dataWithBytes:video length:2],^{},fd[1]);
+  NSData *first=TestReadPacket(fd[0]);ok=ok&&[first isEqual:[NSData dataWithBytes:video length:2]];
+  // The video completed while the simulated OS cursor query was still blocked.
+  dispatch_semaphore_signal(release);
+  ok=(dispatch_group_wait(done,dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC))==0)&&ok;
+  NSData *second=TestReadPacket(fd[0]);ok=ok&&cursor&&second.length==19&&((const uint8_t*)second.bytes)[0]==7;
+  close(fd[0]);close(fd[1]);return ok;
+}
+static BOOL TestCursorBusyAndEpoch(void){
+  int fd[2];if(!TestPipe(fd))return NO;
+  dispatch_group_t done=dispatch_group_create();__block BOOL sent=YES;int writeFD=fd[1];
+  pthread_mutex_lock(&writeMutex);
+  dispatch_group_async(done,dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{@autoreleasepool{sent=TryCursorOutput(TestCursorPacket(),atomic_load(&reconfigEpoch),^{},writeFD);}});
+  BOOL ok=dispatch_group_wait(done,dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC))==0;
+  pthread_mutex_unlock(&writeMutex);
+  ok=ok&&!sent;
+  // An invalidated geometry proof cannot publish a visible stale cursor.
+  ok=TryCursorOutput(TestCursorPacket(),atomic_load(&reconfigEpoch)+1,^{},fd[1])&&ok;
+  NSData *hidden=TestReadPacket(fd[0]);ok=ok&&hidden.length==19;
+  if(hidden.length==19)for(NSUInteger n=9;n<19;n++)ok=ok&&((const uint8_t*)hidden.bytes)[n]==0;
+  close(fd[0]);close(fd[1]);return ok;
+}
+static BOOL TestWriterBackpressureOrdering(void){
+  int fd[2];if(!TestPipe(fd))return NO;
+  uint8_t filler[512]={0};size_t filled=0;for(;;){ssize_t n=write(fd[1],filler,sizeof(filler));if(n>0){filled+=(size_t)n;continue;}if(n<0&&errno==EINTR)continue;break;}
+  // A full pipe drops the atomic cursor message instead of polling or tearing it.
+  BOOL ok=!TryCursorOutput(TestCursorPacket(),atomic_load(&reconfigEpoch),^{},fd[1]);
+  unsigned savedSlots=encodingSlots;int savedFD=outputFD;outputFD=fd[1];encodingSlots=2;
+  atomic_store(&inFlight,0);atomic_store(&emitted,0);outputOrder=(EncodedOrderWindow){0};
+  ok=ReserveEncoding()&&ReserveEncoding()&&ok;
+  uint8_t zero[2]={2,0},one[2]={2,1};double now=Now();
+  PublishEncoded([NSData dataWithBytes:one length:2],(EncodeTicket){.sequence=1,.started=now,.capturedAt=now},NO);
+  PublishEncoded([NSData dataWithBytes:zero length:2],(EncodeTicket){.sequence=0,.started=now,.capturedAt=now},NO);
+  // Both callbacks returned despite the blocked writer; no third slot is freed.
+  ok=ok&&atomic_load(&inFlight)==2&&!ReserveEncoding();
+  while(filled){size_t n=MIN(filled,sizeof(filler));if(!TestReadExact(fd[0],filler,n)){ok=NO;break;}filled-=n;}
+  NSData *a=TestReadPacket(fd[0]),*b=TestReadPacket(fd[0]);
+  ok=ok&&[a isEqual:[NSData dataWithBytes:zero length:2]]&&[b isEqual:[NSData dataWithBytes:one length:2]];
+  double deadline=Now()+2;while(atomic_load(&inFlight)&&Now()<deadline)usleep(100);
+  ok=ok&&atomic_load(&inFlight)==0&&atomic_load(&emitted)==2;
+  dispatch_sync(WriterQueue(),^{});outputFD=savedFD;encodingSlots=savedSlots;outputOrder=(EncodedOrderWindow){0};
+  atomic_store(&emitted,0);atomic_store(&inFlight,0);atomic_store(&maximumInFlight,0);
+  close(fd[0]);close(fd[1]);return ok;
+}
 static int SelfTest(void){
   int failures=0;
   #define CHECK(cond,name) do{if(!(cond)){fprintf(stderr,"FAIL %s\n",name);failures++;}else fprintf(stderr,"PASS %s\n",name);}while(0)
+
+  CHECK(TestCursorGuardIsolation(),"cursor-slow-guard-does-not-lock-video");
+  CHECK(TestCursorBusyAndEpoch(),"cursor-busy-skips-and-stale-epoch-hides");
+  CHECK(TestWriterBackpressureOrdering(),"writer-backpressure-callbacks-return-two-slot-bound-and-order");
 
   CHECK(PumpWait(1,0)==0.025,"pump-long-wait-capped-25ms");
   CHECK(PumpWait(1,1)==0 && PumpWait(1,2)==0 && PumpWait(-1,0)==0,"pump-expired-negative-no-wait");
@@ -1261,7 +1381,7 @@ int main(int argc,const char **argv){@autoreleasepool {
   // Early lifecycle contract line: parent reads stderr via launchHelper and
   // logs each line. State the bounded contract as counts/booleans only; no
   // display IDs, origins, counts of specific displays or geometry are logged.
-  fprintf(stderr,"Bounded display helper 0.8.30.2: startupHiDPIModePhase=postDetach ownedModeTxn=ownedOnly physicalBaselineBounded=yes preservesPhysicalSettings=yes reassertPrecreateOnlyInOwnStartupTxn=yes postStartPhysicalReplay=no setupScope=session ownedResolutionSessionFixed=yes ownedNonMirroredRequired=yes reconfigFatal=no newFrameSubmissionSuspendedDuringInvalid=yes encodedOwnedFramesInFlightEmitted=yes capturesPhysicalOtherDisplay=no rollsBackUserGeometryOnExit=no\n");
+  fprintf(stderr,"Bounded display helper 0.8.30.5: startupHiDPIModePhase=postDetach ownedModeTxn=ownedOnly physicalBaselineBounded=yes preservesPhysicalSettings=yes reassertPrecreateOnlyInOwnStartupTxn=yes postStartPhysicalReplay=no setupScope=session ownedResolutionSessionFixed=yes ownedNonMirroredRequired=yes reconfigFatal=no newFrameSubmissionSuspendedDuringInvalid=yes encodedOwnedFramesInFlightEmitted=yes capturesPhysicalOtherDisplay=no rollsBackUserGeometryOnExit=no\n");
   StartWatchdog();
   if(!BaselineSupported())Fail("unsupported physical display baseline");
   PlacementPhysical placementPhysical[8];
