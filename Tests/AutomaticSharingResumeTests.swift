@@ -32,5 +32,28 @@ func runAutomaticSharingResumeTests()->Int {
   let bindingB=AutomaticSharingResume.Binding(pair:pairB,inputIsSender:false,host:"169.254.1.3")
   reducer.bind(binding);reducer.bind(bindingB);reducer.bind(nil)
   expect(reducer.lastBinding==bindingB && reducer.binding==nil)
+  // First authenticated defaults require no manual video button on either Mac.
+  // Ordinary disconnect and repeated cleanup preserve intent; user OFF and the
+  // emergency/manual stop latch remain authoritative through route rebinding.
+  for sender in [false,true] {
+    let live=AutomaticSharingResume.Binding(pair:pair,inputIsSender:sender,host:"169.254.1.2")
+    var initial=SavedSharingState.authenticatedDefault(pair:pair,inputIsSender:sender)
+    var alwaysOn=AutomaticSharingResume();alwaysOn.bind(live)
+    func restore(_ time:Double,_ safe:Bool=true,_ active:Bool=false,_ cleaning:Bool=false)->Bool {
+      alwaysOn.shouldStart(now:time,intent:initial,safe:safe,active:active,cleaning:cleaning)
+    }
+    expect(!restore(0,false));expect(!restore(0,true,true));expect(!restore(0,true,false,true))
+    expect(restore(0))
+    alwaysOn.bind(nil);expect(!restore(1))
+    alwaysOn.bind(live);expect(restore(2))
+    alwaysOn.manualStop();alwaysOn.bind(nil);alwaysOn.bind(live)
+    expect(!restore(100))
+    alwaysOn.manualResume();expect(restore(101))
+    initial.videoEnabled=false
+    alwaysOn.bind(nil);alwaysOn.bind(live);expect(!restore(200))
+    // Rebinding to an address is never sufficient to start a different peer.
+    alwaysOn.bind(.init(pair:pairB,inputIsSender:sender,host:"169.254.1.2"))
+    initial.videoEnabled=true;expect(!restore(300))
+  }
   print("Automatic sharing resume reducer tests failures=\(failures)");return failures
 }

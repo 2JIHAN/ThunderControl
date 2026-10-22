@@ -227,3 +227,5 @@
 "When a connection request arrives, enter the code from the Sender Mac." = "When a connection request arrives, enter the code from the Sender Mac.";
 "Sending Mac" = "Sending Mac";
 "Receiving Mac" = "Receiving Mac";
+
+"Full screen unavailable; using a window" = "Full screen unavailable; using a window";

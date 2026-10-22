@@ -1,5 +1,9 @@
 # Apple notarization
 
+## v0.8.27 draft status
+
+The build and strict/deep Developer ID signature checks passed with the existing app identity. This new binary is **not notarized or stapled**. Gatekeeper reports `Unnotarized Developer ID`. Publishing remains blocked until notarization credentials are supplied and Apple accepts this exact build. Do not disable Gatekeeper or reuse the older release ticket.
+
 ## Published v0.8.26 download
 
 On 2026-10-21, Apple's notary service accepted ThunderControl 0.8.26 / build 56 with status code 0, `Ready for distribution`, and no listed issues. The approval ticket was stapled to the app and validated. Gatekeeper assessed it as `accepted`, `source=Notarized Developer ID`.

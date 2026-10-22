@@ -10,6 +10,14 @@ struct SavedSharingState:Codable,Equatable {
   var videoEnabled:Bool
   var videoSending:Bool
   var valid:Bool {pair.localID != pair.peerID && videoSending == !inputIsSender && (!inputIsSender ? !inputAuto && !inputForward : !receiverConsent) && !(inputAuto && inputForward)}
+  /// Default intent after the caller has proved a live, authenticated peer.
+  /// This is not authorization: route, session and permission gates still own
+  /// activation. Existing records (including explicit OFF) must take priority.
+  static func authenticatedDefault(pair:LayoutDevicePair,inputIsSender:Bool)->Self {
+    .init(pair:pair,inputIsSender:inputIsSender,inputAuto:inputIsSender,
+      inputForward:false,receiverConsent:!inputIsSender,videoEnabled:true,
+      videoSending:!inputIsSender)
+  }
   /// No record means no explicit per-pair OFF was saved. Preserve the existing
   /// authenticated sender's default auto-input intent even if peer geometry
   /// has not arrived when the first video button is pressed.
@@ -42,6 +50,14 @@ final class SavedSharingStateStore {
   }
   func load(pair:LayoutDevicePair,inputIsSender:Bool)->SavedSharingState? {
     records()?.first{$0.pair==pair && $0.inputIsSender==inputIsSender}
+  }
+  /// Seed once, never migrate a saved OFF back to ON. Unreadable storage is
+  /// not an absent record and must never be replaced with permissive defaults.
+  @discardableResult func seedAuthenticatedDefaults(pair:LayoutDevicePair,inputIsSender:Bool)->SavedSharingState? {
+    guard isReadable else{return nil}
+    if let existing=load(pair:pair,inputIsSender:inputIsSender) {return existing}
+    let initial=SavedSharingState.authenticatedDefault(pair:pair,inputIsSender:inputIsSender)
+    return save(initial) ? initial:nil
   }
   @discardableResult func save(_ state:SavedSharingState)->Bool {
     guard state.valid,let existing=records() else{return false}

@@ -44,17 +44,18 @@ struct AutomaticSharingResume {
     return sharingStore.load(pair:pair,inputIsSender:relay.inputIsSender)
   }
   func sharingSeedCurrentIntent() {
-    guard !isAutomationTest,!applicationIsQuitting,sharingStore.isReadable,relay.authenticated,let pair=relay.authenticatedDevicePair,
-      sharingStore.load(pair:pair,inputIsSender:relay.inputIsSender)==nil,
+    guard !isAutomationTest,!applicationIsQuitting,!automaticConnectionPaused,
+      !sharingInputRestoreBlocked,!sharingResume.blocked,!relay.automaticReconnectSuspended,
+      sharingStore.isReadable,relay.authenticated,let pair=relay.authenticatedDevicePair,
+      let host=relay.authenticatedSharingPeerHost,DisplayPeerRoute.valid(host),
+      relay.sessionAllowed,!relay.sessionLockedSignal,!relay.screenSleeping,!relay.systemSleeping,
+      !relay.hasUnresolvedLocalRecovery,inputPermissionsReady(),
       !relay.displayTopologyTransitionActive,!displayMode.cleaning else{return}
-    guard relay.auto || relay.forward || relay.inject || displayMode.active else{return}
-    var state=SavedSharingState.off(pair:pair,inputIsSender:relay.inputIsSender)
-    state.inputAuto=relay.inputIsSender && relay.auto
-    state.inputForward=relay.inputIsSender && !relay.auto && relay.forward
-    state.receiverConsent = !relay.inputIsSender && relay.inject
-    // Only an observed active/waiting display can seed video, never an IP preference.
-    state.videoEnabled=displayMode.active && displayMode.sharingSending == !relay.inputIsSender
-    sharingStore.save(state)
+    // A proven live peer, not a discovered/stored address, adopts always-on
+    // input and video intent once. Actual capture still requires the existing
+    // screen-recording permission and topology/session guards in restoreTick.
+    // Saved OFF records and manual/emergency stop latches always win.
+    sharingStore.seedAuthenticatedDefaults(pair:pair,inputIsSender:relay.inputIsSender)
   }
   func sharingUserChangedInput() {
     guard !isAutomationTest,!applicationIsQuitting else{return}
@@ -62,7 +63,7 @@ struct AutomaticSharingResume {
     guard let pair=relay.authenticatedDevicePair ?? binding?.pair else{return}
     let sender=relay.authenticated ? relay.inputIsSender:(binding?.inputIsSender ?? false)
     guard (mode.selectedSegment==0)==sender else{return}
-    var state=sharingStore.load(pair:pair,inputIsSender:sender) ?? .off(pair:pair,inputIsSender:sender)
+    var state=sharingStore.load(pair:pair,inputIsSender:sender) ?? .authenticatedDefault(pair:pair,inputIsSender:sender)
     state.inputAuto=sender && automatic.state == .on
     state.inputForward=sender && !state.inputAuto && forward.state == .on
     state.receiverConsent = !sender && enable.state == .on

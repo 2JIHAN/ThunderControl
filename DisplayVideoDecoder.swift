@@ -344,6 +344,29 @@ func displayVideoInitialContentRect(format: DisplayVideoFormat = .standard, visi
                   width: size.width, height: size.height)
 }
 
+/// One native transition request per viewer lifetime. A bounded failure exposes a
+/// usable window; never issue another toggle while AppKit may still be entering.
+struct DisplayViewerStartup {
+    enum Phase: Equatable { case idle, waitingForWindow, enteringFullScreen, fullScreen, windowed, closed }
+    private(set) var phase: Phase = .idle
+    var mayPresentVideo: Bool { phase == .fullScreen || phase == .windowed }
+    var isPending: Bool { phase == .waitingForWindow || phase == .enteringFullScreen }
+    mutating func begin(fullScreen: Bool) { phase = fullScreen ? .waitingForWindow : .windowed }
+    mutating func requestIfReady(windowReady: Bool) -> Bool {
+        guard phase == .waitingForWindow, windowReady else { return false }
+        phase = .enteringFullScreen; return true
+    }
+    mutating func didEnterFullScreen() {
+        guard phase != .closed, phase != .idle else { return }
+        phase = .fullScreen
+    }
+    @discardableResult mutating func useWindowedFallback() -> Bool {
+        guard isPending else { return false }
+        phase = .windowed; return true
+    }
+    mutating func close() { phase = .closed }
+}
+
 @MainActor final class DisplayViewer: NSObject, NSWindowDelegate {
     let format: DisplayVideoFormat
     private let targetScreen: NSScreen?
@@ -352,6 +375,10 @@ func displayVideoInitialContentRect(format: DisplayVideoFormat = .standard, visi
     }
     var startsFullScreen = true
     private var windowEpoch: UInt64 = 0
+    private var startup = DisplayViewerStartup()
+    private var startupTimer: Timer?
+    private var startupDeadline: TimeInterval = 0
+    var isVideoPresentationReadyForTests: Bool { startup.mayPresentVideo }
     var acceptsViewerInput=true
     var onClose: (() -> Void)?
     /// Only explicit native-window close or locally handled Escape, never codec teardown.
@@ -382,6 +409,7 @@ func displayVideoInitialContentRect(format: DisplayVideoFormat = .standard, visi
         closing = false
         windowEpoch &+= 1
         let epoch = windowEpoch
+        startup.begin(fullScreen: startsFullScreen)
         let screen = targetScreen ?? NSScreen.main ?? NSScreen.screens.first
         let available = screen.map { $0.visibleFrame.intersection($0.frame) } ?? NSRect(x: 0, y: 0, width: 1024, height: 768)
         let content = displayVideoInitialContentRect(format: format, visibleFrame: available)
@@ -391,6 +419,9 @@ func displayVideoInitialContentRect(format: DisplayVideoFormat = .standard, visi
         window.escapeCloses=acceptsViewerInput
         window.title = TCText("Mac mini Extended Display")
         window.backgroundColor = .black; window.isReleasedWhenClosed = false
+        // Native fullscreen needs an ordered/key window; do not expose its small
+        // decorated startup frame, or submit video before the Space is ready.
+        window.alphaValue = startup.mayPresentVideo ? 1 : 0
         window.acceptsMouseMovedEvents = true
         window.collectionBehavior = [.fullScreenPrimary]; window.contentMinSize = NSSize(width: min(320, content.width), height: min(320, content.width) * CGFloat(format.height) / CGFloat(format.width))
         window.contentAspectRatio = format.size
@@ -405,12 +436,45 @@ func displayVideoInitialContentRect(format: DisplayVideoFormat = .standard, visi
         window.setFrame(frame, display: false); window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         if startsFullScreen {
-            DispatchQueue.main.async { [weak self, weak window] in
-                guard let self, let window, !self.closing, self.windowEpoch == epoch,
-                      self.viewerWindow === window, !window.styleMask.contains(.fullScreen) else { return }
-                window.toggleFullScreen(nil)
+            startupDeadline = ProcessInfo.processInfo.systemUptime + 5
+            let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self, weak window] _ in
+                MainActor.assumeIsolated {
+                    guard let self, let window, !self.closing, self.windowEpoch == epoch,
+                          self.viewerWindow === window else { return }
+                    self.advanceFullScreenStartup(window)
+                }
             }
+            startupTimer = timer; RunLoop.main.add(timer, forMode: .common)
         }
+    }
+    private func advanceFullScreenStartup(_ window: NSWindow) {
+        guard startup.isPending else { return }
+        if ProcessInfo.processInfo.systemUptime >= startupDeadline {
+            finishFullScreenFallback(window); return
+        }
+        if startup.requestIfReady(windowReady: window.isVisible && window.isKeyWindow && NSApp.isActive) {
+            // Advance state before AppKit: delegate callbacks may be synchronous.
+            window.toggleFullScreen(nil)
+        }
+    }
+    private func finishFullScreenFallback(_ window: NSWindow) {
+        guard startup.useWindowedFallback() else { return }
+        startupTimer?.invalidate(); startupTimer = nil
+        window.alphaValue = 1
+        window.title = TCText("Mac mini Extended Display") + " (" + TCText("Full screen unavailable; using a window") + ")"
+        NSLog("ThunderControl: native fullscreen startup failed or timed out; keeping a usable viewer window (no automatic toggle retry).")
+        drainPresentation()
+    }
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window === viewerWindow, !closing else { return }
+        startup.didEnterFullScreen()
+        startupTimer?.invalidate(); startupTimer = nil
+        window.title = TCText("Mac mini Extended Display"); window.alphaValue = 1
+        drainPresentation()
+    }
+    func windowDidFailToEnterFullScreen(_ window: NSWindow) {
+        guard window === viewerWindow, !closing else { return }
+        finishFullScreenFallback(window)
     }
     func accept(_ payload: Data) throws {
         guard viewerWindow != nil, !closing else { throw DisplayVideoError.decoderFailed }
@@ -426,7 +490,7 @@ func displayVideoInitialContentRect(format: DisplayVideoFormat = .standard, visi
         drainPresentation()
     }
     private func drainPresentation() {
-        guard !closing, let layer = surface?.videoLayer, latestDecoded.pixel != nil else { return }
+        guard !closing, startup.mayPresentVideo, let layer = surface?.videoLayer, latestDecoded.pixel != nil else { return }
         guard #available(macOS 14.0, *) else { close(); return }
         let renderer = layer.sampleBufferRenderer
         guard renderer.status != .failed else { close(); return }
@@ -463,6 +527,7 @@ func displayVideoInitialContentRect(format: DisplayVideoFormat = .standard, visi
     }
     func close() {
         guard !closing else { return }; closing = true
+        startup.close(); startupTimer?.invalidate(); startupTimer = nil
         removeLocalInputMonitor(); reportFocusLost()
         clear()
         let old = viewerWindow; viewerWindow = nil; surface = nil; old?.delegate = nil; old?.close()
@@ -534,6 +599,7 @@ func displayVideoInitialContentRect(format: DisplayVideoFormat = .standard, visi
     }
     func windowWillClose(_ notification: Notification) {
         guard !closing else { return }; closing = true
+        startup.close(); startupTimer?.invalidate(); startupTimer = nil
         removeLocalInputMonitor(); reportFocusLost()
         clear(); viewerWindow?.delegate = nil; viewerWindow = nil; surface = nil
         onUserClose?()

@@ -91,6 +91,7 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
 /// It does not create a virtual display, initiate networking, or post input.
 /// Parent wiring: --display-viewer-ui-test <synthetic.frames> <new-output.png>.
 @MainActor func runDisplayViewerUITests(path: String, output: String, format: DisplayVideoFormat = .standard, targetScreen: NSScreen? = nil, startsFullScreen: Bool = false) async throws {
+    try displayViewerStartupLifecycleTests()
     guard #available(macOS 14.0, *) else { throw DisplayLiveUITestError.failed("macOS14 required") }
     try displayLiveRequire(format.valid, "valid expected format")
     let frames = try displayLiveSyntheticFrames(path, format: format)
@@ -121,6 +122,13 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     let created = application.windows.filter { !initialWindowIDs.contains($0.windowNumber) && $0.title == TCText("Mac mini Extended Display") }
     try displayLiveRequire(created.count == 1, "exact own viewer window")
     let window = created[0]
+    if startsFullScreen {
+        try displayLiveRequire(!viewer.isVideoPresentationReadyForTests && window.alphaValue == 0 && viewer.presentationStats.submitted == 0, "no decorated-window/video flash before native fullscreen confirmation")
+        viewer.show()
+        try displayLiveRequire(!viewer.isVideoPresentationReadyForTests && window.alphaValue == 0, "re-show while pending must not reveal window or issue another fullscreen toggle")
+    } else {
+        try displayLiveRequire(viewer.isVideoPresentationReadyForTests && window.alphaValue == 1, "explicit windowed mode starts visibly without fullscreen wait")
+    }
     var enteredFullScreen = false
     let fullScreenObserver = NotificationCenter.default.addObserver(forName: NSWindow.didEnterFullScreenNotification, object: window, queue: .main) { _ in
         enteredFullScreen = true
@@ -132,7 +140,7 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
         try await pump(until: { enteredFullScreen && viewer.isFullScreenForTests }, maximum: 5, stage: "native fullscreen entry")
         // Re-showing an existing viewer must not toggle it back out of fullscreen.
         viewer.show()
-        try displayLiveRequire(viewer.isFullScreenForTests, "existing viewer remains fullscreen")
+        try displayLiveRequire(viewer.isFullScreenForTests && viewer.isVideoPresentationReadyForTests && window.alphaValue == 1, "existing viewer remains fullscreen and visible only after confirmed entry")
     }
     try await pump(until: { window.isKeyWindow && application.isActive && gained > 0 }, maximum: 3,stage:"initial active key viewer")
     for (index, packet) in frames.enumerated() {
@@ -167,4 +175,31 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     let colorfulSamples = try displayLiveVerifyScreenshot(outputURL.path)
     try displayLiveRequire(closed == 0 && ProcessInfo.processInfo.systemUptime < deadline, "test final state")
     print("PASS native viewer: fullscreen=\(viewer.isFullScreenForTests) decoded=8 submitted=8 colorfulSamples=\(colorfulSamples) focusLossCallbacks=\(lost) focusGainCallbacks=\(gained) unexpectedCloses=0; own-window generated-pattern screenshot only; no network, virtual display or input posting")
+}
+
+/// Pure lifecycle regression coverage: no AppKit activation, capture or input.
+/// Also usable independently of the native fullscreen test harness.
+func displayViewerStartupLifecycleTests() throws {
+    var startup = DisplayViewerStartup()
+    try displayLiveRequire(!startup.mayPresentVideo, "idle viewer must not present video")
+    startup.begin(fullScreen: true)
+    try displayLiveRequire(startup.isPending && !startup.mayPresentVideo, "fullscreen startup holds video")
+    try displayLiveRequire(!startup.requestIfReady(windowReady: false), "wait for native key/active window readiness")
+    try displayLiveRequire(startup.requestIfReady(windowReady: true), "ready window requests fullscreen once")
+    try displayLiveRequire(!startup.requestIfReady(windowReady: true) && !startup.mayPresentVideo, "in-flight transition must not toggle again or render")
+    startup.didEnterFullScreen()
+    try displayLiveRequire(startup.mayPresentVideo && !startup.isPending && !startup.useWindowedFallback(), "confirmed entry cannot be downgraded by stale timeout")
+    startup.close(); startup.didEnterFullScreen()
+    try displayLiveRequire(!startup.mayPresentVideo && !startup.requestIfReady(windowReady: true), "closed viewer ignores late entry and request")
+    startup.begin(fullScreen: true)
+    try displayLiveRequire(startup.useWindowedFallback() && startup.mayPresentVideo, "readiness timeout falls back to usable window")
+    try displayLiveRequire(!startup.useWindowedFallback() && !startup.requestIfReady(windowReady: true), "fallback is idempotent and cannot toggle")
+    startup.begin(fullScreen: true)
+    _ = startup.requestIfReady(windowReady: true)
+    try displayLiveRequire(startup.useWindowedFallback() && startup.mayPresentVideo, "native failure/entry timeout releases held video")
+    startup.didEnterFullScreen()
+    try displayLiveRequire(startup.phase == .fullScreen && startup.mayPresentVideo, "late native entry after fallback remains usable without second toggle")
+    startup.close(); startup.begin(fullScreen: false)
+    try displayLiveRequire(startup.mayPresentVideo && !startup.isPending && !startup.requestIfReady(windowReady: true), "explicit windowed/reopened viewer needs no native transition")
+    print("PASS viewer startup: readiness gate, one native request, confirmation, bounded usable fallback, late callbacks and reopen; no network/input")
 }

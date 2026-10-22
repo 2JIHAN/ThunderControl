@@ -227,3 +227,5 @@
 "When a connection request arrives, enter the code from the Sender Mac." = "연결 요청이 오면 보내는 맥의 코드를 입력하세요.";
 "Sending Mac" = "보내는 Mac";
 "Receiving Mac" = "받는 Mac";
+
+"Full screen unavailable; using a window" = "전체 화면을 시작할 수 없어 창으로 표시합니다";

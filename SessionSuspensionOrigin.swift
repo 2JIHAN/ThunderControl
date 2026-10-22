@@ -1,13 +1,14 @@
 import Foundation
 
 // Only confirmed lock/sleep/login-session transitions are automatically
-// recoverable. Ordinary foreground loss, Secure Input and all explicit safety
-// failures stay independent, even if a lock happens shortly afterwards.
+// recoverable. Ordinary foreground loss and all explicit safety failures stay
+// independent, even if a lock happens shortly afterwards. Secure Input alone
+// does not suspend an authenticated connection.
 enum SessionSuspensionOrigin: Equatable {case independent,transition}
 func mayAdoptSessionTransition(suspended:Bool,origin:SessionSuspensionOrigin)->Bool {
   !suspended || origin == .transition
 }
-// Cleanup never enables input. Secure Input remains a separate resume gate.
+// Cleanup never enables input. Session lock/sleep proof remains mandatory.
 func mayClearSessionLockAfterUnlock(snapshot:SessionSafetySnapshot,unlockObserved:Bool,screenSleeping:Bool,systemSleeping:Bool,observersInstalled:Bool)->Bool {
   !screenSleeping && verifiedStandbyUnlock(snapshot:snapshot,unlockObserved:unlockObserved,systemSleeping:systemSleeping,secureInput:false,observersInstalled:observersInstalled)
 }

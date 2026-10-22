@@ -1250,8 +1250,8 @@ final class Relay {
     guard reports==2,r.automaticSuspensionEpoch==first else{return false}
     permit.observedUnlock();r.suspendAutomaticForSession(.transition)
     guard permit.permits(paused:false,epoch:first) else{return false}
-    // Auth, emergency, permission, cursor and unknown foreground/Secure Input
-    // stops all use the independent setter. A subsequent lock cannot adopt it.
+    // Auth, emergency, permission, cursor and unknown foreground stops use the
+    // independent setter. Secure Input alone no longer stops the connection.
     for _ in 0..<6 {
       r.automaticReconnectSuspended=true
       let independent=r.automaticSuspensionEpoch
@@ -1293,7 +1293,7 @@ final class Relay {
     if context != nil || auto || forward || inject {
       stop(reason:"Session safety: "+reason)
     }
-    status(TCText("Safety stop: ") + reason + (reason.contains("Secure input") ? TCText(". Close password or security dialogs, then click Connect or Resume Listening."):TCText(". Check the safety state, then click Connect or Resume Listening.")))
+    status(TCText("Safety stop: ") + reason + TCText(". Check the safety state, then click Connect or Resume Listening."))
   }
   func prepareSessionForExplicitStart() throws {
     guard NSApp.isActive else { throw Failure("Activate ThunderControl before starting a session") }
@@ -1303,7 +1303,7 @@ final class Relay {
         snapshot: fresh, lockedSignal: false, sleeping: screenSleeping || systemSleeping,
         secureInput: isSystemSecureInputEnabled()) == nil
     else {
-      throw Failure("Session is inactive, locked, asleep or using secure input")
+      throw Failure("Session is inactive, locked or asleep")
     }
     transportScreenLockObserved=false
     sessionLockedSignal = false
@@ -1347,10 +1347,21 @@ final class Relay {
     requestSourceActivation?()
     if NSApp.isActive { sourceBecameActive() }
   }
+  /// Focus changes revoke active remote ownership, not authenticated transport
+  /// or saved sharing intent. Lock/sleep/session checks still take precedence.
+  func pauseSourceForForegroundLoss() {
+    guard sender else{return}
+    if let token=handoff.token {_ = control("cancel",token:token)}
+    forward=false
+    forceLocal()
+    status("Local input active after focus change; connection and screen sharing maintained.")
+  }
   func sourceResignedActive() {
     if desktopFocusIntent != nil {cancelDesktopFocusRestore();_ = restoreLocal()}
     if sender && (forward || (isTransferring && !awaitingSourceActivation)) {
-      sessionBecameUnsafe("source lost foreground cursor ownership",origin:freshSessionSuspensionOrigin)
+      if let reason=currentSessionBlockReason(forceRefresh:true) {
+        sessionBecameUnsafe(reason,origin:freshSessionSuspensionOrigin)
+      } else {pauseSourceForForegroundLoss()}
     }
   }
   var remoteDisplaySize: CGSize?
@@ -2215,6 +2226,28 @@ final class Relay {
     subject.receiveControl(Wire(kind:"active",session:UUID().uuidString,sequence:1,token:UUID().uuidString))
     return subject.context === ctx && !ctx.cancelled && subject.generation==g && subject.handoff.phase == .local
   }
+  static func verifyForegroundPausePreservesConnectionForTests() -> Bool {
+    final class Mock: CursorRecoveryAPI {
+      func associate(_ associated: Bool) -> CGError { .success }
+      func hide(display: CGDirectDisplayID) -> CGError { .success }
+      func show(display: CGDirectDisplayID) -> CGError { .success }
+      func warp(to point: CGPoint) -> CGError { .success }
+    }
+    var fds:[Int32]=[0,0]
+    guard socketpair(AF_UNIX,SOCK_STREAM,0,&fds)==0 else{return false}
+    defer{close(fds[1])}
+    let socket=OwnedSocket(fds[0]),context=SessionContext(socket)
+    defer{context.cancel(reason:"Foreground pause fixture finished")}
+    let subject=Relay(cursorResources:CursorRecoveryController(api:Mock()))
+    subject.sender=true;subject.context=context;subject.connection=socket
+    subject.key=SymmetricKey(size:.bits256);subject.auto=true;subject.forward=true
+    subject.handoff.phase = .remote
+    let generation=subject.generation,epoch=subject.automaticSuspensionEpoch
+    subject.pauseSourceForForegroundLoss()
+    return subject.context === context && subject.connection === socket && !context.cancelled
+      && subject.key != nil && subject.generation==generation && subject.automaticSuspensionEpoch==epoch
+      && !subject.automaticReconnectSuspended && subject.auto && !subject.forward && subject.handoff.phase == .local
+  }
   static func verifyUnsafeStopOrderingForTests() -> Bool {
     final class Mock: CursorRecoveryAPI {
       func associate(_ associated: Bool) -> CGError { .success }
@@ -2432,7 +2465,7 @@ final class Relay {
         return
       }
       if self.sender && (self.forward || self.handoff.phase == .remote) && !NSApp.isActive {
-        self.sessionBecameUnsafe("source lost foreground",origin:freshSessionSuspensionOrigin)
+        self.pauseSourceForForegroundLoss()
         return
       }
       _ = self.detectReceiverMapTransition()
@@ -2793,7 +2826,7 @@ final class Relay {
     }
     if context != nil, let reason = currentSessionBlockReason() { sessionBecameUnsafe(reason,origin:polledSessionSuspensionOrigin) }
     if sender && (forward || handoff.phase == .remote) && !NSApp.isActive {
-      sessionBecameUnsafe("source lost foreground",origin:freshSessionSuspensionOrigin)
+      pauseSourceForForegroundLoss()
     }
     let raw55 = UInt32(truncatingIfNeeded: e.getIntegerValueField(CGEventField(rawValue: 55)!))
     let type = ([29, 30].contains(raw55) ? CGEventType(rawValue: raw55) : reported) ?? reported
@@ -4813,7 +4846,9 @@ func edgeTests() throws {
 func tests() throws {
   check(runScreenLayoutTests() == 0)
   check(runSessionSafetyTests() == 0)
+  try displayViewerStartupLifecycleTests()
   check(Relay.verifyUnsafeStopOrderingForTests())
+  check(Relay.verifyForegroundPausePreservesConnectionForTests())
   print(
     "PASS unsafe session cancels transport and invalidates queues before mock cursor recovery/activation callback"
   )

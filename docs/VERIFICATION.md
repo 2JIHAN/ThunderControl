@@ -1,6 +1,21 @@
-# Verification scope for v0.8.26
+# Verification scope for v0.8.27 (build 57)
 
-## Inherited v0.8.25 implementation evidence
+## v0.8.27 current evidence and pending checks
+
+This is an experimental prerelease target. Publication approval is not evidence of a completed build, published asset, signature, notarization or physical two-Mac run.
+
+- **Source inspection:** `DisplayVideoDecoder.swift` gates video presentation on native full-screen confirmation, with a usable window fallback on failure or a five-second timeout and no repeated automatic toggle. This does not establish visible AppKit behavior on either physical Mac.
+- **Source inspection:** `SessionSafety.swift` defaults Secure Input to keeping the authenticated connection. It does not disable or bypass macOS protected event delivery. Lock, sleep and console/login-session checks remain blocking conditions.
+- **Source inspection:** `ThunderControl.swift` returns active source input locally on ordinary foreground loss without intentionally tearing down authenticated transport or video. This is not evidence of uninterrupted live video or authorization for background forwarding.
+- **Source inspection:** `SavedSharingState.swift` and `AutomaticSharingResume.swift` seed automatic input/video intent only for a valid live authenticated pair without an existing record. Saved OFF records and unreadable storage are not overwritten. Manual/emergency-stop latches and current authentication, route, permissions, session and capture/topology gates still constrain activation and restore.
+- **Standalone policy tests:** compiled and passed: session safety matrix, viewer startup lifecycle, saved sharing/rebind, video format and parser regressions.
+- **Main memory-only regression suite:** the optimized build and complete main suite passed in English and Korean. The helper state-machine, recovery, ownership, desktop-map and local-socket PIN pairing fixtures passed. The final stripped, re-signed binaries passed main/helper regressions again. The helper verifies Secure Input preserves video while lock/inactive/unknown/malformed session states remain blocking.
+- **Build and release checks:** optimized arm64 main/helper build and strict/deep Developer ID verification passed; the designated requirement matches the installed app. Both binaries were checked for the build user home path after stripping, with no match. Notarization is blocked on credentials; Gatekeeper reports `Unnotarized Developer ID`. This is not a published or notarized binary release. Final uploaded asset comparison remains pending.
+- **Integrated/live checks:** visible full-screen startup/fallback, Secure Input continuity, focus-loss local-input pause with transport/video retention, first-pair automatic start and saved-OFF/manual/emergency-stop behavior remain to be verified on two physical Macs.
+
+The release owner must fill in actual test and signing/notarization outcomes before claiming those checks passed. None of the source-level findings establishes two-Mac latency, broad OS compatibility or a security audit.
+
+## Historical v0.8.25 implementation evidence
 
 These measurements and live-helper checks were performed locally for the v0.8.25 implementation before public packaging. They are not repeated measurements of two physically connected Macs.
 
@@ -19,7 +34,7 @@ H.264 to authenticated encryption to the production decoder passed eight-frame g
 
 Local real-virtual-display testing received 333, 364, 354 and 322 frames across creation, left placement, upper placement and a larger saved-placement restore. Low-latency mode and a one-reference-buffer readback were observed. Physical-monitor fields stayed unchanged during the armed stable phase, and EOF cleanup restored the owned configuration. Temporary OS transitions before that stable phase were separately observed and are not claimed invariant.
 
-The full main regression suite and helper state-machine tests passed. The main suite includes 52 memory-only cases on the integrated system-gesture receiver path. Native full-screen presentation was checked on the Mac mini.
+For v0.8.25, the full main regression suite and helper state-machine tests passed. That main suite includes 52 memory-only cases on the integrated system-gesture receiver path. Native full-screen presentation was checked on the Mac mini for that earlier implementation, not the v0.8.27 startup change.
 
 ## Not established
 
@@ -29,9 +44,9 @@ The full main regression suite and helper state-machine tests passed. The main s
 - Real two-Mac Mission Control gestures, four-finger mapping or MacBook notch placement after updating both devices.
 - Independent cryptographic/security auditing, broad macOS compatibility, or a production support guarantee.
 
-## v0.8.26 localization and public packaging
+## Historical v0.8.26 localization and public packaging
 
-This release adds presentation-only localization and an offscreen native-control preview. The v0.8.25 encoder source is unchanged except its version banner. Wire keys, authentication, pairing storage, route policy, capture/decoder safety bounds and input gates are not intentionally changed.
+v0.8.26 added presentation-only localization and an offscreen native-control preview. The v0.8.25 encoder source is unchanged except its version banner. Wire keys, authentication, pairing storage, route policy, capture/decoder safety bounds and input gates are not intentionally changed.
 
 The clean signed build passed the full memory-only regression suite in both English and Korean. Localization checks passed 703 assertions, including parity of 228 keys in each bundled language, indexed parameters, printf types/order, regional Korean, English fallback and literal handling of peer-supplied values. The helper state-machine, recovery mocks, ownership, desktop-map and local-socket pairing integration tests also passed.
 
@@ -41,7 +56,7 @@ The final implementation retained the four-size generated H.264/AEAD/decoder pip
 
 Offscreen rendering and guarded-state observations do not establish visible-window focus behavior, packet instrumentation, live sharing or physical two-Mac results.
 
-## Apple notarization update, 2026-10-21
+## Historical v0.8.26 Apple notarization update, 2026-10-21
 
 Apple returned `Accepted`, status code 0, with the summary `Ready for distribution` and no listed issues. The approval ticket was stapled to the app and `stapler validate` passed. Strict/deep code-signature validation passed, and Gatekeeper returned `accepted` with `source=Notarized Developer ID`. Both executables remained byte-identical to the initial v0.8.26 package; there was no rebuild or re-sign after approval.
 

@@ -18,7 +18,7 @@ func runLockedTransportPolicyTests()->Int {
   }}}}}}
   for console in values {for login in values {for locked in values {for unlocked in [false,true] {for sleep in [false,true] {for secure in [false,true] {for observed in [false,true] {
     let s=SessionSafetySnapshot(onConsole:console,loginDone:login,screenLocked:locked)
-    check(verifiedStandbyUnlock(snapshot:s,unlockObserved:unlocked,systemSleeping:sleep,secureInput:secure,observersInstalled:observed)==(unlocked && observed && !sleep && !secure && console==true && login==true && locked != true))
+    check(verifiedStandbyUnlock(snapshot:s,unlockObserved:unlocked,systemSleeping:sleep,secureInput:secure,observersInstalled:observed)==(unlocked && observed && !sleep && console==true && login==true && locked != true))
   }}}}}}}
   for kind in ["event","begin","commit","active","return","returnAck","dock","appGesture","cursorMode","cancel"] {check(!lockedTransportOutgoingAllowed(Wire(kind:kind,session:"test",sequence:1)))}
   check(lockedTransportOutgoingAllowed(Wire(kind:"ping",session:"test",sequence:1)))

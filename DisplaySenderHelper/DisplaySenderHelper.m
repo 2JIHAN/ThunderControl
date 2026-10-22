@@ -253,10 +253,16 @@ static dispatch_queue_t frameQueue;
 static double Now(void){return NSProcessInfo.processInfo.systemUptime;}
 static void Fail(const char *reason){fprintf(stderr,"Display sender stopped: %s\n",reason);fflush(stderr);_exit(1);}
 static void SignalStop(int sig){(void)sig;_exit(2);}
+// Secure Input restricts OS input delivery, not authenticated video. Do not
+// disable/bypass it or tear down the virtual display when a password field opens.
+static BOOL SessionValuesSafe(id on,id login,id locked,BOOL secureInput){
+  (void)secureInput;
+  return on && login && CFGetTypeID((__bridge CFTypeRef)on)==CFBooleanGetTypeID() && CFGetTypeID((__bridge CFTypeRef)login)==CFBooleanGetTypeID() && [on boolValue] && [login boolValue] && (!locked || CFGetTypeID((__bridge CFTypeRef)locked)==CFBooleanGetTypeID()) && ![locked boolValue];
+}
 static BOOL SessionSafe(void){
   NSDictionary *d=CFBridgingRelease(CGSessionCopyCurrentDictionary());
   id on=d[(__bridge NSString*)kCGSessionOnConsoleKey],login=d[(__bridge NSString*)kCGSessionLoginDoneKey],locked=d[@"CGSSessionScreenIsLocked"];
-  return on && login && CFGetTypeID((__bridge CFTypeRef)on)==CFBooleanGetTypeID() && CFGetTypeID((__bridge CFTypeRef)login)==CFBooleanGetTypeID() && [on boolValue] && [login boolValue] && ![locked boolValue] && !IsSecureEventInputEnabled();
+  return SessionValuesSafe(on,login,locked,IsSecureEventInputEnabled());
 }
 static BOOL ModeSame(CGDisplayModeRef a,CGDisplayModeRef b){
   return a && b && CGDisplayModeGetIODisplayModeID(a)==CGDisplayModeGetIODisplayModeID(b) && CGDisplayModeGetWidth(a)==CGDisplayModeGetWidth(b) && CGDisplayModeGetHeight(a)==CGDisplayModeGetHeight(b) && CGDisplayModeGetPixelWidth(a)==CGDisplayModeGetPixelWidth(b) && CGDisplayModeGetPixelHeight(a)==CGDisplayModeGetPixelHeight(b) && CGDisplayModeGetRefreshRate(a)==CGDisplayModeGetRefreshRate(b) && CGDisplayModeGetIOFlags(a)==CGDisplayModeGetIOFlags(b);
@@ -800,6 +806,10 @@ static int SelfTest(void){
   int failures=0;
   #define CHECK(cond,name) do{if(!(cond)){fprintf(stderr,"FAIL %s\n",name);failures++;}else fprintf(stderr,"PASS %s\n",name);}while(0)
 
+  CHECK(SessionValuesSafe(@YES,@YES,@NO,NO) && SessionValuesSafe(@YES,@YES,@NO,YES),"password-secure-input-preserves-video");
+  CHECK(!SessionValuesSafe(@YES,@YES,@YES,NO) && !SessionValuesSafe(@YES,@YES,@YES,YES),"screen-lock-still-stops-video");
+  CHECK(!SessionValuesSafe(@NO,@YES,@NO,YES) && !SessionValuesSafe(@YES,@NO,@NO,YES) && !SessionValuesSafe(nil,@YES,@NO,YES) && !SessionValuesSafe(@YES,nil,@NO,YES),"inactive-unknown-session-still-stops-video");
+  CHECK(!SessionValuesSafe(@1,@YES,@NO,YES) && !SessionValuesSafe(@YES,@1,@NO,YES) && !SessionValuesSafe(@YES,@YES,@1,YES),"malformed-session-state-fails-closed");
   CHECK(!StartupModeChooseAllowed(NO,YES,YES,YES,NO),"startup-mode-cannot-choose-before-detach-commit");
   CHECK(StartupModeChooseAllowed(YES,YES,YES,YES,NO),"startup-mode-choose-after-detach-before-arm");
   CHECK(!StartupModeChooseAllowed(YES,YES,YES,YES,YES),"startup-mode-no-post-arm-write");
@@ -1169,7 +1179,7 @@ int main(int argc,const char **argv){@autoreleasepool {
   // Early lifecycle contract line: parent reads stderr via launchHelper and
   // logs each line. State the bounded contract as counts/booleans only; no
   // display IDs, origins, counts of specific displays or geometry are logged.
-  fprintf(stderr,"Bounded display helper 0.8.26: startupHiDPIModePhase=postDetach ownedModeTxn=ownedOnly physicalBaselineBounded=yes preservesPhysicalSettings=yes reassertPrecreateOnlyInOwnStartupTxn=yes postStartPhysicalReplay=no setupScope=session ownedResolutionSessionFixed=yes ownedNonMirroredRequired=yes reconfigFatal=no newFrameSubmissionSuspendedDuringInvalid=yes encodedOwnedFramesInFlightEmitted=yes capturesPhysicalOtherDisplay=no rollsBackUserGeometryOnExit=no\n");
+  fprintf(stderr,"Bounded display helper 0.8.27: startupHiDPIModePhase=postDetach ownedModeTxn=ownedOnly physicalBaselineBounded=yes preservesPhysicalSettings=yes reassertPrecreateOnlyInOwnStartupTxn=yes postStartPhysicalReplay=no setupScope=session ownedResolutionSessionFixed=yes ownedNonMirroredRequired=yes reconfigFatal=no newFrameSubmissionSuspendedDuringInvalid=yes encodedOwnedFramesInFlightEmitted=yes capturesPhysicalOtherDisplay=no rollsBackUserGeometryOnExit=no\n");
   StartWatchdog();
   if(!BaselineSupported())Fail("unsupported physical display baseline");
   [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];[NSApp finishLaunching];
