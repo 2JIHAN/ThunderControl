@@ -4,13 +4,17 @@
 
 Thunderbolt로 두 Mac을 직접 연결하고, MacBook의 키보드와 트랙패드, 화면으로 Mac mini에서 작업하세요.
 
-**[Apple Silicon용 다운로드](https://github.com/2JIHAN/ThunderControl/releases/download/v0.8.28/ThunderControl-0.8.28-macOS-arm64.zip)** | [릴리스 안내와 체크섬](https://github.com/2JIHAN/ThunderControl/releases/tag/v0.8.28)
+**[Apple Silicon용 다운로드](https://github.com/2JIHAN/ThunderControl/releases/download/v0.8.29/ThunderControl-0.8.29-macOS-arm64.zip)** | [릴리스 안내와 체크섬](https://github.com/2JIHAN/ThunderControl/releases/tag/v0.8.29)
 
-v0.8.28(빌드 58)은 Apple Silicon Mac 두 대를 위한 실험용 사전 릴리스입니다. 화면 공유에는 macOS 14 이상이 필요합니다. 전체 빌드·메모리 회귀 테스트·Developer ID 엄격 서명 검증은 통과했습니다. 2026-10-22 Apple 공증을 받았고 공개 ZIP에 공증 티켓을 부착했습니다. 공개 파일을 다시 내려받아 체크섬, 엄격 서명 검증, 티켓과 Gatekeeper의 Notarized Developer ID 판정을 확인했습니다.
+v0.8.29(빌드 59)은 Apple Silicon Mac 두 대를 위한 실험용 사전 릴리스입니다. 화면 공유에는 macOS 14 이상이 필요합니다. 전체 빌드·메모리 회귀 테스트·Developer ID 엄격 서명 검증은 통과했습니다. 2026-10-22 Apple 공증을 받았고 공개 ZIP에 공증 티켓을 부착했습니다. 공개 파일을 다시 내려받아 체크섬, 엄격 서명 검증, 티켓과 Gatekeeper의 Notarized Developer ID 판정을 확인했습니다.
 
 ![MacBook의 키보드와 포인터 입력은 Mac mini로, Mac mini의 확장 화면은 Thunderbolt Bridge를 통해 MacBook으로 전달됩니다.](docs/assets/overview-ko.svg)
 
 *앱 스크린샷이 아닌 연결 개념도입니다.*
+
+## 공유 시작 문제 수정 (0.8.29)
+
+역할 선택이 전체 중지로 처리되던 문제를 수정했습니다. 양쪽 Mac을 업데이트한 뒤 보내기 쪽에서 한 번 명시적으로 다시 연결해 이전 중지 상태의 입력을 재개하세요. 영상이 필요하면 **현 기기를 가상 디스플레이로 사용**을 체크하세요. 저장된 영상 OFF와 안전 중지는 자동으로 덮어쓰지 않습니다. 공유 대기와 차단 이유도 표시하고 기록합니다. 실제 두 Mac의 입력과 영상 복구는 현장 확인이 필요합니다.
 
 ## 확장 화면과 업데이트 확인 (0.8.28)
 

@@ -1,4 +1,14 @@
-# Verification scope for v0.8.28 (build 58)
+# Verification scope for v0.8.29 (build59)
+
+## Sharing startup regression
+
+A user field report and sender/receiver logs showed authenticated input connections and geometry exchange without Auto arming or display startup after repeated role changes. Source inspection found modeChanged calling the explicit Stop-all path, leaving shared input/video intent OFF and an input-restoration block. Authentication status was not evidence of completed sharing startup.
+
+The fix separates role teardown from explicit Stop, applies explicit Connect input-resume only after a matching authenticated generation/role/pair, preserves videoOFF and safety/session/permission/recovery gates, and preserves checkbox intent during same-peer address synchronization. Startup diagnostics record blocking gates/readiness without credentials. No blanket preference migration or reset is performed.
+
+The final Developer ID build and full safe release script passed. App/Relay lifecycle44, localization772, display48 and update160 checks passed, along with main/helper, recovery, ownership, desktop-map and local PIN fixtures and English/Korean offscreen AppKit checks. Apple notarization Accepted on2026-10-22, status code0, Ready for distribution, no listed issues. The ticket is stapled and validated. Strict/deep signature verification passed and Gatekeeper reports accepted, source=Notarized Developer ID. All signed app files remained unchanged after submission. App/Relay fixture coverage exercises actual teardown with inert sockets, explicit-resume and actual control dispatch, not the complete native modeChanged/Connect UI with physical peers. Physical two-Mac input/video recovery remains unverified until both devices update and reconnect.
+
+## Historical0.8.28 evidence
 
 ## Current local checks
 

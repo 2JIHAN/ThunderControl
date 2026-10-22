@@ -35,7 +35,7 @@ enum DisplayPreferencePolicy {
     let enabled=displayPreferenceToggle.state == .on
     UserDefaults.standard.set(enabled,forKey:"ThunderControl.virtualDisplayPreferred")
     displayPreferencePending=enabled;displayPreferencePendingPair=relay.authenticatedDevicePair
-    if enabled {sharingResume.manualResume()} else {sharingUserStoppedVideo();displayMode.stop()}
+    if enabled {if !sharingInputRestoreBlocked {sharingResume.manualResume()}} else {sharingUserStoppedVideo();displayMode.stop()}
     sharingRestoreTick()
   }
   func sharingReceivedDisplayPreference(_ enabled:Bool) {

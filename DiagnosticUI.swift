@@ -13,7 +13,7 @@ import ApplicationServices
       state.stringValue=TCText("Verifying sharing has stopped and inputs are released")
       state.textColor = .secondaryLabelColor
     } else if relay.authenticated {
-      state.stringValue=relay.isTransferring ? TCText("Controlling remote Mac"):TCText("Connected")
+      state.stringValue=relay.isTransferring ? TCText("Controlling remote Mac"):(sharingBlockedReason ?? (relay.inputIsSender && !relay.auto ? TCText("Connected. Waiting for input sharing readiness."):TCText("Connected")))
       state.textColor = .labelColor
     } else if relay.hasSession {
       state.stringValue=mode.selectedSegment==1 ? TCText("Waiting for connection requests"):TCText("Connecting...")

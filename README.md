@@ -4,13 +4,17 @@
 
 Use your MacBook's keyboard, trackpad and screen to work on your Mac mini over a direct Thunderbolt connection.
 
-**[Download for Apple Silicon](https://github.com/2JIHAN/ThunderControl/releases/download/v0.8.28/ThunderControl-0.8.28-macOS-arm64.zip)** | [Release notes and checksums](https://github.com/2JIHAN/ThunderControl/releases/tag/v0.8.28)
+**[Download for Apple Silicon](https://github.com/2JIHAN/ThunderControl/releases/download/v0.8.29/ThunderControl-0.8.29-macOS-arm64.zip)** | [Release notes and checksums](https://github.com/2JIHAN/ThunderControl/releases/tag/v0.8.29)
 
-v0.8.28 (build 58) is an experimental prerelease for two Apple Silicon Macs. Display sharing requires macOS 14 or later. The full build, memory-only regression suites and strict/deep Developer ID signature validation passed. Apple accepted notarization on 2026-10-22. The published ZIP contains the stapled ticket; checksum, strict/deep code signature, ticket validation and Gatekeeper Notarized Developer ID were verified again after downloading the public assets.
+v0.8.29 (build 59) is an experimental prerelease for two Apple Silicon Macs. Display sharing requires macOS 14 or later. The full build, memory-only regression suites and strict/deep Developer ID signature validation passed. Apple accepted notarization on 2026-10-22. The published ZIP contains the stapled ticket; checksum, strict/deep code signature, ticket validation and Gatekeeper Notarized Developer ID were verified again after downloading the public assets.
 
 ![MacBook sends keyboard and pointer input to Mac mini; Mac mini sends its extended display back over Thunderbolt Bridge.](docs/assets/overview-en.svg)
 
 *Connection diagram, not an app screenshot.*
+
+## Sharing startup fix (0.8.29)
+
+Role selection no longer acts as Stop-all. After updating both Macs, explicitly reconnect on Sender once to resume input from the old stopped state. Select **Use this Mac as a virtual display** if video is wanted. Saved videoOFF is preserved, and safety stops are not resumed by automatic reconnect. Sharing readiness/blocking reasons are now visible and logged. This fixes the authenticated-but-idle startup path; physical two-Mac recovery still requires field confirmation.
 
 ## Extended display and update checks (0.8.28)
 

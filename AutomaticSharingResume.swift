@@ -35,6 +35,7 @@ struct AutomaticSharingResume {
     } else {sharingResume.bind(nil);displayPreferenceLastSent=nil;if displayMode.active {displayMode.stop()}}
   }
   func sharingInputPermitted(pair:LayoutDevicePair,sender:Bool)->Bool {
+    if !applicationIsQuitting,!automaticConnectionPaused,!relay.automaticReconnectSuspended,!displayMode.cleaning,!relay.displayTopologyTransitionActive,!relay.hasUnresolvedLocalRecovery,relay.authenticated,relay.authenticatedDevicePair==pair,relay.inputIsSender==sender,relay.sessionAllowed,inputPermissionsReady() {_ = sharingApplyExplicitConnectIntent(pair:pair,sender:sender)}
     guard !applicationIsQuitting,!sharingInputRestoreBlocked,sharingStore.isReadable else{return false}
     guard let saved=sharingStore.load(pair:pair,inputIsSender:sender) else{return true}
     return sender ? saved.inputAuto:saved.receiverConsent
@@ -90,6 +91,7 @@ struct AutomaticSharingResume {
   }
   func sharingUserStoppedAll() {
     guard !applicationIsQuitting,!isAutomationTest else{return}
+    sharingExplicitResumePending=nil
     sharingInputRestoreBlocked=true
     if let pair=relay.authenticatedDevicePair {sharingStore.save(.off(pair:pair,inputIsSender:relay.inputIsSender))}
     else if let binding=sharingResume.lastBinding {sharingStore.save(.off(pair:binding.pair,inputIsSender:binding.inputIsSender))}
@@ -110,9 +112,11 @@ struct AutomaticSharingResume {
       let host=relay.authenticatedSharingPeerHost,DisplayPeerRoute.valid(host) else{sharingResume.bind(nil);displayPreferenceLastSent=nil;refreshDisplayPreferenceUI();return}
     sharingResume.bind(.init(pair:pair,inputIsSender:relay.inputIsSender,host:host))
     let safe = !automaticConnectionPaused && !relay.automaticReconnectSuspended && relay.sessionAllowed && !relay.sessionLockedSignal && !relay.screenSleeping && !relay.systemSleeping && !relay.hasUnresolvedLocalRecovery && inputPermissionsReady()
-    guard safe,!sharingInputRestoreBlocked else{return}
+    guard safe else{sharingReportGate(TCText("Sharing paused: check session, permissions or safety stop."));return}
+    _ = sharingApplyExplicitConnectIntent(pair:pair,sender:relay.inputIsSender)
+    guard !sharingInputRestoreBlocked else{sharingReportGate(TCText("Sharing paused. Stop and reconnect to resume."));return}
     sharingSeedCurrentIntent()
-    guard var state=sharingCurrentIntent() else{return}
+    guard var state=sharingCurrentIntent() else{sharingReportGate(TCText("Sharing preferences unavailable."));return}
     if relay.inputIsSender {
       if let pending=displayPreferencePending {
         if DisplayPreferencePolicy.pendingApplies(expected:displayPreferencePendingPair,current:pair) {
@@ -136,9 +140,11 @@ struct AutomaticSharingResume {
         if state.inputForward && !relay.forward {relay.restoreSavedSharingForwardIfReady()}
       } else if relay.inject != state.receiverConsent {relay.consent(state.receiverConsent)}
     }
-    guard DisplayPreferencePolicy.canStart(inputIsSender:relay.inputIsSender,compatible:relay.displayPreferenceCompatible,localIntent:state.videoEnabled,remoteIntent:relay.peerDisplayPreference) else{return}
+    guard DisplayPreferencePolicy.canStart(inputIsSender:relay.inputIsSender,compatible:relay.displayPreferenceCompatible,localIntent:state.videoEnabled,remoteIntent:relay.peerDisplayPreference) else{
+      if state.videoEnabled {sharingReportGate(relay.displayPreferenceCompatible ? TCText("Waiting for the Sender display request."):TCText("Automatic virtual display requires 0.8.28 or later on both Macs."))}else{sharingReportGate(nil)};return}
     state.videoEnabled=true // authenticated sender owns video; ignore stale receiver OFF
     let videoSafe=safe && relay.multiDisplayDesktopReady && (!state.videoSending || CGPreflightScreenCaptureAccess())
+    sharingReportGate(videoSafe ? nil:TCText("Screen sharing waits for capture permission and desktop readiness."))
     if sharingResume.shouldStart(now:ProcessInfo.processInfo.systemUptime,intent:state,safe:videoSafe,active:displayMode.active,cleaning:displayMode.cleaning) {
       // Current authenticated socket route only, never a stored unrelated host.
       displayPeer.stringValue=host;sharingAutomaticVideoStart=true

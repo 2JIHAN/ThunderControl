@@ -1067,6 +1067,9 @@ final class Relay {
     guard authenticated,sender,displayPreferenceCompatible else{return false}
     return enqueue(Wire(kind:"displayPreference",session:session,sequence:0,displayPreference:enabled))
   }
+  var sharingLifecyclePairForTests:LayoutDevicePair? {get{authenticatedDevicePair} set{authenticatedDevicePair=newValue}}
+  var sharingLifecycleCapabilityForTests:Bool {get{displayPreferenceCompatible} set{displayPreferenceCompatible=newValue}}
+  var sharingReadinessSummary:String {"sender=\(sender) auto=\(auto) inject=\(inject) receiverAvailable=\(receiverAvailable) geometry=\(remoteDisplaySize != nil) desktop=\(receiverDesktop != nil) origin=\(sourceOrigin != nil) peerVideo=\(peerDisplayPreference.map(String.init) ?? "none") compatible=\(displayPreferenceCompatible)"}
   private func automaticSharingInputAllowed(_ sending:Bool)->Bool {
     guard let pair=authenticatedDevicePair else{return automaticInputSharingPermitted == nil}
     return automaticInputSharingPermitted?(pair,sending) != false
@@ -3640,7 +3643,11 @@ final class PasteCommandProbe: NSResponder {
   var appearanceTimer:Timer?
   var appearanceInstalled=false
   var applicationIsQuitting=false
-  let sharingStore=SavedSharingStateStore()
+  let sharingStore:SavedSharingStateStore
+  var sharingNewPairVideoPreference:()->Bool? = {UserDefaults.standard.object(forKey:"ThunderControl.virtualDisplayPreferred") as? Bool}
+  var sharingExplicitResumePending:(generation:UUID,sender:Bool)?
+  var sharingLastGateDiagnostic=""
+  var sharingBlockedReason:String?
   var sharingResume=AutomaticSharingResume()
   var sharingAutomaticVideoStart=false
   var sharingRestoreInProgress=false
@@ -3657,7 +3664,7 @@ final class PasteCommandProbe: NSResponder {
   let displayPeer=NSTextField(string:"")
   let displayStatus=NSTextField(wrappingLabelWithString:TCText("Screen mode is stopped."))
   override convenience init() {self.init(relay:Relay())}
-  init(relay:Relay) {self.relay=relay;super.init()}
+  init(relay:Relay,sharingStore:SavedSharingStateStore=SavedSharingStateStore()) {self.relay=relay;self.sharingStore=sharingStore;super.init()}
   lazy var ownershipHUD = SourceOwnershipHUD()
   lazy var receiverCursorFocus=ReceiverCursorFocusController(window:window)
   let discovery = BridgeDiscovery()
@@ -4370,9 +4377,11 @@ final class PasteCommandProbe: NSResponder {
   }
   @objc func modeChanged() {
     displayPreferencePending=nil;displayPreferencePendingPair=nil
-    stop()
+    let keepPaused=automaticConnectionPaused || sharingInputRestoreBlocked || relay.automaticReconnectSuspended
+    sharingPrepareRoleChange()
+    tearDownConnection(userStop:false)
     UserDefaults.standard.set(mode.selectedSegment==0 ? "send":"receive",forKey:"preferredRole")
-    automaticConnectionPaused=false;nextAutomaticAttempt=0;nextDiscoveryAttempt=0;reconnectBackoff.reset();sessionAutoResume.revoke()
+    automaticConnectionPaused=keepPaused;nextAutomaticAttempt=0;nextDiscoveryAttempt=0;reconnectBackoff.reset();sessionAutoResume.revoke()
     refreshModeUI()
     refreshLocalAddress()
     if mode.selectedSegment == 0 { generatePIN(); searchPeers() }
@@ -4415,7 +4424,11 @@ final class PasteCommandProbe: NSResponder {
   }
   @objc func showManualPeer() {manualPeerRow.isHidden = manualPeerToggle.state != .on}
   @objc func peerSelected() {
-    displayPreferencePending=nil;displayPreferencePendingPair=nil
+    let i=peerPicker.indexOfSelectedItem
+    if discoveredPeers.indices.contains(i),peer.stringValue != discoveredPeers[i].ipv4 {displayPreferencePending=nil;displayPreferencePendingPair=nil}
+    syncSelectedPeerAddress()
+  }
+  func syncSelectedPeerAddress() {
     let i=peerPicker.indexOfSelectedItem
     guard discoveredPeers.indices.contains(i) else{return}
     peerSelectionConfirmed=true
@@ -4460,22 +4473,24 @@ final class PasteCommandProbe: NSResponder {
     do {
       let sending=mode.selectedSegment==0
       let p:UInt16=49177
-      if sending && manualPeerToggle.state != .on {guard peerSelectionConfirmed else{throw Failure(TCText("Select a discovered Receiver Mac or choose to enter an address directly"))};peerSelected()}
+      if sending && manualPeerToggle.state != .on {guard peerSelectionConfirmed else{throw Failure(TCText("Select a discovered Receiver Mac or choose to enter an address directly"))};syncSelectedPeerAddress()}
       if sending,pinField.stringValue.isEmpty {generatePIN()}
       if sending {guard pinField.stringValue.utf8.count==4,pinField.stringValue.utf8.allSatisfy({(48...57).contains($0)}) else{throw Failure(TCText("Set a 4-digit numeric code for this request"))}}
       discovery.stop();discoveryIsBrowsing=false
       let verified=try relay.start(name:"bridge0",peer:peer.stringValue,pass:sending ? pinField.stringValue : "",port:p,sendMode:sending)
+      sharingDidStartExplicitConnection(sending:sending)
       automaticSessionVerified=true;manualPairingAttempt=sending;refreshModeUI()
       if !sending {advertiseVerifiedReceiver(verified,port:p)}
     } catch {relay.status(safeConnectionError(error));if !relay.hasSession {discovery.stop()}}
   }
-  @objc func stop() {
-    sharingUserStoppedAll()
+  @objc func stop() {tearDownConnection(userStop:true)}
+  func tearDownConnection(userStop:Bool,updateUI:Bool=true) {
+    if userStop {sharingUserStoppedAll()}
     displayMode.stop()
     dockOutputTestGeneration=UUID()
     if let alert=pairingAlert {window.endSheet(alert.window,returnCode:.abort);pairingAlert=nil;pairingAlertToken=nil}
     automaticConnectionPaused=true;discoveryIsBrowsing=false;sessionAutoResume.revoke()
-    discovery.stop();relay.stop();forward.state = .off;enable.state = .off;automatic.state = .off;refreshModeUI()
+    discovery.stop();relay.stop();forward.state = .off;enable.state = .off;automatic.state = .off;if updateUI {refreshModeUI()}
   }
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     applicationIsQuitting=true // Preserve sharing intent, but never restart video while quitting.
@@ -5106,7 +5121,7 @@ struct ThunderControlMain {
     } else if CommandLine.arguments.contains("--desktop-map-self-test") {
       exit(runDesktopMapTransitionTests()==0 ? 0:1)
     } else if CommandLine.arguments.contains("--self-test") {
-      do { try tests();check(runLocalizationTests()==0);check(runConcurrentDisplayTests()==0);check(runReceiverDesktopRelayTests()==0);check(runReceiverDesktopTests()==0);check(runSavedDesktopPlacementTests()==0);check(runReceiverDesktopUITests()==0);check(runDesktopMapTransitionTests()==0);check(runDesktopHandoffRoutingTests()==0);check(runDesktopEntryPolicyTests()==0);check(runDisplayHeartbeatTests()==0);check(runDisplayTrustTests()==0);check(runDisplayRemoteInputTests()==0);check(runDisplayTransportTests()==0);check(runDisplayVideoFormatTests()==0);check(runSavedSharingStateTests()==0);check(runAutomaticSharingResumeTests()==0);check(runDisplayPreferenceTests()==0);check(runUpdateReleaseTests()==0);check(runSavedVirtualDisplayPlacementTests()==0);check(runVirtualDisplayPlacementSessionTests()==0);check(runDisplayVideoDecoderTests()==0);check(runScrollReplayTests()==0);check(runDiscoveryRecoveryPolicyTests()==0);check(runNativeGestureTests()==0);check((runDockTransferStateTests()+runDesktopSystemGestureTests())==0);check(runTransitionMotionTests()==0);check(runGestureTraceTests()==0);check(runCursorIsolationTests()==0);check(runCursorVisibilityTests()==0);check(runConnectedLayoutTests()==0);check(runCursorModeProtocolTests()==0);ReceiverCursorFocusTests.run();check(runAutomaticConnectionPolicyTests()==0);check(runCableReconnectPolicyTests()==0);check(runReceiverFocusRetryTests()==0);check(runReturnWarpResumeTests()==0);check(runDiagnosticStoreTests()==0);check(runTrustedPairingTests()==0);check(runConnectionNotificationTests()==0);check(runSingleConnectionNotificationTests()==0);check(runAppAppearancePreferencesTests()==0);check(runAppWindowPresentationPolicyTests()==0);check(runConnectedWindowVisibilityTests()==0);check(runSavedScreenLayoutTests()==0);check(Relay.verifyDeviceLayoutPersistenceForTests());check(runSessionAutoResumeTests()==0);check(runSessionSuspensionOriginTests()==0);check(Relay.verifySessionSuspensionOriginsForTests());check(runAutomaticReconnectBackoffTests()==0);check(runBridgeRecoverySchedulingTests()==0);check(runLockedTransportPolicyTests()==0);check(runAuthenticatedRouteHintTests()==0);check(runFastReconnectPolicyTests()==0);check(Relay.verifyLockedTransportInputBarrierForTests());check(!Relay().receiverWantsCursorHidden);ScreenArrangementDragTests.run();check(Relay.verifyReceiverRecoveryBlocksStartForTests());check(Relay.verifyReceiverPhysicalInputCancelsActivationForTests());try dockProtocolTests();try appGesturePacketTests();print("PASS gesture memory classification and system stream ordering; no posting") } catch {
+      do { try tests();check(runLocalizationTests()==0);check(runConcurrentDisplayTests()==0);check(runReceiverDesktopRelayTests()==0);check(runReceiverDesktopTests()==0);check(runSavedDesktopPlacementTests()==0);check(runReceiverDesktopUITests()==0);check(runDesktopMapTransitionTests()==0);check(runDesktopHandoffRoutingTests()==0);check(runDesktopEntryPolicyTests()==0);check(runDisplayHeartbeatTests()==0);check(runDisplayTrustTests()==0);check(runDisplayRemoteInputTests()==0);check(runDisplayTransportTests()==0);check(runDisplayVideoFormatTests()==0);check(runSavedSharingStateTests()==0);check(runAutomaticSharingResumeTests()==0);check(runSharingLifecycleIntegrationTests()==0);check(runDisplayPreferenceTests()==0);check(runUpdateReleaseTests()==0);check(runSavedVirtualDisplayPlacementTests()==0);check(runVirtualDisplayPlacementSessionTests()==0);check(runDisplayVideoDecoderTests()==0);check(runScrollReplayTests()==0);check(runDiscoveryRecoveryPolicyTests()==0);check(runNativeGestureTests()==0);check((runDockTransferStateTests()+runDesktopSystemGestureTests())==0);check(runTransitionMotionTests()==0);check(runGestureTraceTests()==0);check(runCursorIsolationTests()==0);check(runCursorVisibilityTests()==0);check(runConnectedLayoutTests()==0);check(runCursorModeProtocolTests()==0);ReceiverCursorFocusTests.run();check(runAutomaticConnectionPolicyTests()==0);check(runCableReconnectPolicyTests()==0);check(runReceiverFocusRetryTests()==0);check(runReturnWarpResumeTests()==0);check(runDiagnosticStoreTests()==0);check(runTrustedPairingTests()==0);check(runConnectionNotificationTests()==0);check(runSingleConnectionNotificationTests()==0);check(runAppAppearancePreferencesTests()==0);check(runAppWindowPresentationPolicyTests()==0);check(runConnectedWindowVisibilityTests()==0);check(runSavedScreenLayoutTests()==0);check(Relay.verifyDeviceLayoutPersistenceForTests());check(runSessionAutoResumeTests()==0);check(runSessionSuspensionOriginTests()==0);check(Relay.verifySessionSuspensionOriginsForTests());check(runAutomaticReconnectBackoffTests()==0);check(runBridgeRecoverySchedulingTests()==0);check(runLockedTransportPolicyTests()==0);check(runAuthenticatedRouteHintTests()==0);check(runFastReconnectPolicyTests()==0);check(Relay.verifyLockedTransportInputBarrierForTests());check(!Relay().receiverWantsCursorHidden);ScreenArrangementDragTests.run();check(Relay.verifyReceiverRecoveryBlocksStartForTests());check(Relay.verifyReceiverPhysicalInputCancelsActivationForTests());try dockProtocolTests();try appGesturePacketTests();print("PASS gesture memory classification and system stream ordering; no posting") } catch {
         fputs("FAIL \(error)\n", stderr)
         exit(1)
       }

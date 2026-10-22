@@ -246,3 +246,9 @@
 "Current version: {0}. Published prereleases are included." = "Current version: {0}. Published prereleases are included.";
 "Open Release Page" = "Open Release Page";
 "Not Now" = "Not Now";
+"Sharing paused: check session, permissions or safety stop." = "Sharing paused: check session, permissions or safety stop.";
+"Sharing paused. Stop and reconnect to resume." = "Sharing paused. Stop and reconnect to resume.";
+"Sharing preferences unavailable." = "Sharing preferences unavailable.";
+"Waiting for the Sender display request." = "Waiting for the Sender display request.";
+"Screen sharing waits for capture permission and desktop readiness." = "Screen sharing waits for capture permission and desktop readiness.";
+"Connected. Waiting for input sharing readiness." = "Connected. Waiting for input sharing readiness.";

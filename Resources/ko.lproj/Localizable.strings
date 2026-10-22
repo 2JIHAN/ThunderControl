@@ -246,3 +246,9 @@
 "Current version: {0}. Published prereleases are included." = "현재 버전: {0}. 공개된 사전 릴리스도 확인합니다.";
 "Open Release Page" = "릴리스 페이지 열기";
 "Not Now" = "나중에";
+"Sharing paused: check session, permissions or safety stop." = "공유 일시 중지: 세션, 권한 또는 안전 중지 상태를 확인하세요.";
+"Sharing paused. Stop and reconnect to resume." = "공유가 중지돼 있습니다. 중지 후 다시 연결하면 재개됩니다.";
+"Sharing preferences unavailable." = "공유 설정을 읽을 수 없습니다.";
+"Waiting for the Sender display request." = "송신 Mac의 화면 요청을 기다리는 중입니다.";
+"Screen sharing waits for capture permission and desktop readiness." = "화면 기록 권한과 화면 구성 준비를 기다리는 중입니다.";
+"Connected. Waiting for input sharing readiness." = "연결됨. 입력 공유 준비를 기다리는 중입니다.";
