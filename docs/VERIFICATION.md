@@ -1,19 +1,24 @@
-# Verification scope for v0.8.27 (build 57)
+# Verification scope for v0.8.28 (build 58)
 
-## v0.8.27 current evidence and pending checks
+## Current local checks
 
-This is an experimental prerelease target. Publication approval is not evidence of a completed build, published asset, signature, notarization or physical two-Mac run.
+The optimized local build and full memory-only main regression suite passed. New authenticated display-preference protocol/policy tests passed 48 checks, including capability/role/session/sequence/envelope restrictions, pending pair policy, stale Receiver OFF, cleanup and manual-stop constraints. Localization passed 754 checks. Helper offline state-machine tests passed 233 assertions.
 
-- **Source inspection:** `DisplayVideoDecoder.swift` gates video presentation on native full-screen confirmation, with a usable window fallback on failure or a five-second timeout and no repeated automatic toggle. This does not establish visible AppKit behavior on either physical Mac.
-- **Source inspection:** `SessionSafety.swift` defaults Secure Input to keeping the authenticated connection. It does not disable or bypass macOS protected event delivery. Lock, sleep and console/login-session checks remain blocking conditions.
-- **Source inspection:** `ThunderControl.swift` returns active source input locally on ordinary foreground loss without intentionally tearing down authenticated transport or video. This is not evidence of uninterrupted live video or authorization for background forwarding.
-- **Source inspection:** `SavedSharingState.swift` and `AutomaticSharingResume.swift` seed automatic input/video intent only for a valid live authenticated pair without an existing record. Saved OFF records and unreadable storage are not overwritten. Manual/emergency-stop latches and current authentication, route, permissions, session and capture/topology gates still constrain activation and restore.
-- **Standalone policy tests:** compiled and passed: session safety matrix, viewer startup lifecycle, saved sharing/rebind, video format and parser regressions.
-- **Main memory-only regression suite:** the optimized build and complete main suite passed in English and Korean. The helper state-machine, recovery, ownership, desktop-map and local-socket PIN pairing fixtures passed. The final stripped, re-signed binaries passed main/helper regressions again. The helper verifies Secure Input preserves video while lock/inactive/unknown/malformed session states remain blocking.
-- **Build and release checks:** optimized arm64 main/helper build and strict/deep Developer ID verification passed; the designated requirement matches the installed app. Both binaries were checked for the build user home path after stripping, with no match. Notarization is blocked on credentials; Gatekeeper reports `Unnotarized Developer ID`. This is not a published or notarized binary release. Final uploaded asset comparison remains pending.
-- **Integrated/live checks:** visible full-screen startup/fallback, Secure Input continuity, focus-loss local-input pause with transport/video retention, first-pair automatic start and saved-OFF/manual/emergency-stop behavior remain to be verified on two physical Macs.
+English and Korean AppKit offscreen hierarchy tests verified that the checkbox belongs to the Sender section, status shares its connection parent, there is no Extended Display tab and the old display IP field has no parent. These are not physical two-Mac tests. The attempted Receiver-role offscreen invocation was another Sender preview due an existing automation guard; Receiver native UI is not independently verified. Layer-backed buttons were absent in offscreen PNG rendering, so those PNGs are not complete UI visual proof.
 
-The release owner must fill in actual test and signing/notarization outcomes before claiming those checks passed. None of the source-level findings establishes two-Mac latency, broad OS compatibility or a security audit.
+The input Sender owns negotiated video preference. Routing uses only the currently authenticated socket peer. Old peers retain input but no automatic video. Remote ON does not clear manual/emergency safety latches or bypass permissions, session checks or topology cleanup. Saved pair OFF is preserved; device defaults seed only an absent record. These claims are supported by source and memory-only tests, not a new physical connection trial.
+
+## Update check policy
+
+Update metadata is fetched from the fixed public GitHub releases endpoint, including prereleases, without cookies or credentials. Responses are limited to1MiB and requests have bounded timeouts; redirects are rejected. Version comparisons are semantic and only newer valid tags are offered. Release links are constructed for this repository, not taken from remote URL fields. Automatic checks are throttled to24h; a passive menu item indicates an update. Manual checks can show a result dialog. There is no automatic download, installation or app restart. Automation/test invocations do not make update requests. The final signed app passed160 updater fixture checks. English/Korean AppKit offscreen checks verified both update menu entries without network requests. A standalone anonymous live transport fixture fetched GitHub release metadata and selected public prerelease0.8.27 over0.8.26. A real future-version update on two installed Macs has not been demonstrated.
+
+## Distribution status
+
+Developer ID build and the complete safe release fixtures passed: main/helper, recovery, ownership, desktop-map and local-socket PIN integration. The designated signing requirement matches installed0.8.27. Apple notarization Accepted on 2026-10-22 (status code0, Ready for distribution, no listed issues). The ticket is stapled and validated; strict/deep signature verification passed and Gatekeeper reports accepted, source=Notarized Developer ID. Main/helper and all originally signed app files remained unchanged after submission. Final status is recorded in the release's NOTARIZATION.txt and download checksums.
+
+## Unverified behavior
+
+Physical two-Mac checkbox-to-display startup/stop/reconnect and native Receiver UI remain unverified. Actual latency, frame rate, broad macOS compatibility, real Mission Control gestures and protected input delivery are not guaranteed. Previous live results below are historical evidence, not new0.8.28 measurements.
 
 ## Historical v0.8.25 implementation evidence
 

@@ -283,18 +283,10 @@ struct OwnedDisplayMonitor {
 }
 
 @MainActor extension App {
-  func installDisplayTab() {
-    let tab=NSTabViewItem(identifier:"displayStream");tab.label=TCText("Extended Display")
-    let root=NSView(),stack=NSStackView();stack.orientation = .vertical;stack.alignment = .leading;stack.spacing=14;stack.translatesAutoresizingMaskIntoConstraints=false;root.addSubview(stack)
-    NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo:root.leadingAnchor,constant:20),stack.trailingAnchor.constraint(equalTo:root.trailingAnchor,constant:-20),stack.topAnchor.constraint(equalTo:root.topAnchor,constant:20)])
-    stack.addArrangedSubview(NSTextField(wrappingLabelWithString:TCText("Screen connection: Mac mini → MacBook / Input connection: MacBook → Mac mini. First complete the existing input connection with 0.8.22 or later on both Macs. Starting or ending the screen connection does not disconnect a working input connection.")))
-    stack.addArrangedSubview(NSTextField(wrappingLabelWithString:TCText("Click Receive Screen on the MacBook and Send Extended Display on the Mac mini. Input keeps using the existing automatic screen-crossing route. The video window is view-only and does not send duplicate input. Resolution is set when the connection starts; the screen is not stretched or cropped. The extended display position is saved for each device pair and reused on the next connection.")))
-    displayPeer.stringValue=DisplayPeerRoute.load() ?? "";displayPeer.placeholderString=TCText("MacBook Thunderbolt IPv4");displayPeer.widthAnchor.constraint(equalToConstant:420).isActive=true;stack.addArrangedSubview(displayPeer)
-    stack.addArrangedSubview(NSStackView(views:[NSButton(title:TCText("Send Extended Display"),target:self,action:#selector(sendDisplay)),NSButton(title:TCText("Receive Screen"),target:self,action:#selector(receiveDisplay)),NSButton(title:TCText("Stop Screen Sharing"),target:self,action:#selector(stopDisplay))]))
-    stack.addArrangedSubview(NSButton(title:TCText("Request Screen Recording Permission / Settings"),target:self,action:#selector(displayPermission)))
-    stack.addArrangedSubview(displayStatus)
-    stack.addArrangedSubview(NSTextField(wrappingLabelWithString:TCText("The connection stays active; input is briefly released only when adding or removing a screen. Control the original monitors and extended display together using the Receiver Mac's actual layout. Uses 2x HiDPI for the MacBook's built-in display, automatic full screen when receiving, a 60fps maximum (not guaranteed), Thunderbolt only. Ctrl+Option+Esc remains the emergency shortcut to return input control to this Mac.")))
-    tab.view=root;settingsTabs.addTabViewItem(tab)
+  func installDisplaySharing() {
+    screenPermissionButton.target=self;screenPermissionButton.action=#selector(displayPermission)
+    receiveSection.addArrangedSubview(screenPermissionButton)
+    relay.displayPreferenceChanged={[weak self] enabled in self?.sharingReceivedDisplayPreference(enabled)}
     displayMode.sessionPermitted={[weak self] in guard let self else{return false};return self.relay.sessionAllowed && !self.relay.screenSleeping && !self.relay.systemSleeping && self.relay.multiDisplayDesktopReady}
     displayMode.prepareInputTransition={[weak self] completion in guard let self else{completion(.failure(Failure("Input owner unavailable")));return};self.relay.beginDisplayTopologyTransition(completion:completion)}
     displayMode.commitInputDisplay={[weak self] original,id in guard let self else{throw Failure("Input owner unavailable")};try self.relay.commitDisplayTopology(original:original,ownedID:id)}
@@ -305,11 +297,10 @@ struct OwnedDisplayMonitor {
   }
   func beginDisplay(sending:Bool) {
     guard !displayMode.active,!displayMode.cleaning else{return}
+    guard relay.displayPreferenceCompatible else{displayStatus.stringValue=TCText("Automatic virtual display requires 0.8.28 or later on both Macs.");return}
     guard let pair=relay.authenticatedDevicePair,relay.authenticated,relay.inputIsSender == !sending else{displayStatus.stringValue=TCText("First complete the input connection: Sender on the MacBook → Receiver on the Mac mini. The existing connection has not been changed.");return}
     guard relay.multiDisplayDesktopReady else{displayStatus.stringValue=TCText("Integrated screen mapping requires 0.8.22 or later on both Macs. The existing input connection remains active.");return}
-    let typed=displayPeer.stringValue.trimmingCharacters(in:.whitespacesAndNewlines)
-    let destination = !typed.isEmpty ? typed : (DisplayPeerRoute.load() ?? peer.stringValue)
-    if sending {guard DisplayPeerRoute.valid(destination) else{displayStatus.stringValue=TCText("Check the MacBook's Thunderbolt IPv4 address. The existing input connection remains active.");return};displayPeer.stringValue=destination}
+    guard let destination=relay.authenticatedSharingPeerHost,DisplayPeerRoute.valid(destination) else{displayStatus.stringValue=TCText("Waiting for the authenticated peer route.");return}
     displayMode.inputBindingConflicts={[weak self] in guard let self,let current=self.relay.authenticatedDevicePair else{return false};return current != pair || self.relay.inputIsSender != !sending}
     displayMode.inputBindingValid={[weak self] in guard let self else{return false};return self.relay.authenticated && self.relay.authenticatedDevicePair==pair && self.relay.inputIsSender == !sending}
     do{try displayMode.start(sending:sending,peer:destination,expectedPair:pair)}catch{displayStatus.stringValue=safeConnectionError(error)}

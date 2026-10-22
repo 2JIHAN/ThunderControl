@@ -1179,7 +1179,7 @@ int main(int argc,const char **argv){@autoreleasepool {
   // Early lifecycle contract line: parent reads stderr via launchHelper and
   // logs each line. State the bounded contract as counts/booleans only; no
   // display IDs, origins, counts of specific displays or geometry are logged.
-  fprintf(stderr,"Bounded display helper 0.8.27: startupHiDPIModePhase=postDetach ownedModeTxn=ownedOnly physicalBaselineBounded=yes preservesPhysicalSettings=yes reassertPrecreateOnlyInOwnStartupTxn=yes postStartPhysicalReplay=no setupScope=session ownedResolutionSessionFixed=yes ownedNonMirroredRequired=yes reconfigFatal=no newFrameSubmissionSuspendedDuringInvalid=yes encodedOwnedFramesInFlightEmitted=yes capturesPhysicalOtherDisplay=no rollsBackUserGeometryOnExit=no\n");
+  fprintf(stderr,"Bounded display helper 0.8.28: startupHiDPIModePhase=postDetach ownedModeTxn=ownedOnly physicalBaselineBounded=yes preservesPhysicalSettings=yes reassertPrecreateOnlyInOwnStartupTxn=yes postStartPhysicalReplay=no setupScope=session ownedResolutionSessionFixed=yes ownedNonMirroredRequired=yes reconfigFatal=no newFrameSubmissionSuspendedDuringInvalid=yes encodedOwnedFramesInFlightEmitted=yes capturesPhysicalOtherDisplay=no rollsBackUserGeometryOnExit=no\n");
   StartWatchdog();
   if(!BaselineSupported())Fail("unsupported physical display baseline");
   [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];[NSApp finishLaunching];

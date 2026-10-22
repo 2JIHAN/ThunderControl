@@ -229,3 +229,20 @@
 "Receiving Mac" = "Receiving Mac";
 
 "Full screen unavailable; using a window" = "Full screen unavailable; using a window";
+"Use this Mac as a virtual display" = "Use this Mac as a virtual display";
+"Uses the connected Mac automatically. Both Macs require 0.8.28 or later." = "Uses the connected Mac automatically. Both Macs require 0.8.28 or later.";
+"Automatic virtual display requires 0.8.28 or later on both Macs." = "Automatic virtual display requires 0.8.28 or later on both Macs.";
+"Waiting for the authenticated peer route." = "Waiting for the authenticated peer route.";
+"Allow Screen Recording" = "Allow Screen Recording";
+
+"Check for Updates…" = "Check for Updates…";
+"Checking for updates…" = "Checking for updates…";
+"New version available" = "New version available";
+"Version {0} available…" = "Version {0} available…";
+"Could not check for updates" = "Could not check for updates";
+"You are up to date" = "You are up to date";
+"Check your Internet connection and try again later. GitHub may temporarily limit requests." = "Check your Internet connection and try again later. GitHub may temporarily limit requests.";
+"Version {0} is available. Open its GitHub release page to review and download it. The app will not install updates automatically." = "Version {0} is available. Open its GitHub release page to review and download it. The app will not install updates automatically.";
+"Current version: {0}. Published prereleases are included." = "Current version: {0}. Published prereleases are included.";
+"Open Release Page" = "Open Release Page";
+"Not Now" = "Not Now";

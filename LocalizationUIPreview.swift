@@ -17,6 +17,13 @@ import AppKit
               !relay.forward, !relay.inject, !relay.auto else {
             throw Failure("Offscreen preview admission failed")
         }
+        guard displayPreferenceToggle.superview === sendSection,
+              displayStatus.superview === sendSection.superview,
+              !settingsTabs.tabViewItems.contains(where:{($0.identifier as? String)=="displayStream"}),
+              displayPeer.superview==nil else{throw Failure("Simplified display UI hierarchy invalid")}
+        print("PASS actual UI hierarchy: sender checkbox, shared status, no display tab or address field")
+        guard let menu=NSApp.mainMenu?.items.first?.submenu,menu.items.contains(where:{$0 === appUpdateCheck.checkItem}),menu.items.contains(where:{$0 === appUpdateCheck.availableItem}),appUpdateCheck.availableItem.isHidden else{throw Failure("Update menu hierarchy invalid")}
+        print("PASS actual update menu: manual check and hidden passive availability item; offline")
         let destination = URL(fileURLWithPath: CommandLine.arguments[index + 1])
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         pinField.stringValue = ""

@@ -28,7 +28,7 @@ SIGNING_IDENTITY='Developer ID Application: Your Name (TEAMID)' bash build.sh
 
 A certificate fingerprint is also accepted by `codesign`. No personal certificate name, team ID, key or signing credential is committed in the build script. The helper and app are both signed with hardened runtime. Real Developer ID signing requests an Apple timestamp; ad-hoc signing does not.
 
-Developer ID signing alone is not Apple notarization. The published v0.8.26 download was subsequently notarized and stapled, without changing its executable bytes. Your own rebuild is not automatically notarized. See [the notarization workflow and verified release status](NOTARIZATION.md) and Apple's [documentation](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution). Notarization credentials must be managed privately and must never be committed.
+Developer ID signing alone is not Apple notarization. The published v0.8.28 download is notarized and stapled, without changing its executable bytes after submission. Your own rebuild is not automatically notarized. See [the notarization workflow and verified release status](NOTARIZATION.md) and Apple's [documentation](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution). Notarization credentials must be managed privately and must never be committed.
 
 Changing the signing identity of an already paired app can change how macOS recognizes its permission identity. Keep an older app available and do not replace a working installation merely to run tests.
 

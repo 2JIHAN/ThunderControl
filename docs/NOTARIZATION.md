@@ -1,8 +1,14 @@
 # Apple notarization
 
-## v0.8.27 draft status
+## Published v0.8.28 download
 
-The build and strict/deep Developer ID signature checks passed with the existing app identity. This new binary is **not notarized or stapled**. Gatekeeper reports `Unnotarized Developer ID`. Publishing remains blocked until notarization credentials are supplied and Apple accepts this exact build. Do not disable Gatekeeper or reuse the older release ticket.
+Apple notarization Accepted on 2026-10-22 (status code0, Ready for distribution, no listed issues). The ticket is stapled and validated; strict/deep signature verification passed and Gatekeeper reports accepted, source=Notarized Developer ID. Main/helper and all originally signed app files remained unchanged after submission.
+
+Submission ID: `d8ddf102-1116-473a-b4b9-8f150d17b3ce`. The release contains the checksums and NOTARIZATION.txt. Public asset re-download verification is performed before reporting deployment complete.
+
+## Published v0.8.27 download
+
+Apple accepted build57 on2026-10-22. Its ticket was stapled and validated, and the public ZIP passed checksum, strict/deep signature and Gatekeeper Notarized Developer ID checks. Its signed app files were unchanged.
 
 ## Published v0.8.26 download
 

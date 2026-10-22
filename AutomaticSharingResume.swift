@@ -32,7 +32,7 @@ struct AutomaticSharingResume {
     if relay.authenticated,let pair=relay.authenticatedDevicePair,
       let host=relay.authenticatedSharingPeerHost,DisplayPeerRoute.valid(host) {
       sharingResume.bind(.init(pair:pair,inputIsSender:relay.inputIsSender,host:host))
-    } else {sharingResume.bind(nil)}
+    } else {sharingResume.bind(nil);displayPreferenceLastSent=nil;if displayMode.active {displayMode.stop()}}
   }
   func sharingInputPermitted(pair:LayoutDevicePair,sender:Bool)->Bool {
     guard !applicationIsQuitting,!sharingInputRestoreBlocked,sharingStore.isReadable else{return false}
@@ -55,7 +55,12 @@ struct AutomaticSharingResume {
     // input and video intent once. Actual capture still requires the existing
     // screen-recording permission and topology/session guards in restoreTick.
     // Saved OFF records and manual/emergency stop latches always win.
-    sharingStore.seedAuthenticatedDefaults(pair:pair,inputIsSender:relay.inputIsSender)
+    let existing=sharingStore.load(pair:pair,inputIsSender:relay.inputIsSender)
+    if var initial=sharingStore.seedAuthenticatedDefaults(pair:pair,inputIsSender:relay.inputIsSender),
+      existing==nil,relay.inputIsSender,
+      let preferred=UserDefaults.standard.object(forKey:"ThunderControl.virtualDisplayPreferred") as? Bool {
+      initial.videoEnabled=preferred;sharingStore.save(initial)
+    }
   }
   func sharingUserChangedInput() {
     guard !isAutomationTest,!applicationIsQuitting else{return}
@@ -102,12 +107,26 @@ struct AutomaticSharingResume {
     guard !isAutomationTest,!applicationIsQuitting,!sharingRestoreInProgress else{return}
     sharingRestoreInProgress=true;defer{sharingRestoreInProgress=false}
     guard relay.authenticated,let pair=relay.authenticatedDevicePair,
-      let host=relay.authenticatedSharingPeerHost,DisplayPeerRoute.valid(host) else{sharingResume.bind(nil);return}
+      let host=relay.authenticatedSharingPeerHost,DisplayPeerRoute.valid(host) else{sharingResume.bind(nil);displayPreferenceLastSent=nil;refreshDisplayPreferenceUI();return}
     sharingResume.bind(.init(pair:pair,inputIsSender:relay.inputIsSender,host:host))
     let safe = !automaticConnectionPaused && !relay.automaticReconnectSuspended && relay.sessionAllowed && !relay.sessionLockedSignal && !relay.screenSleeping && !relay.systemSleeping && !relay.hasUnresolvedLocalRecovery && inputPermissionsReady()
     guard safe,!sharingInputRestoreBlocked else{return}
     sharingSeedCurrentIntent()
-    guard let state=sharingCurrentIntent() else{return}
+    guard var state=sharingCurrentIntent() else{return}
+    if relay.inputIsSender {
+      if let pending=displayPreferencePending {
+        if DisplayPreferencePolicy.pendingApplies(expected:displayPreferencePendingPair,current:pair) {
+          state.videoEnabled=pending
+          if sharingStore.save(state){displayPreferencePending=nil;displayPreferencePendingPair=nil}
+        } else {displayPreferencePending=nil;displayPreferencePendingPair=nil}
+      }
+      if relay.displayPreferenceCompatible {
+        if displayPreferenceLastSent?.0 != relay.generation || displayPreferenceLastSent?.1 != state.videoEnabled {
+          if relay.sendDisplayPreference(state.videoEnabled) {displayPreferenceLastSent=(relay.generation,state.videoEnabled)}
+        }
+      }
+    }
+    refreshDisplayPreferenceUI()
     if !relay.displayTopologyTransitionActive && !displayMode.cleaning {
       if relay.inputIsSender {
         if !state.inputAuto && relay.auto {relay.configureAuto(false,edge:relay.selectedEdge)}
@@ -117,6 +136,8 @@ struct AutomaticSharingResume {
         if state.inputForward && !relay.forward {relay.restoreSavedSharingForwardIfReady()}
       } else if relay.inject != state.receiverConsent {relay.consent(state.receiverConsent)}
     }
+    guard DisplayPreferencePolicy.canStart(inputIsSender:relay.inputIsSender,compatible:relay.displayPreferenceCompatible,localIntent:state.videoEnabled,remoteIntent:relay.peerDisplayPreference) else{return}
+    state.videoEnabled=true // authenticated sender owns video; ignore stale receiver OFF
     let videoSafe=safe && relay.multiDisplayDesktopReady && (!state.videoSending || CGPreflightScreenCaptureAccess())
     if sharingResume.shouldStart(now:ProcessInfo.processInfo.systemUptime,intent:state,safe:videoSafe,active:displayMode.active,cleaning:displayMode.cleaning) {
       // Current authenticated socket route only, never a stored unrelated host.
