@@ -11,6 +11,9 @@
 #import <fcntl.h>
 #import <unistd.h>
 #import <sys/stat.h>
+#import <sys/file.h>
+#import <sys/wait.h>
+#import <errno.h>
 #import <assert.h>
 #import <pthread.h>
 #import <limits.h>
@@ -174,8 +177,8 @@ static BOOL ParseOriginDecimal(const char *text,int32_t *value){
 static BOOL ParseInvocation(int argc,const char **argv,VideoFormat *format,OwnedOrigin *origin){
   if(argc<2)return NO;
   BOOL stream=!strcmp(argv[1],"--stream");
-  BOOL sizable=stream || !strcmp(argv[1],"--synthetic");
-  BOOL known=sizable || !strcmp(argv[1],"--selftest") || !strcmp(argv[1],"--probe") ||
+  BOOL sizable=stream || !strcmp(argv[1],"--synthetic") || !strcmp(argv[1],"--identity-probe");
+  BOOL known=sizable || !strcmp(argv[1],"--selftest") || !strcmp(argv[1],"--event-pump-selftest") || !strcmp(argv[1],"--probe") ||
     !strcmp(argv[1],"--benchmark-old") || !strcmp(argv[1],"--benchmark-new") ||
     !strcmp(argv[1],"--benchmark-ratecontrol");
   if(!known)return NO;
@@ -236,6 +239,44 @@ static OwnedOrigin DefaultOwnedOrigin(VideoFormat format,const PlacementPhysical
   OwnedOrigin result={YES,(int32_t)x,(int32_t)y};return SavedOriginValid(result,format,physical,count)?result:none;
 }
 static int targetFPS=60;
+// One stable display identity per macOS user. The valid uid_t domain maps
+// injectively to nonzero uint32 serials; no random, format, peer or PID input.
+// Keep vendor/product and this mapping stable across future app versions.
+static const unsigned OwnedDisplayVendor=505,OwnedDisplayProduct=0x6001;
+static unsigned StableDisplaySerial(uid_t user){return user==(uid_t)UINT32_MAX?0:(uint32_t)user+1u;}
+static BOOL SameDisplayIdentity(unsigned vendor,unsigned product,unsigned serial,unsigned wanted){
+  return wanted && vendor==OwnedDisplayVendor && product==OwnedDisplayProduct && serial==wanted;
+}
+// Held until process exit (including _exit/signal paths). Never unlink the
+// lock file: unlinking a held inode permits another process to bypass flock.
+static int identityLockFD=-1;
+static int AcquireDisplayIdentityLock(const char *directory,uid_t owner){
+  int dir=open(directory,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);if(dir<0)return -1;
+  struct stat info;
+  if(fstat(dir,&info)||!S_ISDIR(info.st_mode)||info.st_uid!=owner||(info.st_mode&022)){close(dir);return -1;}
+  int fd=openat(dir,"display.lock",O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC,0600);close(dir);
+  if(fd<0)return -1;
+  if(fstat(fd,&info)||!S_ISREG(info.st_mode)||info.st_uid!=owner||info.st_nlink!=1||(info.st_mode&022)||flock(fd,LOCK_EX|LOCK_NB)){
+    close(fd);return -1;
+  }
+  return fd;
+}
+static int AcquireUserDisplayIdentityLock(void){
+  if(getuid()!=geteuid())return -1;
+  NSString *directory=[NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/ThunderControl/VirtualDisplay"];
+  if(![NSFileManager.defaultManager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions:@0700} error:NULL])return -1;
+  return AcquireDisplayIdentityLock(directory.fileSystemRepresentation,geteuid());
+}
+static BOOL DisplayIdentityAvailable(unsigned serial){
+  CGDirectDisplayID ids[32];uint32_t count=0;
+  if(!serial||CGGetOnlineDisplayList(32,ids,&count)!=kCGErrorSuccess||count>32)return NO;
+  for(uint32_t i=0;i<count;i++){
+    unsigned vendor=CGDisplayVendorNumber(ids[i]),product=CGDisplayModelNumber(ids[i]),other=CGDisplaySerialNumber(ids[i]);
+    if(SameDisplayIdentity(vendor,product,other,serial) ||
+       (vendor==OwnedDisplayVendor && product==OwnedDisplayProduct && !other))return NO;
+  }
+  return YES; // Never adopt an existing display or randomize on collision.
+}
 static pid_t parentPID=0;
 static double latencies[1024],frameAges[1024];
 static BOOL tuning=NO,tuneBaselineProfile=NO,tuneHighBitrate=NO;
@@ -736,7 +777,16 @@ static void Pump(double t){@autoreleasepool {
     Guard();
     double remaining=PumpWait(deadline,Now());
     if(remaining<=0)break;
-    [NSRunLoop.currentRunLoop runUntilDate:[NSDate dateWithTimeIntervalSinceNow:remaining]];
+    NSDate *until=[NSDate dateWithTimeIntervalSinceNow:remaining];
+    if(NSApp){
+      // A registered AppKit process must drain its application event queue.
+      // NSRunLoop alone services CF sources but leaves AppKit events queued,
+      // allowing WindowServer to mark the otherwise-live helper unresponsive.
+      NSEvent *event=[NSApp nextEventMatchingMask:NSEventMaskAny untilDate:until inMode:NSDefaultRunLoopMode dequeue:YES];
+      if(event)[NSApp sendEvent:event];
+    } else {
+      [NSRunLoop.currentRunLoop runUntilDate:until];
+    }
   }
 }}
 static void StartWatchdog(void){
@@ -981,10 +1031,60 @@ static BOOL TestWriterBackpressureOrdering(void){
   atomic_store(&emitted,0);atomic_store(&inFlight,0);atomic_store(&maximumInFlight,0);
   close(fd[0]);close(fd[1]);return ok;
 }
+// Optional GUI-session regression: application-local synthetic event only.
+// No window, virtual display, capture, network or CG input posting.
+@interface HelperPumpTestApplication:NSApplication
+@property BOOL sawPumpTestEvent;
+@end
+@implementation HelperPumpTestApplication
+-(void)sendEvent:(NSEvent*)event {
+  if(event.type==NSEventTypeApplicationDefined && event.subtype==0x5443){self.sawPumpTestEvent=YES;return;}
+  [super sendEvent:event];
+}
+@end
+static int EventPumpSelfTest(void){
+  HelperPumpTestApplication *app=[HelperPumpTestApplication sharedApplication];
+  [app setActivationPolicy:NSApplicationActivationPolicyProhibited];[app finishLaunching];
+  NSEvent *event=[NSEvent otherEventWithType:NSEventTypeApplicationDefined location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:0 context:nil subtype:0x5443 data1:0 data2:0];
+  if(!event)return 5;[app postEvent:event atStart:NO];Pump(.1);
+  fprintf(stderr,"%s helper AppKit event pump: local event delivered, no window/display/capture/input posting\n",app.sawPumpTestEvent?"PASS":"FAIL");
+  return app.sawPumpTestEvent?0:5;
+}
+static BOOL TestDisplayIdentityLock(void){
+  char directory[PATH_MAX];
+  int length=snprintf(directory,sizeof(directory),"%s/tc-identity.XXXXXX",NSTemporaryDirectory().fileSystemRepresentation);
+  if(length<0||(size_t)length>=sizeof(directory)||!mkdtemp(directory))return NO;
+  char path[PATH_MAX],other[PATH_MAX];
+  snprintf(path,sizeof(path),"%s/display.lock",directory);snprintf(other,sizeof(other),"%s/other",directory);
+  int first=AcquireDisplayIdentityLock(directory,geteuid()),second=-1;BOOL ok=first>=0;
+  if(first>=0){
+    second=AcquireDisplayIdentityLock(directory,geteuid());ok=ok&&second<0;if(second>=0)close(second);
+    pid_t child=fork();
+    if(child==0){close(first);int fd=AcquireDisplayIdentityLock(directory,geteuid());if(fd>=0)close(fd);_exit(fd<0?0:1);}
+    int status=0;pid_t waited=-1;if(child>0){do{waited=waitpid(child,&status,0);}while(waited<0&&errno==EINTR);}
+    ok=ok&&child>0&&waited==child&&WIFEXITED(status)&&WEXITSTATUS(status)==0;
+    close(first);
+    second=AcquireDisplayIdentityLock(directory,geteuid());ok=ok&&second>=0;if(second>=0)close(second);
+  }
+  ok=ok&&AcquireDisplayIdentityLock(directory,geteuid()+1)<0;
+  unlink(path);BOOL linked=symlink("/dev/null",path)==0;
+  second=AcquireDisplayIdentityLock(directory,geteuid());ok=ok&&linked&&second<0;if(second>=0)close(second);unlink(path);
+  int temp=open(other,O_WRONLY|O_CREAT|O_EXCL,0600);if(temp>=0)close(temp);
+  linked=temp>=0&&link(other,path)==0;
+  second=AcquireDisplayIdentityLock(directory,geteuid());ok=ok&&linked&&second<0;if(second>=0)close(second);
+  unlink(path);unlink(other);chmod(directory,0777);
+  second=AcquireDisplayIdentityLock(directory,geteuid());ok=ok&&second<0;if(second>=0)close(second);
+  chmod(directory,0700);unlink(path);rmdir(directory);return ok;
+}
 static int SelfTest(void){
   int failures=0;
   #define CHECK(cond,name) do{if(!(cond)){fprintf(stderr,"FAIL %s\n",name);failures++;}else fprintf(stderr,"PASS %s\n",name);}while(0)
 
+  CHECK(StableDisplaySerial(501)==502 && StableDisplaySerial(501)==StableDisplaySerial(501),"display-identity-stable-across-starts");
+  CHECK(StableDisplaySerial(501)!=StableDisplaySerial(502),"display-identity-separated-by-user");
+  CHECK(StableDisplaySerial(0)==1 && StableDisplaySerial((uid_t)UINT32_MAX-1)==UINT32_MAX && StableDisplaySerial((uid_t)UINT32_MAX)==0,"display-identity-nonzero-and-invalid-user-fails-closed");
+  CHECK(SameDisplayIdentity(505,0x6001,502,502) && !SameDisplayIdentity(506,0x6001,502,502) && !SameDisplayIdentity(505,0x6002,502,502) && !SameDisplayIdentity(505,0x6001,503,502) && !SameDisplayIdentity(505,0x6001,0,0),"display-identity-collision-exact-match");
+  CHECK(TestDisplayIdentityLock(),"display-identity-lock-cross-process-release-symlink-hardlink-permissions");
   CHECK(TestCursorGuardIsolation(),"cursor-slow-guard-does-not-lock-video");
   CHECK(TestCursorBusyAndEpoch(),"cursor-busy-skips-and-stale-epoch-hides");
   CHECK(TestWriterBackpressureOrdering(),"writer-backpressure-callbacks-return-two-slot-bound-and-order");
@@ -1339,6 +1439,12 @@ int main(int argc,const char **argv){@autoreleasepool {
   const OwnedOrigin savedOrigin=parsedOrigin;
   negotiatedFormat=&sessionFormat; // Single assignment before any concurrency/API use.
   if(!strcmp(argv[1],"--selftest")){synthetic=YES;return SelfTest();}
+  if(!strcmp(argv[1],"--event-pump-selftest")){synthetic=YES;return EventPumpSelfTest();}
+  // Read-only diagnostic: no AppKit launch, display/capture APIs or lock file.
+  if(!strcmp(argv[1],"--identity-probe")){
+    unsigned serial=StableDisplaySerial(getuid());if(!serial)return 2;
+    printf("identity-v1 vendor=%u product=%u serial=%u\n",OwnedDisplayVendor,OwnedDisplayProduct,serial);return 0;
+  }
   if(!strcmp(argv[1],"--probe")){
     BOOL api=API();fprintf(stderr,"Virtual display API %s; capture permission %s\n",api?"available":"unavailable",CGPreflightScreenCaptureAccess()?"granted":"not granted");
     CGDirectDisplayID online[32],active[32];uint32_t onlineCount=0,activeCount=0;
@@ -1378,10 +1484,13 @@ int main(int argc,const char **argv){@autoreleasepool {
   if(synthetic){alarm(20);return benchmark?Benchmark():Synthetic();}
   struct stat input,output;if(fstat(STDIN_FILENO,&input)||fstat(STDOUT_FILENO,&output)||!S_ISFIFO(input.st_mode)||!S_ISFIFO(output.st_mode))Fail("parent pipes required");
   if(!API()||!CGPreflightScreenCaptureAccess()||!SessionSafe())Fail("capture prerequisites unavailable");
+  const unsigned displaySerial=StableDisplaySerial(getuid());if(!displaySerial)Fail("invalid display identity user");
+  identityLockFD=AcquireUserDisplayIdentityLock();if(identityLockFD<0)Fail("display identity in use or lock unavailable");
+  if(!DisplayIdentityAvailable(displaySerial))Fail("display identity already online or unavailable");
   // Early lifecycle contract line: parent reads stderr via launchHelper and
   // logs each line. State the bounded contract as counts/booleans only; no
   // display IDs, origins, counts of specific displays or geometry are logged.
-  fprintf(stderr,"Bounded display helper 0.8.30.5: startupHiDPIModePhase=postDetach ownedModeTxn=ownedOnly physicalBaselineBounded=yes preservesPhysicalSettings=yes reassertPrecreateOnlyInOwnStartupTxn=yes postStartPhysicalReplay=no setupScope=session ownedResolutionSessionFixed=yes ownedNonMirroredRequired=yes reconfigFatal=no newFrameSubmissionSuspendedDuringInvalid=yes encodedOwnedFramesInFlightEmitted=yes capturesPhysicalOtherDisplay=no rollsBackUserGeometryOnExit=no\n");
+  fprintf(stderr,"Bounded display helper 0.8.30.7: appKitEventsDrained=yes stableDisplayIdentity=perUserV1 singleOwnerLock=processLifetime startupHiDPIModePhase=postDetach ownedModeTxn=ownedOnly physicalBaselineBounded=yes preservesPhysicalSettings=yes reassertPrecreateOnlyInOwnStartupTxn=yes postStartPhysicalReplay=no setupScope=session ownedResolutionSessionFixed=yes ownedNonMirroredRequired=yes reconfigFatal=no newFrameSubmissionSuspendedDuringInvalid=yes encodedOwnedFramesInFlightEmitted=yes capturesPhysicalOtherDisplay=no rollsBackUserGeometryOnExit=no\n");
   StartWatchdog();
   if(!BaselineSupported())Fail("unsupported physical display baseline");
   PlacementPhysical placementPhysical[8];
@@ -1396,8 +1505,8 @@ int main(int argc,const char **argv){@autoreleasepool {
   [NSWorkspace.sharedWorkspace.notificationCenter addObserverForName:NSWorkspaceSessionDidResignActiveNotification object:nil queue:nil usingBlock:stop];
   [NSDistributedNotificationCenter.defaultCenter addObserverForName:@"com.apple.screenIsLocked" object:nil queue:nil usingBlock:stop];
   InitEncoder();
-  CGVirtualDisplayDescriptor *d=[[NSClassFromString(@"CGVirtualDisplayDescriptor") alloc]init];d.vendorID=505;d.productID=0x6001;
-  unsigned serial=arc4random_uniform(0x7ffffffe)+1;d.serialNum=serial;d.serialNumber=serial;d.name=@"ThunderControl MacBook Extension";
+  CGVirtualDisplayDescriptor *d=[[NSClassFromString(@"CGVirtualDisplayDescriptor") alloc]init];d.vendorID=OwnedDisplayVendor;d.productID=OwnedDisplayProduct;
+  d.serialNum=displaySerial;d.serialNumber=displaySerial;d.name=@"ThunderControl MacBook Extension";
   d.queue=dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0);d.maxPixelsWide=PixelWidth;d.maxPixelsHigh=PixelHeight;double ppi=negotiatedFormat->pixelScale==2?220.0:96.0;d.sizeInMillimeters=CGSizeMake(PixelWidth*25.4/ppi,PixelHeight*25.4/ppi);
   d.redPrimary=CGPointMake(.64,.33);d.greenPrimary=CGPointMake(.30,.60);d.bluePrimary=CGPointMake(.15,.06);d.whitePoint=CGPointMake(.3127,.3290);
   CGVirtualDisplay * __attribute__((objc_precise_lifetime)) display=[[NSClassFromString(@"CGVirtualDisplay") alloc]initWithDescriptor:d];if(!display)Fail("virtual display unavailable");
