@@ -181,6 +181,7 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     dummy.close()
     try displayLiveRequire(closed == 0 && viewer.receivedFrameCount == 8 && viewer.presentationStats.submitted == 8, "focus return must preserve video")
     try displayLiveRequire(viewer.receivedCadenceCountForTests == 8 && viewer.submittedCadenceCountForTests == 8 && viewer.sourceEncodeSamplesForTests == 8, "all frame cadence points counted")
+    try displayLiveRequire(viewer.pacingActiveForTests && viewer.pacingTicksForTests > 0 && viewer.pacingPendingForTests == 0, "actual display-link pacing active and decoded queue drained")
     let readinessBefore = viewer.readinessCallbacksForTests
     try displayLiveRequire(viewer.requestReadinessForTests(), "register actual native renderer readiness callback")
     try await pump(until:{viewer.readinessCallbacksForTests == readinessBefore+1 && !viewer.readinessRequestedForTests}, maximum:2, stage:"one-shot readiness callback with no pending pixel")
@@ -215,11 +216,12 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     try displayLiveRequire(viewer.requestReadinessForTests(), "pending readiness before close")
     viewer.close()
     try displayLiveRequire(!viewer.cursorVisibleForTests && !viewer.readinessRequestedForTests, "close clears cursor and renderer request")
+    try displayLiveRequire(!viewer.pacingActiveForTests && viewer.pacingTicksForTests == 0 && viewer.pacingPendingForTests == 0, "close invalidates display link and clears paced frames")
     try displayLiveRequire(!ownershipFixture.sourceWindowOwnership.hasStableOwnership,"closed viewer cannot leave stale source ownership or activate HUD")
     let closedSettle = ProcessInfo.processInfo.systemUptime + 0.1
     try await pump(until:{ProcessInfo.processInfo.systemUptime >= closedSettle},maximum:0.5,stage:"closed readiness late callback")
     try displayLiveRequire(!viewer.readinessRequestedForTests && viewer.readinessCallbacksForTests == 0, "no callback resurrects closed viewer readiness counters")
-    print("PASS native viewer: activationPolicy=\(application.activationPolicy().rawValue) coordinator=true fullscreen=\(wasFullscreen) decoded=8 submitted=8 colorfulSamples=\(colorfulSamples) focusLossCallbacks=\(lost) focusGainCallbacks=\(gained) expectedClose=1 newFrameWhileUnfocused=true stampedFrames=true separateCursor=true cursorExpiry=true cadence=true readinessCallbackOneShot=true; own-window generated-pattern screenshot only; no network, virtual display or input posting")
+    print("PASS native viewer: activationPolicy=\(application.activationPolicy().rawValue) coordinator=true fullscreen=\(wasFullscreen) decoded=8 submitted=8 colorfulSamples=\(colorfulSamples) focusLossCallbacks=\(lost) focusGainCallbacks=\(gained) expectedClose=1 newFrameWhileUnfocused=true stampedFrames=true separateCursor=true cursorExpiry=true cadence=true readinessCallbackOneShot=true realDisplayLinkPacing=true; own-window generated-pattern screenshot only; no network, virtual display or input posting")
 }
 
 /// Pure lifecycle regression coverage: no AppKit activation, capture or input.

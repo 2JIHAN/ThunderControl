@@ -12,6 +12,10 @@ v0.8.30 (build 60) is an experimental prerelease for two Apple Silicon Macs. Dis
 
 *Connection diagram, not an app screenshot.*
 
+## Frame pacing test build: 0.8.30.8
+
+[Experimental test release](https://github.com/2JIHAN/ThunderControl/releases/tag/v0.8.30.8). The MacBook viewer uses a real display link and a bounded decoded-frame buffer. Local policy, decoder and native-viewer tests passed; actual two-Mac stutter improvement and physical-panel 60 fps remain unverified. This is a receiver-side change and does not change the video protocol. See the release notes before updating.
+
 ## Cadence and overhead test build: 0.8.30.2
 
 [Experimental test release](https://github.com/2JIHAN/ThunderControl/releases/tag/v0.8.30.2). This revision keeps the separate cursor, avoids repeated video-body copies in transport validation/logging, fixes the helper runloop's unconditional 25ms wait, and adds constant-memory per-frame cadence and distinct drop/replacement/readiness diagnostics. Logs are aggregated, not written every frame. Actual two-Mac stutter improvement is not yet established.

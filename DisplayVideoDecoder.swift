@@ -489,6 +489,17 @@ struct DisplayViewerStartup {
     mutating func close() { phase = .closed }
 }
 
+/// Display link retains its target, so the target must not retain the viewer.
+@MainActor private final class DisplayPacingLinkTarget: NSObject {
+    weak var owner: DisplayViewer?
+    let generation: UInt64
+    init(owner: DisplayViewer, generation: UInt64) { self.owner=owner; self.generation=generation }
+    @objc func tick(_ sender: AnyObject) {
+        guard #available(macOS 14.0, *), let link=sender as? CADisplayLink else { return }
+        owner?.displayPacingTick(generation:generation, targetTimestamp:link.targetTimestamp)
+    }
+}
+
 @MainActor final class DisplayViewer: NSObject, NSWindowDelegate {
     let format: DisplayVideoFormat
     private let targetScreen: NSScreen?
@@ -520,7 +531,11 @@ struct DisplayViewerStartup {
     private var focusArmed = false
     private var viewerWindow: DisplayViewerWindow?
     private var surface: DisplayVideoSurface?
-    private var latestDecoded = DisplayLatestDecodedFrame()
+    private var pacedFrames = DisplayFramePacer<CVPixelBuffer>()
+    private var pacingLink: AnyObject?
+    private var pacingTarget: DisplayPacingLinkTarget?
+    private var pacingGeneration: UInt64 = 0
+    private var displayLinkCadence = DisplayCadenceStats()
     private var readinessRequested = false
     private var readinessEpoch: UInt64 = 0
     private var lastStreamSequence: UInt64?
@@ -549,7 +564,7 @@ struct DisplayViewerStartup {
     var submittedCadenceCountForTests: UInt64 { rendererCadence.count }
     var sourceEncodeSamplesForTests: UInt64 { sourceEncodeTiming.count }
     @discardableResult func requestReadinessForTests() -> Bool {
-        guard !closing, latestDecoded.pixel == nil, #available(macOS 14.0, *), let renderer = surface?.videoLayer?.sampleBufferRenderer, renderer.isReadyForMoreMediaData else { return false }
+        guard !closing, !pacedFrames.pending, #available(macOS 14.0, *), let renderer = surface?.videoLayer?.sampleBufferRenderer, renderer.isReadyForMoreMediaData else { return false }
         requestRendererReadiness(renderer); return true
     }
     var isFullScreenForTests: Bool { viewerWindow?.styleMask.contains(.fullScreen) == true }
@@ -671,11 +686,37 @@ struct DisplayViewerStartup {
         lastDecodedAt = ProcessInfo.processInfo.systemUptime
         decodedMainCadence.observe(lastDecodedAt)
         receivedFrameCount += 1; presentationStats.decoded &+= 1
-        if latestDecoded.replace(pixel) { presentationStats.replacedDecoded &+= 1 }
+        if pacedFrames.offer(pixel, at:CACurrentMediaTime()) { presentationStats.replacedDecoded &+= 1 }
         drainPresentation()
     }
-    private func drainPresentation() {
-        guard !closing, startup.mayPresentVideo, let layer = surface?.videoLayer, latestDecoded.pixel != nil else { return }
+    private func ensurePacingLink() {
+        guard pacingLink == nil, !closing, let surface, #available(macOS 14.0, *) else { return }
+        pacingGeneration &+= 1
+        let target=DisplayPacingLinkTarget(owner:self,generation:pacingGeneration)
+        let link=surface.displayLink(target:target,selector:#selector(DisplayPacingLinkTarget.tick(_:)))
+        link.preferredFrameRateRange=CAFrameRateRange(minimum:60,maximum:60,preferred:60)
+        pacingTarget=target; pacingLink=link
+        link.add(to:.main,forMode:.common)
+    }
+    private func stopPacingLink() {
+        pacingGeneration &+= 1
+        if #available(macOS 14.0, *) { (pacingLink as? CADisplayLink)?.invalidate() }
+        pacingLink=nil; pacingTarget=nil
+    }
+    fileprivate func displayPacingTick(generation:UInt64,targetTimestamp:Double) {
+        guard !closing, generation == pacingGeneration, pacingLink != nil else { return }
+        displayLinkCadence.observe(ProcessInfo.processInfo.systemUptime)
+        drainPresentation(targetTimestamp:targetTimestamp)
+    }
+    var pacingActiveForTests: Bool { pacingLink != nil }
+    var pacingTicksForTests: UInt64 { displayLinkCadence.count }
+    var pacingPendingForTests: Int { pacedFrames.pendingCount }
+    private func drainPresentation(targetTimestamp:Double? = nil) {
+        guard !closing, startup.mayPresentVideo, let layer = surface?.videoLayer else { return }
+        ensurePacingLink()
+        // Decode and renderer-readiness callbacks only queue/wake. Enqueue happens
+        // exclusively on the display-link callback, never on packet arrival.
+        guard let targetTimestamp else { return }
         guard #available(macOS 14.0, *) else { close(); return }
         let renderer = layer.sampleBufferRenderer
         guard renderer.status != .failed else { close(); return }
@@ -685,7 +726,7 @@ struct DisplayViewerStartup {
             return
         }
         stopReadiness(ready: true)
-        guard let pixel = latestDecoded.take() else { return }
+        guard let pixel = pacedFrames.take(now:CACurrentMediaTime(),targetTimestamp:targetTimestamp) else { return }
         let started = ProcessInfo.processInfo.systemUptime
         do {
             let sample = try displayImmediateImageSample(pixel, format: self.format)
@@ -729,7 +770,7 @@ struct DisplayViewerStartup {
         let now = ProcessInfo.processInfo.systemUptime
         guard mainVideoCadence.count > 0, force || now-cadenceLoggedAt >= 2 else { return }
         cadenceLoggedAt = now
-        displayStageLog("Display cadence viewer: encodedMain[\(mainVideoCadence.summary)] decodedMain[\(decodedMainCadence.summary)] rendererEnqueue[\(rendererCadence.summary)] sourceAdmission[\(sourceAdmissionTiming.summary)] sourceEncode[\(sourceEncodeTiming.summary)] sourceEncodeSequenceSkips=\(sourceSequenceSkips) latestDecodedReplaced=\(presentationStats.replacedDecoded) readinessDeferrals=\(presentationStats.readinessDeferrals) registrations=\(readinessRegistrations) callbacks=\(readinessCallbacks) cancelled=\(readinessCancelled) readinessWait[\(readinessWait.summary)]; contentMayBeIdle=true enqueueNotPanel=true final=\(force)")
+        displayStageLog("Display cadence viewer: encodedMain[\(mainVideoCadence.summary)] decodedMain[\(decodedMainCadence.summary)] rendererEnqueue[\(rendererCadence.summary)] sourceAdmission[\(sourceAdmissionTiming.summary)] sourceEncode[\(sourceEncodeTiming.summary)] sourceEncodeSequenceSkips=\(sourceSequenceSkips) latestDecodedReplaced=\(presentationStats.replacedDecoded) readinessDeferrals=\(presentationStats.readinessDeferrals) registrations=\(readinessRegistrations) callbacks=\(readinessCallbacks) cancelled=\(readinessCancelled) readinessWait[\(readinessWait.summary)] displayLink[\(displayLinkCadence.summary)] pacedPending=\(pacedFrames.pendingCount) pacing=\(pacedFrames.stats); pacingHoldNominalMs=16.667 contentMayBeIdle=true enqueueNotPanel=true final=\(force)")
     }
     func acceptCursor(_ payload: Data) throws {
         let next = try DisplayCursorMetadata(payload)
@@ -766,8 +807,9 @@ struct DisplayViewerStartup {
     }
     func clear() {
         forwardedButtons.removeAll()
-        stopReadiness(); latestDecoded.clear()
+        stopReadiness(); stopPacingLink()
         logCadence(force: true)
+        pacedFrames.clear(); displayLinkCadence=DisplayCadenceStats()
         cursorExpiry?.cancel(); cursorExpiry = nil; cursorMetadata = nil; cursorOverlay.removeFromSuperlayer(); cursorGlyphs.removeAll()
         lastCursorSequence = nil; lastStreamSequence = nil; lastDecodedAt = 0
         mainVideoCadence = DisplayCadenceStats(); decodedMainCadence = DisplayCadenceStats(); rendererCadence = DisplayCadenceStats()
