@@ -84,6 +84,9 @@ func isTransientTransportFailure(_ error:Error)->Bool {
 }
 func shouldSuspendAutomaticReconnect(stage:String,error:Error,terminalReason:String?)->Bool {
   if terminalReason=="Fast route budget expired" {return false}
+  // Locally detected saturation is not a peer-authentication failure. Teardown,
+  // held-input cleanup and all automatic safety gates still run before retry.
+  if stage=="Authenticated stream",let failure=error as? Failure,failure.description=="Inbound queue overload" {return false}
   if let e=error as? TrustedPairingError,case .keychainUnavailable=e {return false}
   return ["Trusted pairing","Encrypted role confirmation","Authenticated stream"].contains(stage) && !isTransientTransportFailure(error) && terminalReason != "Pairing transport interrupted"
 }
@@ -1923,9 +1926,45 @@ final class Relay {
   func abortDisplayTopologyTransition() {
     if displayBarrier != nil {safetyStop("Display topology transition aborted safely")}
   }
+  static func verifyDevelopmentReconnectTimeoutForTests()->Bool {
+    final class Mock:CursorRecoveryAPI {
+      var failShow=false
+      func associate(_ associated:Bool)->CGError{.success};func hide(display:CGDirectDisplayID)->CGError{.success}
+      func show(display:CGDirectDisplayID)->CGError{failShow ? .failure:.success};func warp(to point:CGPoint)->CGError{.success}
+    }
+    for independentlySuspended in [false,true] {
+      let mock=Mock(),r=Relay(cursorResources:CursorRecoveryController(api:mock),receiverCursor:CursorVisibilityController(api:mock))
+      r.automaticReconnectSuspended=independentlySuspended
+      let ctx=SessionContext(OwnedSocket(-1));r.context=ctx;r.connection=OwnedSocket(-1);r.key=SymmetricKey(size:.bits256)
+      r.displayBarrier=ConcurrentDisplayBarrier(phase:.awaitingAck,now:0)
+      var completionAfterCancellation=false
+      r.displayBarrierCompletion={_ in completionAfterCancellation=ctx.cancelled && r.displayBarrier==nil}
+      r.expireDisplayTopologyTransition()
+      guard ctx.cancelled,r.context==nil,r.displayBarrier==nil,completionAfterCancellation,r.automaticReconnectSuspended==independentlySuspended,!r.hasUnresolvedLocalRecovery else{return false}
+      guard automaticConnectionMayStart(configured:true,paused:false,suspended:r.automaticReconnectSuspended,permissions:true,sessionSafe:true,recovery:r.hasUnresolvedLocalRecovery,hasSession:r.hasSession) == !independentlySuspended else{return false}
+    }
+    let mock=Mock(),visible=CursorVisibilityController(api:mock)
+    guard visible.hide(display:1) else{return false};mock.failShow=true
+    let r=Relay(cursorResources:CursorRecoveryController(api:mock),receiverCursor:visible)
+    r.context=SessionContext(OwnedSocket(-1));r.connection=OwnedSocket(-1);r.key=SymmetricKey(size:.bits256)
+    r.displayBarrier=ConcurrentDisplayBarrier(phase:.awaitingAck,now:0)
+    r.expireDisplayTopologyTransition()
+    guard r.hasUnresolvedLocalRecovery,!r.automaticReconnectSuspended,
+      !automaticConnectionMayStart(configured:true,paused:false,suspended:false,permissions:true,sessionSafe:true,recovery:r.hasUnresolvedLocalRecovery,hasSession:r.hasSession) else{return false}
+    mock.failShow=false;r.forceLocal()
+    return !r.hasUnresolvedLocalRecovery && !r.automaticReconnectSuspended
+  }
+  private func expireDisplayTopologyTransition() {
+    guard displayBarrier != nil else{return}
+    // Timeout proves neither malicious peer nor new user intent. Retire the old
+    // session and recover owned inputs; never clear an existing safety latch.
+    // automaticConnectionMayStart still forbids retry while local recovery remains.
+    DevelopmentDiagnostics.shared.record(stage:"input_transition_timeout")
+    stop(reason:"Display transition timed out; retry after safe local cleanup")
+  }
   private func resumeDisplayReceiver(map:ReceiverDesktop)throws {
     guard let barrier=displayBarrier,barrier.phase == .paused else{throw Failure("Missing display pause acknowledgment")}
-    guard desktopNow<barrier.deadline else{abortDisplayTopologyTransition();throw Failure("Display transition expired")}
+    guard desktopNow<barrier.deadline else{expireDisplayTopologyTransition();throw Failure("Display transition expired")}
     receiverMapPublicationCandidate=map
     defer{receiverMapPublicationCandidate=nil}
     guard control("available",width:0),control("displayResume",token:barrier.token,width:displayLease != nil ? 1:0) else{throw Failure("Display resume queue failed")}
@@ -1991,7 +2030,7 @@ final class Relay {
   }
   private func tickDisplayTopologyTransition() {
     guard let barrier=displayBarrier else{return}
-    guard desktopNow<barrier.deadline else{abortDisplayTopologyTransition();return}
+    guard desktopNow<barrier.deadline else{expireDisplayTopologyTransition();return}
     guard sender else{
       guard receiverOwnsMapTransition,barrier.phase == .paused,let map=stableReceiverDesktop() else{return}
       // A missing owned identity must be reconciled by helper cleanup, never relabelled here.
@@ -2599,11 +2638,12 @@ final class Relay {
     do {try relay.start(name:"not-a-real-interface",peer:"",pass:"0000",port:49177,sendMode:true);return false}
     catch {return String(describing:error).contains("Cursor recovery must finish") && !relay.hasSession && !relay.sender && visible.needsRecovery && !mock.touchesRealCursor}
   }
-  @discardableResult func start(name: String, peer: String, pass: String, port: UInt16, sendMode: Bool,automaticStart:Bool=false,lockedTransport:Bool=false,lockedPermitEpoch:UInt64?=nil,expectedRoutePair:LayoutDevicePair?=nil) throws -> Bridge {
+  @discardableResult func start(name: String, peer: String, pass: String, port: UInt16, sendMode: Bool,automaticStart:Bool=false,lockedTransport:Bool=false,lockedPermitEpoch:UInt64?=nil,expectedRoutePair:LayoutDevicePair?=nil,fastRouteAttempt:Bool=false) throws -> Bridge {
     let attemptStartedAt=ProcessInfo.processInfo.systemUptime
     guard displayLease == nil,displayBarrier == nil else{throw Failure("Stop the owned display before reconnecting input")}
     stop()
-    guard expectedRoutePair==nil || (automaticStart && sendMode) else{throw Failure("Fast route is restricted to automatic sender reconnect")}
+    guard expectedRoutePair==nil || automaticStart else{throw Failure("Remembered peer binding is restricted to automatic reconnect")}
+    guard !fastRouteAttempt || (automaticStart && sendMode && expectedRoutePair != nil) else{throw Failure("Fast route is restricted to a bound automatic sender reconnect")}
     guard cursorResources.canAcquire,!receiverCursor.needsRecovery,receiverFocusRecoveryPending?() != true else{throw Failure("Cursor recovery must finish before starting either role; use Stop to retry recovery")}
     if lockedTransport {
       guard automaticStart,lockedTransportEligible,(!automaticReconnectSuspended || lockedPermitEpoch==automaticSuspensionEpoch) else{throw Failure("Locked transport requires a verified logged-in locked session")}
@@ -2648,7 +2688,7 @@ final class Relay {
     let remote = sendMode ? try address(peer, port) : nil
     let initial = OwnedSocket(try boundSocket(b, sendMode ? 0 : port))
     if !sendMode {guard listen(initial.fd,1)==0 else{throw Failure("Cannot listen on Thunderbolt socket")}}
-    let sessionContext = SessionContext(initial,fastRoute:expectedRoutePair != nil)
+    let sessionContext = SessionContext(initial,fastRoute:fastRouteAttempt)
     self.context = sessionContext
     let localSession = UUID().uuidString
     sender = sendMode
@@ -2732,7 +2772,7 @@ final class Relay {
       do {
         let connected: OwnedSocket
         if let remoteAddress = remote {
-          try connectBound(initial, remoteAddress, sessionContext,timeout:expectedRoutePair == nil ? 5:0.75)
+          try connectBound(initial, remoteAddress, sessionContext,timeout:fastRouteAttempt ? 0.75:5)
           connected = initial
         } else {
           connected = try acceptBound(initial, sessionContext)
@@ -2781,7 +2821,7 @@ final class Relay {
         let k:SymmetricKey
         var verifiedPairingIDs:(String,String)?
         do {defer{pendingPIN=nil}
-        k=try performTrustedPairing(isSender:sendMode,senderPIN:pendingPIN,sessionID:pairingScope,localName:BridgeDiscoveryValidation.displayName(Host.current().localizedName ?? "ThunderControl Mac"),transport:io,allowNewTrust:!lockedTransport && (!automaticStart || !sendMode),allowKeychainInteraction:!automaticStart,authenticatedIdentity:{local,peer in verifiedPairingIDs=(local,peer)},receiverApproval:{request in
+        k=try performTrustedPairing(isSender:sendMode,senderPIN:pendingPIN,sessionID:pairingScope,localName:BridgeDiscoveryValidation.displayName(Host.current().localizedName ?? "ThunderControl Mac"),transport:io,allowNewTrust:expectedRoutePair == nil && !lockedTransport && (!automaticStart || !sendMode),allowKeychainInteraction:!automaticStart,authenticatedIdentity:{local,peer in verifiedPairingIDs=(local,peer)},receiverApproval:{request in
           guard let approval=self.approvePIN else{throw Failure("Receiver approval unavailable")}
           return try approval(request,{sessionContext.cancelled})
         })
@@ -2824,7 +2864,7 @@ final class Relay {
           guard self.generation == g, !sessionContext.cancelled else { return }
           guard sessionContext.finishAuthentication(now:ProcessInfo.processInfo.systemUptime) else{sessionContext.cancel(reason:sessionContext.authenticationTimeoutReason);self.stop(reason:sessionContext.authenticationTimeoutReason);return}
           self.lastInput = ProcessInfo.processInfo.systemUptime
-          connectionLog(String(format:"Connection timing route=%@ transportWaitMs=%.1f trustMs=%.1f roleAndQueueMs=%.1f totalMs=%.1f",expectedRoutePair == nil ? "normal":"cached",(transportReadyAt-attemptStartedAt)*1000,(proofFinishedAt-proofStartedAt)*1000,(self.lastInput-proofFinishedAt)*1000,(self.lastInput-attemptStartedAt)*1000))
+          connectionLog(String(format:"Connection timing route=%@ transportWaitMs=%.1f trustMs=%.1f roleAndQueueMs=%.1f totalMs=%.1f",fastRouteAttempt ? "cached":(expectedRoutePair == nil ? "normal":"discovered-bound"),(transportReadyAt-attemptStartedAt)*1000,(proofFinishedAt-proofStartedAt)*1000,(self.lastInput-proofFinishedAt)*1000,(self.lastInput-attemptStartedAt)*1000))
           if sendMode,let hint=AuthenticatedRouteHint(pair:confirmedLayoutPair,ipv4:peer,port:port) {_ = AuthenticatedRouteHintStore().save(hint)}
           DisplayPeerRoute.rememberAuthenticatedSocket(c)
           self.authenticatedDevicePair=confirmedLayoutPair;self.authenticatedSharingPeerHost=DisplayPeerRoute.authenticatedSocketHost(c);self.concurrentDisplayCompatible=displayCompatible
@@ -4071,6 +4111,9 @@ final class PasteCommandProbe: NSResponder {
     connectionNotifications.permissionStateChanged = {[weak self] needed in self?.notificationPermissionButton.isHidden = !needed}
     permissionStack.addArrangedSubview(notificationPermissionButton)
     permissionStack.addArrangedSubview(NSButton(title:TCText("Export Diagnostics..."),target:self,action:#selector(exportDiagnostics)))
+    permissionStack.addArrangedSubview(NSTextField(wrappingLabelWithString:TCText("Development video diagnostics start with the authenticated screen connection. Numeric frame stages are saved locally and copied to iCloud when available. No video pixels, typed text, or credentials are recorded.")))
+    permissionStack.addArrangedSubview(NSButton(title:TCText("Open Development Diagnostics"),target:self,action:#selector(openDevelopmentDiagnostics)))
+    permissionStack.addArrangedSubview(NSButton(title:TCText("Open iCloud Diagnostics"),target:self,action:#selector(openCloudDevelopmentDiagnostics)))
     let stack = NSStackView()
     stack.orientation = .vertical
     stack.alignment = .leading
@@ -4739,7 +4782,9 @@ final class PasteCommandProbe: NSResponder {
     }
     return .terminateNow
   }
-  func applicationWillTerminate(_ n: Notification) { appUpdateCheck.stop();stopBridgeRecoveryScheduling();appearanceInstalled=false;appearanceTimer?.invalidate();automaticConnectionTimer?.invalidate();discovery.stop(); relay.stop();if !isAutomationTest {appearance.teardown()} }
+  func applicationWillTerminate(_ n: Notification) {
+    if !DevelopmentDiagnostics.shared.shutdown(timeout:2){fputs("Development diagnostics final local flush incomplete; inspect manifest counters.\n",stderr)}
+    appUpdateCheck.stop();stopBridgeRecoveryScheduling();appearanceInstalled=false;appearanceTimer?.invalidate();automaticConnectionTimer?.invalidate();discovery.stop(); relay.stop();if !isAutomationTest {appearance.teardown()} }
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 }
 func check(_ condition: Bool, file: String = #fileID, line: Int = #line) {
@@ -5352,7 +5397,7 @@ struct ThunderControlMain {
     } else if CommandLine.arguments.contains("--desktop-map-self-test") {
       exit(runDesktopMapTransitionTests()==0 ? 0:1)
     } else if CommandLine.arguments.contains("--self-test") {
-      do { try tests();check(runLocalizationTests()==0);check(runConcurrentDisplayTests()==0);check(runReceiverDesktopRelayTests()==0);check(runReceiverDesktopTests()==0);check(runSavedDesktopPlacementTests()==0);check(runReceiverDesktopUITests()==0);check(runDesktopMapTransitionTests()==0);check(runDesktopHandoffRoutingTests()==0);check(runDesktopEntryPolicyTests()==0);check(runDisplayHeartbeatTests()==0);check(runDisplayTrustTests()==0);check(runDisplayRemoteInputTests()==0);check(runDisplayTransportTests()==0);check(runDisplayCadenceTests()==0);check(runDisplayFramePacingTests()==0);check(runDisplayVideoFormatTests()==0);check(runSavedSharingStateTests()==0);check(runAutomaticSharingResumeTests()==0);check(runSharingLifecycleIntegrationTests()==0);check(runDisplayPreferenceTests()==0);check(runUpdateReleaseTests()==0);check(runSavedVirtualDisplayPlacementTests()==0);check(runVirtualDisplayPlacementSessionTests()==0);check(runDisplayVideoDecoderTests()==0);check(runScrollReplayTests()==0);check(runDiscoveryRecoveryPolicyTests()==0);check(runNativeGestureTests()==0);check((runDockTransferStateTests()+runDesktopSystemGestureTests())==0);check(runTransitionMotionTests()==0);check(runGestureTraceTests()==0);check(runCursorIsolationTests()==0);check(runCursorVisibilityTests()==0);check(runConnectedLayoutTests()==0);check(runCursorModeProtocolTests()==0);ReceiverCursorFocusTests.run();check(runAutomaticConnectionPolicyTests()==0);check(runCableReconnectPolicyTests()==0);check(runReceiverFocusRetryTests()==0);check(runReturnWarpResumeTests()==0);check(runDiagnosticStoreTests()==0);check(runTrustedPairingTests()==0);check(runConnectionNotificationTests()==0);check(runSingleConnectionNotificationTests()==0);check(runAppAppearancePreferencesTests()==0);check(runAppWindowPresentationPolicyTests()==0);check(runConnectedWindowVisibilityTests()==0);check(runSavedScreenLayoutTests()==0);check(Relay.verifyDeviceLayoutPersistenceForTests());check(runSessionAutoResumeTests()==0);check(runSessionSuspensionOriginTests()==0);check(Relay.verifySessionSuspensionOriginsForTests());check(runAutomaticReconnectBackoffTests()==0);check(runBridgeRecoverySchedulingTests()==0);check(runLockedTransportPolicyTests()==0);check(runAuthenticatedRouteHintTests()==0);check(runFastReconnectPolicyTests()==0);check(Relay.verifyLockedTransportInputBarrierForTests());check(!Relay().receiverWantsCursorHidden);ScreenArrangementDragTests.run();check(Relay.verifyReceiverRecoveryBlocksStartForTests());check(Relay.verifyReceiverPhysicalInputCancelsActivationForTests());try dockProtocolTests();try appGesturePacketTests();print("PASS gesture memory classification and system stream ordering; no posting") } catch {
+      do { try tests();check(runLocalizationTests()==0);check(runConcurrentDisplayTests()==0);check(runReceiverDesktopRelayTests()==0);check(runReceiverDesktopTests()==0);check(runSavedDesktopPlacementTests()==0);check(runReceiverDesktopUITests()==0);check(runDesktopMapTransitionTests()==0);check(runDesktopHandoffRoutingTests()==0);check(runDesktopEntryPolicyTests()==0);check(runDisplayHeartbeatTests()==0);check(runDisplayTrustTests()==0);check(runDisplayRemoteInputTests()==0);check(runDisplayTransportTests()==0);check(runDisplayCadenceTests()==0);check(runDisplayFramePacingTests()==0);check(runDisplayVideoFormatTests()==0);check(runSavedSharingStateTests()==0);check(runAutomaticSharingResumeTests()==0);check(runSharingLifecycleIntegrationTests()==0);check(runDisplayPreferenceTests()==0);check(runUpdateReleaseTests()==0);check(runSavedVirtualDisplayPlacementTests()==0);check(runVirtualDisplayPlacementSessionTests()==0);check(runDisplayVideoDecoderTests()==0);check(runScrollReplayTests()==0);check(runDiscoveryRecoveryPolicyTests()==0);check(runNativeGestureTests()==0);check((runDockTransferStateTests()+runDesktopSystemGestureTests())==0);check(runTransitionMotionTests()==0);check(runGestureTraceTests()==0);check(runCursorIsolationTests()==0);check(runCursorVisibilityTests()==0);check(runConnectedLayoutTests()==0);check(runCursorModeProtocolTests()==0);ReceiverCursorFocusTests.run();check(runAutomaticConnectionPolicyTests()==0);check(runCableReconnectPolicyTests()==0);check(runReceiverFocusRetryTests()==0);check(runReturnWarpResumeTests()==0);check(runDiagnosticStoreTests()==0);check(runDevelopmentDiagnosticsTests()==0);check(runDevelopmentFrameTraceTests()==0);check(runDisplayDiagnosticLinesTests()==0);check(runTrustedPairingTests()==0);check(runConnectionNotificationTests()==0);check(runSingleConnectionNotificationTests()==0);check(runAppAppearancePreferencesTests()==0);check(runAppWindowPresentationPolicyTests()==0);check(runConnectedWindowVisibilityTests()==0);check(runSavedScreenLayoutTests()==0);check(Relay.verifyDeviceLayoutPersistenceForTests());check(runSessionAutoResumeTests()==0);check(runSessionSuspensionOriginTests()==0);check(Relay.verifySessionSuspensionOriginsForTests());check(runAutomaticReconnectBackoffTests()==0);check(runBridgeRecoverySchedulingTests()==0);check(runLockedTransportPolicyTests()==0);check(runAuthenticatedRouteHintTests()==0);check(runFastReconnectPolicyTests()==0);check(Relay.verifyLockedTransportInputBarrierForTests());check(!Relay().receiverWantsCursorHidden);ScreenArrangementDragTests.run();check(Relay.verifyReceiverRecoveryBlocksStartForTests());check(Relay.verifyReceiverPhysicalInputCancelsActivationForTests());try dockProtocolTests();try appGesturePacketTests();print("PASS gesture memory classification and system stream ordering; no posting") } catch {
         fputs("FAIL \(error)\n", stderr)
         exit(1)
       }

@@ -81,13 +81,16 @@ import AppKit
         let candidate=discoveredPeers.first,candidate.port==49177,
         peer.stringValue==candidate.ipv4,port.stringValue=="49177",
         now>=nextAutomaticAttempt else{return}
+      // The remembered identity survives route/address changes. Discovery is only
+      // a route hint; never silently reconnect to another already-trusted Mac.
+      guard let expectedPair=rememberedAutomaticReconnectPair else{return}
       nextAutomaticAttempt=now+5
       do {
         discovery.stop();discoveryIsBrowsing=false
         // Empty pass is deliberate: unknown automatic senders must never fall
         // back to PIN enrollment. Relay enforces allowNewTrust:false here.
         try relay.start(name:"bridge0",peer:candidate.ipv4,pass:"",port:49177,
-          sendMode:true,automaticStart:true,lockedTransport:lockedStandby,lockedPermitEpoch:sessionAutoResume.epoch)
+          sendMode:true,automaticStart:true,lockedTransport:lockedStandby,lockedPermitEpoch:sessionAutoResume.epoch,expectedRoutePair:expectedPair)
       } catch {
         if !relay.hasSession {discovery.stop();discoveryIsBrowsing=false}
         relay.status(TCText("Automatic Sender connection failed: ") + safeConnectionError(error))
@@ -103,7 +106,7 @@ import AppKit
       discovery.stop();discoveryIsBrowsing=false
       // Listening is not trust. Receiver enrollment still requires a human PIN
       // approval; the Relay permits it even for automatic receiver listening.
-      let verified=try relay.start(name:"bridge0",peer:"",pass:"",port:49177,sendMode:false,automaticStart:true,lockedTransport:lockedStandby,lockedPermitEpoch:sessionAutoResume.epoch)
+      let verified=try relay.start(name:"bridge0",peer:"",pass:"",port:49177,sendMode:false,automaticStart:true,lockedTransport:lockedStandby,lockedPermitEpoch:sessionAutoResume.epoch,expectedRoutePair:sharingResume.lastBinding.flatMap{$0.inputIsSender ? nil:$0.pair})
       _ = verifiedBridgeRecovery.observe("\(verified.name)/\(verified.index)/\(verified.ip)")
       advertiseVerifiedReceiver(verified)
     } catch {

@@ -252,3 +252,9 @@
 "Waiting for the Sender display request." = "Waiting for the Sender display request.";
 "Screen sharing waits for capture permission and desktop readiness." = "Screen sharing waits for capture permission and desktop readiness.";
 "Connected. Waiting for input sharing readiness." = "Connected. Waiting for input sharing readiness.";
+
+"Development video diagnostics start with the authenticated screen connection. Numeric frame stages are saved locally and copied to iCloud when available. No video pixels, typed text, or credentials are recorded." = "Development video diagnostics start with the authenticated screen connection. Numeric frame stages are saved locally and copied to iCloud when available. No video pixels, typed text, or credentials are recorded.";
+"Open Development Diagnostics" = "Open Development Diagnostics";
+"Open iCloud Diagnostics" = "Open iCloud Diagnostics";
+"Development diagnostics start after the screen connection is authenticated." = "Development diagnostics start after the screen connection is authenticated.";
+"iCloud diagnostics are not available yet. Local diagnostics remain available; cloud copying retries automatically." = "iCloud diagnostics are not available yet. Local diagnostics remain available; cloud copying retries automatically.";

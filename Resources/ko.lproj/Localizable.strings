@@ -252,3 +252,9 @@
 "Waiting for the Sender display request." = "송신 Mac의 화면 요청을 기다리는 중입니다.";
 "Screen sharing waits for capture permission and desktop readiness." = "화면 기록 권한과 화면 구성 준비를 기다리는 중입니다.";
 "Connected. Waiting for input sharing readiness." = "연결됨. 입력 공유 준비를 기다리는 중입니다.";
+
+"Development video diagnostics start with the authenticated screen connection. Numeric frame stages are saved locally and copied to iCloud when available. No video pixels, typed text, or credentials are recorded." = "개발용 영상 진단은 화면 연결 인증 후 자동 시작됩니다. 프레임 단계의 수치만 로컬에 저장하고 iCloud가 준비되면 자동 복사합니다. 영상 픽셀, 입력한 글자, 인증 정보는 기록하지 않습니다.";
+"Open Development Diagnostics" = "개발 진단 폴더 열기";
+"Open iCloud Diagnostics" = "iCloud 진단 폴더 열기";
+"Development diagnostics start after the screen connection is authenticated." = "화면 연결이 인증되면 개발 진단 수집이 시작됩니다.";
+"iCloud diagnostics are not available yet. Local diagnostics remain available; cloud copying retries automatically." = "아직 iCloud 진단을 사용할 수 없습니다. 로컬 진단은 유지되며 자동 복사를 재시도합니다.";

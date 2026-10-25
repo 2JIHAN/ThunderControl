@@ -118,7 +118,7 @@ struct OwnedDisplayMonitor {
           do {try self.launchHelper(token:token)}catch{self.stop(message:TCText("Could not start the extended display helper."))}
         }
       } else {
-        let v=DisplayViewer(format:format,targetScreen:viewerTarget?.screen);v.acceptsViewerInput=false
+        let v=DisplayViewer(format:format,targetScreen:viewerTarget?.screen,diagnosticStream:self.transport?.diagnosticStreamID);v.acceptsViewerInput=false
         v.onUserClose={[weak self] in self?.userStopped?()}
         v.onClose={[weak self] in guard let self,self.epoch==token else{return};self.stop()}
         v.onWillClose={[weak self] in self?.viewerOwnershipLost?()}
@@ -199,9 +199,16 @@ struct OwnedDisplayMonitor {
     }
     let process=Process(),input=Pipe(),output=Pipe(),errors=Pipe();process.executableURL=url;process.arguments=arguments;process.standardInput=input;process.standardOutput=output;process.standardError=errors
     try process.run();helper=process;heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
+    let diagnosticStream=transport?.diagnosticStreamID
     DispatchQueue.global(qos:.utility).async {
-      let handle=errors.fileHandleForReading;defer{try? handle.close()};var budget=8192
-      while budget>0,let chunk=try? handle.read(upToCount:min(1024,budget)),!chunk.isEmpty {budget-=chunk.count;if let text=String(data:chunk,encoding:.utf8){connectionLog("Display helper: "+text)}}
+      let handle=errors.fileHandleForReading;defer{try? handle.close()};var lines=DisplayDiagnosticLines()
+      let raw:(String)->Void = {DevelopmentDiagnostics.shared.recordHelperLine($0,stream:diagnosticStream)}
+      // Only diagnostic work gets new pool boundaries; video pipeline is unchanged.
+      while (try? autoreleasepool { () throws -> Bool in
+        guard let chunk=try handle.read(upToCount:1024),!chunk.isEmpty else{return false}
+        lines.append(chunk,now:ProcessInfo.processInfo.systemUptime,emit:connectionLog,raw:raw);return true
+      }) == true {}
+      lines.finish(now:ProcessInfo.processInfo.systemUptime,emit:connectionLog,raw:raw)
     }
     let t=transport
     DispatchQueue.global(qos:.userInitiated).async {[weak self] in
@@ -212,6 +219,9 @@ struct OwnedDisplayMonitor {
         let header=try exact(4),size=header.reduce(UInt32(0)){($0<<8)|UInt32($1)}
         guard size>0,size<=4194304 else{throw Failure("Invalid video framing")}
         let payload=try exact(Int(size))
+        if payload.first==6,let frame=try? DisplayStreamFrameHeader(payload),let diagnosticStream{
+          DevelopmentDiagnostics.shared.record(stage:"helper_read",sequence:frame.sequence,fields:["bytes":Double(payload.count),"sourceCaptureUS":Double(frame.capture),"sourceEncodeStartUS":Double(frame.encodeStart),"sourceEncodeEndUS":Double(frame.encodeEnd)],stream:diagnosticStream)
+        }
         // Keep draining the helper even after its independent video socket closes.
         // Removing the owned display must wait for the raw-input pause barrier.
         let deliver=DispatchQueue.main.sync {self?.active==true && self?.epoch==token}

@@ -1,6 +1,11 @@
 import AppKit
 func routeIdentityMatches(_ actual:LayoutDevicePair,expected:LayoutDevicePair?)->Bool {expected==nil || actual==expected}
 @MainActor extension App {
+  var rememberedAutomaticReconnectPair:LayoutDevicePair? {
+    if let binding=sharingResume.lastBinding,binding.inputIsSender{return binding.pair}
+    guard let stored=UserDefaults.standard.string(forKey:"ThunderControl.autoTrust.deviceID.v1"),let local=UUID(uuidString:stored) else{return nil}
+    return fastRoutes.load(localID:local)?.pair
+  }
   func tryFastAuthenticatedRoute(locked:Bool)->Bool {
     guard !isAutomationTest,!fastRouteTried,discoveredPeers.count<=1,
       let stored=UserDefaults.standard.string(forKey:"ThunderControl.autoTrust.deviceID.v1"),let local=UUID(uuidString:stored),
@@ -9,7 +14,7 @@ func routeIdentityMatches(_ actual:LayoutDevicePair,expected:LayoutDevicePair?)-
     nextAutomaticAttempt=ProcessInfo.processInfo.systemUptime+5
     do {
       // Exactly one TCP attempt. Bonjour is metadata-only and cannot authorize input.
-      let verified=try relay.start(name:"bridge0",peer:hint.ipv4,pass:"",port:hint.port,sendMode:true,automaticStart:true,lockedTransport:locked,lockedPermitEpoch:sessionAutoResume.epoch,expectedRoutePair:hint.pair)
+      let verified=try relay.start(name:"bridge0",peer:hint.ipv4,pass:"",port:hint.port,sendMode:true,automaticStart:true,lockedTransport:locked,lockedPermitEpoch:sessionAutoResume.epoch,expectedRoutePair:hint.pair,fastRouteAttempt:true)
       startPeerBrowsing(verified:verified)
     } catch {
       fastRouteInProgress=false

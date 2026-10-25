@@ -1,0 +1,263 @@
+import Foundation
+import Darwin
+
+// Standalone: swiftc -swift-version 5 -D DEVELOPMENT_DIAGNOSTICS_TEST_MAIN
+// DevelopmentDiagnostics.swift Tests/DevelopmentDiagnosticsTests.swift -o <temporary test executable>
+@discardableResult func runDevelopmentDiagnosticsTests() -> Int {
+    var failures = 0, checks = 0
+    func check(_ condition: Bool, _ label: String) {
+        checks += 1; if !condition { failures += 1; print("DevelopmentDiagnostics FAIL: \(label)") }
+    }
+    let fm = FileManager.default
+    guard let physical = realpath(fm.temporaryDirectory.path, nil) else { return 1 }
+    let temp = URL(fileURLWithPath: String(cString: physical)).appendingPathComponent("tc-development-tests-" + UUID().uuidString)
+    free(physical)
+    let stream = String(repeating:"0123456789abcdef",count:4), second = String(repeating:"fedcba9876543210",count:4)
+    do {
+        try fm.createDirectory(at: temp, withIntermediateDirectories: false)
+        defer { try? fm.removeItem(at: temp) }
+        func own(_ root: URL) throws -> URL {
+            let id = try String(contentsOf: root.appendingPathComponent("device-uuid"), encoding: .utf8)
+            return root.appendingPathComponent(id)
+        }
+        func chunks(_ root: URL) throws -> [URL] {
+            try fm.contentsOfDirectory(at: own(root), includingPropertiesForKeys: nil)
+                .filter { $0.lastPathComponent.hasPrefix("chunk-") && $0.pathExtension == "jsonl" }
+        }
+        func rows(_ root: URL) throws -> [[String: Any]] {
+            try chunks(root).flatMap { url in
+                try Data(contentsOf: url).split(separator: 10).map { try JSONSerialization.jsonObject(with: Data($0)) as! [String: Any] }
+            }
+        }
+        let root = temp.appendingPathComponent("privacy")
+        let recorder = DevelopmentDiagnostics(root: root)
+        check(!fm.fileExists(atPath: root.path), "init has no disk effects")
+        try recorder.flushForTests()
+        check(!fm.fileExists(atPath: root.path), "unused flush has no disk effects")
+        recorder.start(role: "invalid", stream: stream)
+        recorder.start(role: "source", stream: "private-hostname")
+        check(recorder.currentStream == nil, "invalid role and stream rejected")
+        recorder.start(role: "source", stream: stream); try recorder.flushForTests()
+        let session = recorder.snapshotForTests()["session"] as? String
+        recorder.start(role: "source", stream: stream); try recorder.flushForTests()
+        check(recorder.snapshotForTests()["session"] as? String == session, "idempotent start")
+        recorder.record(stage: "capture", sequence: UInt64.max, fields: ["duration_ms": 2.5], stream: stream)
+        recorder.record(stage: "secret input text", fields: [:])
+        recorder.record(stage: "valid", fields: ["raw key text": 1])
+        recorder.record(stage: "valid", fields: ["nan": .nan])
+        recorder.record(stage: "valid", fields: ["infinity": .infinity])
+        recorder.recordHelperLine("TC_DIAG stage=capture seq=9 capture=1 duration_ms=2.0", stream: stream)
+        recorder.recordHelperLine("TC_DIAG stage=helper_failure reason_code=4294967295", stream: stream)
+        recorder.recordHelperLine("TC_DIAG stage=capture seq=123456789",stream:nil)
+        for line in ["private input", "TC_DIAG stage=privatehostname capture=1", "TC_DIAG stage=encode host=private-host.example", "TC_DIAG stage=encode x=nan", "TC_DIAG stage=encode seq=-1", "TC_DIAG stage=encode x=1 x=2", "TC_DIAG stage=encode bad-key=3", "TC_DIAG stage=encode x=1\ninput"] {
+            recorder.recordHelperLine(line, stream: stream)
+        }
+        recorder.record(stage: "stale", stream: second)
+        recorder.stop(stream: second)
+        check(recorder.currentStream == stream, "stale stop rejected")
+        recorder.record(stage: "old_context", sequence: 10)
+        recorder.start(role: "viewer", stream: second)
+        recorder.record(stage: "new_context", sequence: 11)
+        recorder.recordHelperLine("TC_DIAG stage=encode capture=2", stream: stream)
+        recorder.stop(stream: second); try recorder.flushForTests()
+        check(recorder.currentStream == nil, "stop clears active stream and flushes")
+        let events = try rows(root)
+        check(events.count == 5, "only accepted structured events persisted")
+        check(events.first(where: { $0["stage"] as? String == "old_context" })?["stream"] as? String == stream, "old queued context never relabeled")
+        check(events.first(where: { $0["stage"] as? String == "new_context" })?["role"] as? String == "viewer", "new role captured")
+        check(events.allSatisfy { $0["wall"] != nil && $0["monotonic"] != nil && $0["session"] != nil }, "event timestamps and session")
+        let serialized = String(data: try JSONSerialization.data(withJSONObject: events), encoding: .utf8)!
+        check(!serialized.contains("private") && !serialized.contains("hostname") && !serialized.contains("input"), "raw payload absent")
+        let status = recorder.snapshotForTests()
+        check((status["nonfinite"] as? Int64 ?? 0) >= 3 && (status["stale"] as? Int64 ?? 0) >= 3, "explicit drop counters")
+        check(status["mirrorDisabled"] as? Bool == true, "absent cloud disabled")
+        check(recorder.localDirectoryURL == (try own(root)) && recorder.cloudDirectoryURL == nil, "cached paths")
+        check(recorder.shutdown(), "bounded successful shutdown")
+        for url in try chunks(root) + [own(root).appendingPathComponent("manifest.json"), root.appendingPathComponent("device-uuid")] {
+            let attrs = try fm.attributesOfItem(atPath: url.path)
+            check((attrs[.posixPermissions] as? NSNumber)?.intValue == 0o600, "private file permissions")
+        }
+        check((try fm.attributesOfItem(atPath: own(root).path)[.posixPermissions] as? NSNumber)?.intValue == 0o700, "private directory permissions")
+        recorder.withIngressLockedForTests { recorder.record(stage: "contended"); _ = recorder.currentStream }
+        check(recorder.snapshotForTests()["lockContention"] as? Int64 == 2, "contention counted without waiting")
+
+        let gate = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let boundedRoot = temp.appendingPathComponent("bounded")
+        let bounded = DevelopmentDiagnostics(root: boundedRoot, beforeDrain: { gate.signal(); release.wait() })
+        bounded.start(role: "source", stream: stream); try bounded.flushForTests()
+        for _ in 0..<512 { bounded.record(stage: "frame") }
+        check(gate.wait(timeout: .now() + 3) == .success, "disk drain blocked deterministically")
+        let begin = ProcessInfo.processInfo.systemUptime
+        for _ in 0..<1512 { bounded.record(stage: "frame") }
+        let elapsed = ProcessInfo.processInfo.systemUptime - begin
+        // pending + in-flight bounded together, with exactly 1000 overflow drops.
+        check(elapsed < 2, "hot path independent of blocked filesystem queue")
+        check(!bounded.shutdown(timeout: 0.01), "shutdown deadline reports blocked disk queue")
+        release.signal()
+        // The second queued batch also reaches the deterministic hook.
+        release.signal(); release.signal()
+        bounded.stop(); try bounded.flushForTests()
+        check(bounded.snapshotForTests()["accepted"] as? Int64 == 1024, "1024 outstanding cap including in-flight")
+        check(bounded.snapshotForTests()["overflow"] as? Int64 == 1000, "overflow count exact")
+        check(try rows(boundedRoot).count == 1024, "accepted records drained")
+
+        let rotationRoot = temp.appendingPathComponent("rotation")
+        var date = Date()
+        let rotation = DevelopmentDiagnostics(root: rotationRoot, clock: { date }, chunkBytes: 900, diskBytes: 2200)
+        rotation.start(role: "source", stream: stream)
+        for i in 0..<20 { rotation.record(stage: "frame", sequence: UInt64(i)) }
+        try rotation.flushForTests()
+        let files = try chunks(rotationRoot)
+        check(files.count >= 2, "immutable numbered rotation")
+        var bytes = 0
+        for url in files { let n = try Data(contentsOf: url).count; bytes += n; check(n <= 900, "chunk byte cap") }
+        check(bytes <= 2200 && (rotation.snapshotForTests()["retentionEvictions"] as? Int64 ?? 0) > 0, "device disk budget enforced")
+        let unknown = try own(rotationRoot).appendingPathComponent("user-notes.jsonl")
+        try Data("preserve me".utf8).write(to: unknown)
+        date = date.addingTimeInterval(901)
+        try rotation.flushForTests()
+        check(try chunks(rotationRoot).isEmpty, "age retention")
+        check(try String(contentsOf: unknown, encoding: .utf8) == "preserve me", "unknown user files preserved")
+        let previousDevice = try own(rotationRoot)
+        let next = DevelopmentDiagnostics(root: rotationRoot, diskBytes: 2200)
+        next.start(role: "viewer", stream: second); next.record(stage: "frame"); try next.flushForTests()
+        check(try own(rotationRoot) == previousDevice, "stable private device folder")
+        let third = DevelopmentDiagnostics(root: rotationRoot, diskBytes: 500)
+        third.start(role: "source", stream: stream)
+        for i in 0..<10 { third.record(stage: "frame", sequence: UInt64(i)) }
+        try third.flushForTests()
+        let acrossSessionBytes = try chunks(rotationRoot).reduce(0) { try $0 + Data(contentsOf: $1).count }
+        check(acrossSessionBytes <= 500 && (third.snapshotForTests()["retentionEvictions"] as? Int64 ?? 0) > 0, "retention spans previous sessions")
+
+        let outside = temp.appendingPathComponent("outside")
+        try fm.createDirectory(at: outside, withIntermediateDirectories: false)
+        let link = temp.appendingPathComponent("link")
+        try fm.createSymbolicLink(at: link, withDestinationURL: outside)
+        let unsafe = DevelopmentDiagnostics(root: link.appendingPathComponent("nested"))
+        unsafe.start(role: "source", stream: stream); unsafe.record(stage: "frame")
+        do { try unsafe.flushForTests(); check(false, "symlink root refused") } catch { }
+        check(try fm.contentsOfDirectory(atPath: outside.path).isEmpty, "no symlink traversal")
+        let missingCloud = temp.appendingPathComponent("missing-cloud")
+        let absent = DevelopmentDiagnostics(root: temp.appendingPathComponent("absent"), cloudRoot: missingCloud)
+        absent.start(role: "viewer", stream: stream); absent.record(stage: "frame"); try absent.flushForTests()
+        check(!fm.fileExists(atPath: missingCloud.path), "never creates fake cloud root")
+        let cloud = temp.appendingPathComponent("cloud")
+        try fm.createDirectory(at: cloud, withIntermediateDirectories: false)
+        let broken = cloud.appendingPathComponent("ThunderControl-진단")
+        try fm.createSymbolicLink(at: broken, withDestinationURL: outside)
+        let mirrorFailure = DevelopmentDiagnostics(root: temp.appendingPathComponent("mirror-error"), cloudRoot: cloud)
+        mirrorFailure.start(role: "source", stream: stream); mirrorFailure.record(stage: "frame"); try mirrorFailure.flushForTests()
+        check(mirrorFailure.snapshotForTests()["mirrorError"] as? Bool == true, "cloud error local status")
+        check(try fm.contentsOfDirectory(atPath: outside.path).isEmpty, "cloud symlink not followed")
+        try fm.removeItem(at: broken)
+        var cloudDate = Date()
+        let mirroredRoot = temp.appendingPathComponent("mirrored")
+        let mirrored = DevelopmentDiagnostics(root: mirroredRoot, cloudRoot: cloud, clock: { cloudDate }, monotonicClock: { cloudDate.timeIntervalSince1970 })
+        mirrored.start(role: "source", stream: stream); try mirrored.flushForTests()
+        mirrored.record(stage: "frame"); cloudDate = cloudDate.addingTimeInterval(6); try mirrored.flushForTests()
+        let cloudDevice = cloud.appendingPathComponent("ThunderControl-진단").appendingPathComponent(try own(mirroredRoot).lastPathComponent)
+        check(try fm.contentsOfDirectory(atPath: cloudDevice.path).contains(where: { $0.hasPrefix("chunk-") }), "new chunk mirrored")
+        check(mirrored.snapshotForTests()["cloudLastSuccessfulLocalCopy"] != nil, "local cloud copy timestamp, not delivery claim")
+        // Lifecycle cannot be silently skipped when a recorder lock is momentarily busy.
+        let lifecycle = DevelopmentDiagnostics(root: temp.appendingPathComponent("lifecycle"))
+        lifecycle.start(role: "source", stream: stream); try lifecycle.flushForTests()
+        lifecycle.record(stage: "before_switch", stream: stream)
+        let entered = DispatchSemaphore(value: 0), completed = DispatchSemaphore(value: 0)
+        lifecycle.withIngressLockedForTests {
+            DispatchQueue.global(qos: .utility).async {
+                entered.signal(); lifecycle.start(role: "viewer", stream: second); completed.signal()
+            }
+            check(entered.wait(timeout: .now() + 1) == .success, "concurrent start entered")
+            check(completed.wait(timeout: .now() + 0.02) == .timedOut, "lifecycle reliably waits for short memory lock")
+            lifecycle.record(stage: "contended_hot_event")
+        }
+        check(completed.wait(timeout: .now() + 2) == .success, "concurrent start completes after unlock")
+        lifecycle.record(stage: "after_switch", stream: second)
+        lifecycle.withIngressLockedForTests {
+            DispatchQueue.global(qos: .utility).async {
+                entered.signal(); lifecycle.stop(stream: second); completed.signal()
+            }
+            check(entered.wait(timeout: .now() + 1) == .success, "concurrent stop entered")
+            check(completed.wait(timeout: .now() + 0.02) == .timedOut, "stop cannot be silently lost")
+        }
+        check(completed.wait(timeout: .now() + 2) == .success, "concurrent stop completes")
+        try lifecycle.flushForTests()
+        let lifecycleRows = try rows(temp.appendingPathComponent("lifecycle"))
+        check(lifecycleRows.count == 2 && lifecycle.currentStream == nil, "concurrent lifecycle preserves both contexts and stops")
+        check(lifecycleRows.first(where: { $0["stage"] as? String == "before_switch" })?["stream"] as? String == stream,
+              "concurrent switch does not relabel old event")
+
+        final class TestClock: @unchecked Sendable {
+            private let lock = NSLock(); private var value = Date()
+            func now() -> Date { lock.lock(); defer { lock.unlock() }; return value }
+            func advance(_ seconds: Double) { lock.lock(); value.addTimeInterval(seconds); lock.unlock() }
+        }
+        let loadClock = TestClock(), loadRoot = temp.appendingPathComponent("sustained")
+        let delayedCloud = temp.appendingPathComponent("delayed-cloud")
+        let load = DevelopmentDiagnostics(root: loadRoot, cloudRoot: delayedCloud, clock: { loadClock.now() }, monotonicClock: { loadClock.now().timeIntervalSince1970 })
+        load.start(role: "source", stream: stream); try load.flushForTests()
+        // 600 realistic structured frame events/sec for ten wall-clock seconds.
+        for tick in 0..<100 {
+            for frame in 0..<60 {
+                load.record(stage: "encoded_callback", sequence: UInt64(tick * 60 + frame),
+                            fields: ["capture": Double(tick * 60 + frame), "us": Double(tick * 100000), "duration_us": 1500], stream: stream)
+            }
+            if tick == 50 { try fm.createDirectory(at: delayedCloud, withIntermediateDirectories: false) }
+            usleep(100_000); loadClock.advance(0.1)
+            if tick % 10 == 9 { try load.flushForTests() }
+        }
+        load.stop(stream: stream); try load.flushForTests()
+        // Bounded 4 MiB/64-file mirror passes catch up retained local chunks after cloud recovery.
+        for _ in 0..<6 { loadClock.advance(6); try load.flushForTests() }
+        let loadStatus = load.snapshotForTests()
+        let loadAccepted = loadStatus["accepted"] as? Int64 ?? -1
+        let loadDropped = loadStatus["dropped"] as? Int64 ?? -1
+        check(loadAccepted + loadDropped == 6000, "sustained ingress complete accepted/drop accounting")
+        check(loadStatus["written"] as? Int64 == loadAccepted, "sustained accepted records all written")
+        check(try rows(loadRoot).count == Int(loadAccepted), "sustained on-disk no silent loss")
+        check(loadStatus["mirrorPendingCount"] as? Int == 0, "retained mirror backlog catches up")
+        check((loadStatus["mirrorMissCount"] as? Int64 ?? 0) > 0, "cloud outage remains in cumulative status")
+        let loadCloudDevice = delayedCloud.appendingPathComponent("ThunderControl-진단").appendingPathComponent(try own(loadRoot).lastPathComponent)
+        let loadCloudFiles = try fm.contentsOfDirectory(at: loadCloudDevice, includingPropertiesForKeys: nil).filter { $0.pathExtension == "jsonl" }
+        let loadCloudRows = try loadCloudFiles.reduce(0) { try $0 + Data(contentsOf: $1).split(separator: 10).count }
+        check(loadCloudRows == Int(loadAccepted), "sustained cloud recovery no silent record loss")
+        print("DevelopmentDiagnostics sustained 6000 submissions: accepted=\(loadAccepted), dropped=\(loadDropped), cloudRows=\(loadCloudRows)")
+        let copiedBefore = loadStatus["mirroredCount"] as? Int64
+        loadClock.advance(6); try load.flushForTests()
+        check(load.snapshotForTests()["mirroredCount"] as? Int64 == copiedBefore, "already mirrored chunks not duplicated")
+        check(load.shutdown(), "sustained recorder shuts down cleanly")
+        let steadyClock=TestClock(),steadyRoot=temp.appendingPathComponent("steady"),steadyCloud=temp.appendingPathComponent("steady-cloud")
+        try fm.createDirectory(at:steadyCloud,withIntermediateDirectories:false)
+        let steady=DevelopmentDiagnostics(root:steadyRoot,cloudRoot:steadyCloud,clock:{steadyClock.now()},monotonicClock:{steadyClock.now().timeIntervalSince1970})
+        steady.start(role:"source",stream:stream);try steady.flushForTests()
+        let productionFields=Dictionary(uniqueKeysWithValues:(0..<16).map{("metric\($0)",Double(123456789+$0))})
+        var steadyPeakBacklog:Int=0
+        // Controlled monotonic seconds, no catch-up period without ingestion.
+        // 64-character production stream and deliberately realistic metadata size.
+        for second in 1...60 {
+            for frame in 0..<600 {steady.record(stage:"encoded_callback",sequence:UInt64(second*600+frame),fields:productionFields,stream:stream)}
+            steadyClock.advance(1);try steady.flushForTests()
+            if second % 5 == 0 {steadyPeakBacklog=max(steadyPeakBacklog,steady.snapshotForTests()["mirrorPendingCount"] as? Int ?? Int.max)}
+        }
+        let steadyStatus=steady.snapshotForTests(),steadyWritten=steadyStatus["written"] as? Int64 ?? -1
+        let steadyBytes=try chunks(steadyRoot).reduce(0){try $0+Data(contentsOf:$1).count}
+        check(steadyBytes>60*1024*1024/5,"steady test exceeds old 1MiB per five seconds ceiling")
+        check(steadyWritten>30000,"steady producer maintains substantial production load")
+        check(steadyPeakBacklog<=2,"no accumulating backlog at sustained production throughput")
+        check(steadyStatus["mirrorEvictedBeforeCopy"] as? Int64==0,"steady mirror never loses retained chunks")
+        check(steady.shutdown(timeout:10),"termination flush bypasses mirror cadence safely")
+        let steadyOwn=steadyCloud.appendingPathComponent("ThunderControl-진단").appendingPathComponent(try own(steadyRoot).lastPathComponent)
+        let steadyCopied=try fm.contentsOfDirectory(at:steadyOwn,includingPropertiesForKeys:nil).filter{$0.pathExtension=="jsonl"}.reduce(0){try $0+Data(contentsOf:$1).split(separator:10).count}
+        check(steadyCopied==Int(steadyWritten),"final cloud folder includes last partial interval")
+        check(steady.snapshotForTests()["sessionActive"] as? Bool==false,"stopped recorder manifest is not active")
+        print("DevelopmentDiagnostics steady mirror: written=\(steadyWritten), bytes=\(steadyBytes), peakFiveSecondBacklog=\(steadyPeakBacklog), cloudRows=\(steadyCopied); simulated60s, not WAN upload proof")
+
+    } catch { failures += 1; print("DevelopmentDiagnostics unexpected: \(error)") }
+    print("DevelopmentDiagnostics: \(checks) checks, \(failures) failures")
+    return failures
+}
+#if DEVELOPMENT_DIAGNOSTICS_TEST_MAIN
+@main private struct DevelopmentDiagnosticsTestMain {
+    static func main() { exit(Int32(runDevelopmentDiagnosticsTests() == 0 ? 0 : 1)) }
+}
+#endif

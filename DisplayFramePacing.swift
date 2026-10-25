@@ -13,6 +13,8 @@ struct DisplayFramePacingStats: Equatable {
     fileprivate(set) var rateLimitedTicks: UInt64 = 0
 }
 
+enum DisplayFrameDiscardReason: Int { case invalidOffer = 1, overflow = 2, superseded = 3, clear = 4 }
+
 struct DisplayFramePacer<Frame> {
     /// Only already-decoded frames belong here, never compressed reference frames.
     private struct Entry {
@@ -20,6 +22,7 @@ struct DisplayFramePacer<Frame> {
         let arrival: Double
     }
 
+    private let onDiscard: ((Frame, DisplayFrameDiscardReason) -> Void)?
     let framesPerSecond: Double
     private let interval: Double
     // Allow sub-millisecond display-clock jitter, not a second 120Hz selection.
@@ -34,7 +37,8 @@ struct DisplayFramePacer<Frame> {
     private var lastSelectedTarget: Double?
     private(set) var stats = DisplayFramePacingStats()
 
-    init(framesPerSecond: Double = 60) {
+    init(framesPerSecond: Double = 60, onDiscard: ((Frame, DisplayFrameDiscardReason) -> Void)? = nil) {
+        self.onDiscard = onDiscard
         precondition(framesPerSecond.isFinite && framesPerSecond > 0 &&
                      framesPerSecond <= 60 && (1 / framesPerSecond).isFinite,
                      "Decoded-frame pacing requires finite 0 < FPS <= 60")
@@ -53,12 +57,14 @@ struct DisplayFramePacer<Frame> {
     mutating func offer(_ frame: Frame, at arrival: Double) -> Bool {
         guard validTime(arrival), lastArrival.map({ arrival >= $0 }) ?? true else {
             stats.invalidInputs += 1
+            onDiscard?(frame, .invalidOffer)
             return false
         }
         lastArrival = arrival
         stats.offered += 1
         let replaced = queue.count == 2
         if replaced {
+            onDiscard?(queue[0].frame, .overflow)
             queue.removeFirst()
             stats.overflowReplaced += 1
         }
@@ -113,6 +119,7 @@ struct DisplayFramePacer<Frame> {
         lastSelectedTarget = target
         let frame = queue[index].frame
         stats.superseded += UInt64(index)
+        if let onDiscard { for entry in queue.prefix(index) { onDiscard(entry.frame, .superseded) } }
         queue.removeFirst(index + 1)
         stats.selected += 1
         if cushionedIndex == nil { stats.earlySelections += 1 }
@@ -122,6 +129,7 @@ struct DisplayFramePacer<Frame> {
     /// Use for a new stream/timebase or teardown. Drops pending decoded frames and
     /// resets ALL diagnostics and clocks. Does not change configured FPS.
     mutating func clear() {
+        if let onDiscard { for entry in queue { onDiscard(entry.frame, .clear) } }
         queue.removeAll(keepingCapacity: true)
         lastArrival = nil
         lastNow = nil

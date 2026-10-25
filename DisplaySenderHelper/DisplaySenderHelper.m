@@ -18,6 +18,8 @@
 #import <pthread.h>
 #import <limits.h>
 #import <math.h>
+#import <time.h>
+#import <stdarg.h>
 
 // Private interfaces isolated in a process-owned display helper. See notices.
 @interface CGVirtualDisplayDescriptor:NSObject
@@ -302,7 +304,59 @@ static CGDisplayModeRef ownedInitialMode=NULL;
 static VTCompressionSessionRef encoder=NULL;
 static dispatch_queue_t frameQueue;
 static double Now(void){return NSProcessInfo.processInfo.systemUptime;}
-static void Fail(const char *reason){fprintf(stderr,"Display sender stopped: %s\n",reason);fflush(stderr);_exit(1);}
+// Diagnostics are observation-only: fixed storage, no locks, no retries, no I/O
+// except one best-effort nonblocking stderr write. Never changes stdout flags.
+static atomic_ullong diagEagain=0,diagTruncated=0,diagPartial=0,diagFailed=0;
+static atomic_ullong diagCallbacks=0,diagComplete=0,diagIdle=0,diagBlank=0,diagOther=0;
+static atomic_ullong diagStatusDrops=0,diagReplaced=0,diagBusy=0,diagSuspended=0,diagNoPixel=0;
+static atomic_ullong diagGapMaxUS=0,diagGapCount=0,diagGapSumUS=0;
+static BOOL diagEnabled=NO;
+static uint64_t DiagUS(void){struct timespec t;if(clock_gettime(CLOCK_MONOTONIC,&t))return 0;return (uint64_t)t.tv_sec*1000000ULL+(uint64_t)t.tv_nsec/1000;}
+static BOOL DiagNonblocking(int fd){int flags=fcntl(fd,F_GETFL);return flags>=0 && fcntl(fd,F_SETFL,flags|O_NONBLOCK)==0;}
+static BOOL DiagIdentifier(const char *s){if(!s||!*s)return NO;for(;*s;s++)if(!((*s>='a'&&*s<='z')||(*s>='0'&&*s<='9')||*s=='_'))return NO;return YES;}
+// Internal formats contain numeric integer values only. A truncated line is
+// discarded whole, rather than emitting a malformed record or a second write.
+static const uint64_t DiagNoSequence=UINT64_MAX;
+static int DiagFormat(char *line,size_t capacity,const char *stage,uint64_t seq,uint64_t capture,const char *format,va_list args){
+  if(!DiagIdentifier(stage))return -1;
+  int n=snprintf(line,capacity,"TC_DIAG stage=%s ",stage);
+  if(n<0||(size_t)n>=capacity)return -1;
+  if(seq!=DiagNoSequence){int added=snprintf(line+n,capacity-(size_t)n,"seq=%llu ",(unsigned long long)seq);if(added<0||(size_t)added>=capacity-(size_t)n)return -1;n+=added;}
+  if(capture){int added=snprintf(line+n,capacity-(size_t)n,"capture=%llu ",(unsigned long long)capture);if(added<0||(size_t)added>=capacity-(size_t)n)return -1;n+=added;}
+  int tail=vsnprintf(line+n,capacity-(size_t)n,format,args);
+  if(tail<0||(size_t)tail>=capacity-(size_t)n-1)return -1;
+  n+=tail;line[n++]='\n';line[n]=0;return n;
+}
+static void DiagWriteResult(ssize_t result,size_t n,int error){
+  if(result<0){if(error==EAGAIN||error==EWOULDBLOCK)atomic_fetch_add(&diagEagain,1);else atomic_fetch_add(&diagFailed,1);}
+  else if((size_t)result!=n)atomic_fetch_add(&diagPartial,1);
+}
+static void DiagWrite(int fd,const char *line,size_t n){
+  int saved=errno;ssize_t result=write(fd,line,n);int error=errno;
+  DiagWriteResult(result,n,error);errno=saved;
+}
+static void Diag(const char *stage,uint64_t seq,uint64_t capture,const char *format,...) __attribute__((format(printf,4,5)));
+static void Diag(const char *stage,uint64_t seq,uint64_t capture,const char *format,...){
+  if(!diagEnabled)return;int saved=errno;
+  char line[_POSIX_PIPE_BUF];va_list args;va_start(args,format);int n=DiagFormat(line,sizeof(line),stage,seq,capture,format,args);va_end(args);
+  if(n<0)atomic_fetch_add(&diagTruncated,1);else DiagWrite(STDERR_FILENO,line,(size_t)n);errno=saved;
+}
+#define DU(x) ((unsigned long long)(x))
+static void DiagPeriodic(void){
+  static uint64_t previous=0;uint64_t now=DiagUS();if(now-previous<2000000)return;previous=now;
+  Diag("capture_aggregate",DiagNoSequence,0,"us=%llu callbacks=%llu complete=%llu idle=%llu blank=%llu other=%llu",DU(now),DU(atomic_load(&diagCallbacks)),DU(atomic_load(&diagComplete)),DU(atomic_load(&diagIdle)),DU(atomic_load(&diagBlank)),DU(atomic_load(&diagOther)));
+  Diag("capture_drop_aggregate",DiagNoSequence,0,"us=%llu status_drop=%llu replaced=%llu busy=%llu suspended=%llu no_pixel=%llu",DU(now),DU(atomic_load(&diagStatusDrops)),DU(atomic_load(&diagReplaced)),DU(atomic_load(&diagBusy)),DU(atomic_load(&diagSuspended)),DU(atomic_load(&diagNoPixel)));
+  Diag("capture_gap_aggregate",DiagNoSequence,0,"us=%llu gap_count=%llu gap_sum_us=%llu gap_max_us=%llu",DU(now),DU(atomic_exchange(&diagGapCount,0)),DU(atomic_exchange(&diagGapSumUS,0)),DU(atomic_exchange(&diagGapMaxUS,0)));
+  Diag("diagnostics_aggregate",DiagNoSequence,0,"us=%llu eagain=%llu truncated=%llu partial=%llu failed=%llu",DU(now),DU(atomic_load(&diagEagain)),DU(atomic_load(&diagTruncated)),DU(atomic_load(&diagPartial)),DU(atomic_load(&diagFailed)));
+}
+// Only diagnostic metadata follows the existing mailbox/ticket/order window.
+static _Thread_local uint64_t diagSourceOrdinal=0,diagSourceUS=0;
+static uint64_t diagLatestOrdinal=0,diagLatestUS=0;
+// Stable FNV-1a/32 of the existing constant failure reason's UTF-8 bytes.
+// Offline lookup: enumerate Fail("...") literals and compute this same hash;
+// neither reason text nor any captured/input content enters structured output.
+static uint32_t DiagReasonCode(const char *reason){uint32_t hash=2166136261u;for(const unsigned char *p=(const unsigned char*)reason;*p;p++){hash^=*p;hash*=16777619u;}return hash;}
+static void Fail(const char *reason){if(diagEnabled)Diag("helper_failure",DiagNoSequence,0,"reason_code=%u us=%llu",DiagReasonCode(reason),DU(DiagUS()));fprintf(stderr,"Display sender stopped: %s\n",reason);fflush(stderr);_exit(1);}
 static void SignalStop(int sig){(void)sig;_exit(2);}
 // Secure Input restricts OS input delivery, not authenticated video. Do not
 // disable/bypass it or tear down the virtual display when a password field opens.
@@ -573,7 +627,8 @@ static void PublishCursor(void){
   (void)TryCursorOutput(packet,sampledEpoch,^{Guard();},outputFD);
 }
 static uint64_t submittedSequence=0;
-typedef struct {double started,capturedAt;uint64_t sequence,captureSequence;} EncodeTicket;
+typedef struct {double started,capturedAt;uint64_t sequence,captureSequence;uint64_t diagOrdinal,diagCapturedUS,diagAdmissionUS;} EncodeTicket;
+static EncodeTicket diagPendingTickets[2];
 static BOOL OrderAccept(EncodedOrderWindow *order,uint64_t sequence,unsigned slots){
   if(slots<1||slots>2||sequence<order->next||sequence-order->next>=slots)return NO;
   unsigned index=sequence%2;if(order->ready[index])return NO;
@@ -597,19 +652,22 @@ typedef struct {uint64_t count;double sum,max;} SourceTiming;
 static void RecordSourceTiming(SourceTiming *s,double ms){s->count++;s->sum+=ms;s->max=fmax(s->max,ms);}
 static SourceTiming writerWaitTiming,writerGuardTiming,writerLockTiming,writerPipeTiming,writerCadence;
 static uint64_t outputGaps25=0,outputGaps50=0;static double previousOutputAt=0,lastSourceLogAt=0;
-static void FinishEncoded(NSData *ready,uint64_t sequence,double captured,double completedAt){
+static void FinishEncoded(NSData *ready,uint64_t sequence,double captured,double completedAt,EncodeTicket diagnostic){
   // Only this serial queue runs blocking session checks and framed video I/O.
   // Queued/writing frames retain their existing two-slot inFlight budget.
   if(ready){
     if(benchmark){double at=Now();if(lastReadyAt>0 && sequence>=60){double span=at-lastReadyAt;ageArea+=(lastReadyAt-lastReadyCaptureAt)*span+span*span/2;ageDuration+=span;}lastReadyAt=at;lastReadyCaptureAt=captured;}
-    double outputStarted=Now();if(!benchmark)Output(ready);
+    double outputStarted=Now();
+    Diag("pipe_start",sequence,diagnostic.diagOrdinal,"us=%llu capture_us=%llu",DU(DiagUS()),DU(diagnostic.diagCapturedUS));
+    if(!benchmark)Output(ready);
+    Diag("pipe_complete",sequence,diagnostic.diagOrdinal,"us=%llu capture_us=%llu delivered=%u",DU(DiagUS()),DU(diagnostic.diagCapturedUS),!benchmark);
     if(!synthetic){
       double at=Now();RecordSourceTiming(&writerWaitTiming,(outputStarted-completedAt)*1000);
       RecordSourceTiming(&writerGuardTiming,outputTiming.guardMs);RecordSourceTiming(&writerLockTiming,outputTiming.lockMs);RecordSourceTiming(&writerPipeTiming,outputTiming.pipeMs);
       if(previousOutputAt>0){double gap=(at-previousOutputAt)*1000;RecordSourceTiming(&writerCadence,gap);if(gap>25)outputGaps25++;if(gap>50)outputGaps50++;}previousOutputAt=at;
     }
     atomic_fetch_add(&emitted,1);
-  } else atomic_fetch_add(&encoderDropped,1);
+  } else {atomic_fetch_add(&encoderDropped,1);Diag("encoder_drop",sequence,diagnostic.diagOrdinal,"us=%llu",DU(DiagUS()));}
   if(atomic_fetch_sub(&inFlight,1)==0)Fail("encoding count underflow");
   if(frameQueue)dispatch_async(frameQueue,^{@autoreleasepool{DrainCapture();}});
   double at=Now();if(!synthetic && ready && at-lastSourceLogAt>=2){
@@ -625,14 +683,16 @@ static void PublishEncoded(NSData *packet,EncodeTicket ticket,BOOL dropped){
   pthread_mutex_lock(&outputMutex);
   if(!OrderAccept(&outputOrder,ticket.sequence,encodingSlots))Fail("encoded ordering");
   unsigned slot=ticket.sequence%2;
+  diagPendingTickets[slot]=ticket;
   pendingEncoded[slot]=packet;pendingCaptureAt[slot]=ticket.capturedAt;pendingCompletedAt[slot]=Now();
   if(benchmark && !dropped && latencyCount<1024){latencies[latencyCount]=(Now()-ticket.started)*1000;frameAges[latencyCount]=(Now()-ticket.capturedAt)*1000;latencyCount++;lastCaptureSequence=MAX(lastCaptureSequence,ticket.captureSequence);}
   uint64_t sequence=0;
   while(OrderTake(&outputOrder,&sequence)){
     unsigned index=sequence%2;NSData *ready=pendingEncoded[index];pendingEncoded[index]=nil;
     double captured=pendingCaptureAt[index],completedAt=pendingCompletedAt[index];
+    EncodeTicket diagnostic=diagPendingTickets[index];
     // Dispatch while still ordered; jobs retain packets, not capture buffers.
-    dispatch_async(WriterQueue(),^{@autoreleasepool{FinishEncoded(ready,sequence,captured,completedAt);}});
+    dispatch_async(WriterQueue(),^{@autoreleasepool{FinishEncoded(ready,sequence,captured,completedAt,diagnostic);}});
   }
   pthread_mutex_unlock(&outputMutex);
 }
@@ -640,6 +700,7 @@ static void Encoded(void *ctx,void *source,OSStatus status,VTEncodeInfoFlags fla
   (void)ctx;
   @autoreleasepool {
     if(!source)Fail("encoder ticket");EncodeTicket ticket=*(EncodeTicket*)source;free(source);
+    Diag("encoded_callback",ticket.sequence,ticket.diagOrdinal,"us=%llu capture_us=%llu admission_us=%llu status=%u flags=%u",DU(DiagUS()),DU(ticket.diagCapturedUS),DU(ticket.diagAdmissionUS),(unsigned)status,(unsigned)flags);
     if(status==noErr && (flags&kVTEncodeInfo_FrameDropped)){PublishEncoded(nil,ticket,YES);return;}
     if(status!=noErr || !sample || !CMSampleBufferDataIsReady(sample))Fail("encoder output");
     CMFormatDescriptionRef fmt=CMSampleBufferGetFormatDescription(sample);
@@ -723,25 +784,35 @@ static void SubmitAt(CVPixelBufferRef pixel,CMTime pts,double capturedAt){
   // Bounded transient: drop BEFORE encode when owned proof is not fresh. Does
   // not touch encoded reference frames already queued; never leaks a physical
   // display frame because the SCStream filter is identity-bound to ownedID.
-  if(!CanSubmitFrame()){atomic_fetch_add(&capturesSuspended,1);return;}
-  if(!ReserveEncoding())return; // Bounded count; latest capture waits outside codec.
+  if(!CanSubmitFrame()){atomic_fetch_add(&capturesSuspended,1);atomic_fetch_add(&diagSuspended,1);Diag("capture_suspended",DiagNoSequence,diagSourceOrdinal,"us=%llu",DU(DiagUS()));return;}
+  if(!ReserveEncoding()){atomic_fetch_add(&diagBusy,1);Diag("encoder_busy_drop",DiagNoSequence,diagSourceOrdinal,"us=%llu",DU(DiagUS()));return;} // Bounded count; latest capture waits outside codec.
   if(CVPixelBufferGetWidth(pixel)!=PixelWidth||CVPixelBufferGetHeight(pixel)!=PixelHeight||CVPixelBufferGetPixelFormatType(pixel)!=(nativeYUV?kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:kCVPixelFormatType_32BGRA))Fail("capture dimensions or pixel format");
   if(submittedSequence>=UINT64_MAX-2)Fail("encoding sequence exhausted");
   EncodeTicket *ticket=malloc(sizeof(EncodeTicket));if(!ticket)Fail("encoder ticket allocation");
-  *ticket=(EncodeTicket){.started=Now(),.capturedAt=capturedAt,.sequence=submittedSequence++,.captureSequence=(uint64_t)pts.value};VTEncodeInfoFlags flags=0;
-  if(VTCompressionSessionEncodeFrame(encoder,pixel,pts,CMTimeMake(1,targetFPS),NULL,ticket,&flags)!=noErr)Fail("encode failed");
+  *ticket=(EncodeTicket){.started=Now(),.capturedAt=capturedAt,.sequence=submittedSequence++,.captureSequence=(uint64_t)pts.value,.diagOrdinal=diagSourceOrdinal,.diagCapturedUS=diagSourceUS,.diagAdmissionUS=DiagUS()};VTEncodeInfoFlags flags=0;
+  // Callback may synchronously free ticket: keep only a value copy for tracing.
+  EncodeTicket diagnostic=*ticket;
+  Diag("encoder_admission",diagnostic.sequence,diagnostic.diagOrdinal,"us=%llu capture_us=%llu in_flight=%u slots=%u",DU(diagnostic.diagAdmissionUS),DU(diagnostic.diagCapturedUS),atomic_load(&inFlight),encodingSlots);
+  Diag("encode_call_start",diagnostic.sequence,diagnostic.diagOrdinal,"us=%llu",DU(DiagUS()));
+  OSStatus diagnosticStatus=VTCompressionSessionEncodeFrame(encoder,pixel,pts,CMTimeMake(1,targetFPS),NULL,ticket,&flags);
+  Diag("encode_call_end",diagnostic.sequence,diagnostic.diagOrdinal,"us=%llu status=%u flags=%u",DU(DiagUS()),(unsigned)diagnosticStatus,(unsigned)flags);
+  if(diagnosticStatus!=noErr)Fail("encode failed");
 }
 static void Submit(CVPixelBufferRef pixel,CMTime pts){SubmitAt(pixel,pts,Now());}
 static void DrainCapture(void){
   if(atomic_load(&inFlight)>=encodingSlots || !latestCapture)return;
   CVPixelBufferRef pixel=latestCapture;CMTime pts=latestCapturePTS;latestCapture=NULL;
+  uint64_t savedOrdinal=diagSourceOrdinal,savedUS=diagSourceUS;
+  diagSourceOrdinal=diagLatestOrdinal;diagSourceUS=diagLatestUS;
   SubmitAt(pixel,pts,latestCaptureAt);CVPixelBufferRelease(pixel);
+  diagSourceOrdinal=savedOrdinal;diagSourceUS=savedUS;
 }
 static void OfferCaptureAt(CVPixelBufferRef pixel,CMTime pts,double capturedAt){
   // At most one pending source image; replacement occurs BEFORE H264 encoding.
   // Keeping the last damage frame also prevents a frozen final cursor/window
   // position when ScreenCaptureKit sends only idle frames after motion stops.
-  if(latestCapture){atomic_fetch_add(&capturesReplacedBeforeEncode,1);CVPixelBufferRelease(latestCapture);}
+  if(latestCapture){atomic_fetch_add(&capturesReplacedBeforeEncode,1);atomic_fetch_add(&diagReplaced,1);Diag("capture_replaced",DiagNoSequence,diagLatestOrdinal,"us=%llu replacement_capture=%llu",DU(DiagUS()),DU(diagSourceOrdinal));CVPixelBufferRelease(latestCapture);}
+  diagLatestOrdinal=diagSourceOrdinal;diagLatestUS=diagSourceUS;
   latestCapture=CVPixelBufferRetain(pixel);latestCapturePTS=pts;latestCaptureAt=capturedAt;DrainCapture();
 }
 static void OfferCapture(CVPixelBufferRef pixel,CMTime pts){OfferCaptureAt(pixel,pts,Now());}
@@ -752,11 +823,21 @@ static void OfferCapture(CVPixelBufferRef pixel,CMTime pts){OfferCaptureAt(pixel
 -(void)stream:(SCStream*)stream didStopWithError:(NSError*)error{(void)stream;(void)error;Fail("capture stopped");}
 -(void)stream:(SCStream*)stream didOutputSampleBuffer:(CMSampleBufferRef)sample ofType:(SCStreamOutputType)type{
   (void)stream;@autoreleasepool {
-    FastGuard();if(type!=SCStreamOutputTypeScreen||!CMSampleBufferIsValid(sample))return;
+    FastGuard();
+    uint64_t ordinal=atomic_fetch_add(&diagCallbacks,1)+1,callbackUS=DiagUS();
+    static uint64_t previousUS=0;uint64_t gap=previousUS?callbackUS-previousUS:0;previousUS=callbackUS;
+    if(gap){atomic_fetch_add(&diagGapCount,1);atomic_fetch_add(&diagGapSumUS,gap);uint64_t maximum=atomic_load(&diagGapMaxUS);if(gap>maximum)(void)atomic_compare_exchange_strong(&diagGapMaxUS,&maximum,gap); }
+    if(type!=SCStreamOutputTypeScreen||!CMSampleBufferIsValid(sample)){atomic_fetch_add(&diagOther,1);atomic_fetch_add(&diagStatusDrops,1);Diag("capture_callback",DiagNoSequence,ordinal,"us=%llu gap_us=%llu status_class=3",DU(callbackUS),DU(gap));return;}
     CFArrayRef a=CMSampleBufferGetSampleAttachmentsArray(sample,false);
     NSDictionary *info=[(__bridge NSArray*)a firstObject];NSNumber *status=info[SCStreamFrameInfoStatus];
-    if(!status||status.integerValue!=SCFrameStatusComplete)return;
+    unsigned statusClass=!status?3:status.integerValue==SCFrameStatusComplete?0:status.integerValue==SCFrameStatusIdle?1:status.integerValue==SCFrameStatusBlank?2:3;
+    atomic_fetch_add(statusClass==0?&diagComplete:statusClass==1?&diagIdle:statusClass==2?&diagBlank:&diagOther,1);
+    Diag("capture_callback",DiagNoSequence,ordinal,"us=%llu gap_us=%llu status_class=%u",DU(callbackUS),DU(gap),statusClass);
+    if(!status||status.integerValue!=SCFrameStatusComplete){atomic_fetch_add(&diagStatusDrops,1);return;}
+    diagSourceOrdinal=ordinal;diagSourceUS=callbackUS;
     CVPixelBufferRef pixel=CMSampleBufferGetImageBuffer(sample);if(pixel)OfferCapture(pixel,CMTimeMake(self.sequence++,targetFPS));
+    else {atomic_fetch_add(&diagNoPixel,1);Diag("capture_no_pixel",DiagNoSequence,ordinal,"us=%llu",DU(DiagUS()));}
+    diagSourceOrdinal=0;diagSourceUS=0;
   }
 }
 @end
@@ -1076,6 +1157,42 @@ static BOOL TestDisplayIdentityLock(void){
   second=AcquireDisplayIdentityLock(directory,geteuid());ok=ok&&second<0;if(second>=0)close(second);
   chmod(directory,0700);unlink(path);rmdir(directory);return ok;
 }
+// Offline diagnostic checks: no capture/display/encoder APIs invoked.
+static int TestDiagFormat(char *line,size_t capacity,const char *stage,uint64_t seq,uint64_t capture,const char *format,...){
+  va_list args;va_start(args,format);int n=DiagFormat(line,capacity,stage,seq,capture,format,args);va_end(args);return n;
+}
+static BOOL TestDiagnosticRecords(void){
+  struct {char line[_POSIX_PIPE_BUF];char sentinel;} bounded={.sentinel=73};
+  int n=TestDiagFormat(bounded.line,sizeof(bounded.line),"encode_call_end",UINT64_MAX-1,UINT64_MAX,"us=%llu status=%u flags=%u",DU(UINT64_MAX),UINT_MAX,UINT_MAX);
+  if(n<=0||n>=_POSIX_PIPE_BUF||bounded.sentinel!=73||bounded.line[n-1]!='\n')return NO;
+  // Parse the exact public key=value grammar and decimal-only values.
+  char *state=NULL;char *token=strtok_r(bounded.line," \n",&state);if(!token||strcmp(token,"TC_DIAG"))return NO;
+  unsigned fields=0;while((token=strtok_r(NULL," \n",&state))){char *equal=strchr(token,'=');if(!equal)return NO;*equal=0;if(!DiagIdentifier(token))return NO;
+    if(!strcmp(token,"stage")){if(strcmp(equal+1,"encode_call_end"))return NO;}
+    else {const char *v=equal+1;if(!*v)return NO;for(;*v;v++)if(*v<'0'||*v>'9')return NO;}fields++;
+  }
+  if(fields!=6)return NO;
+  if(TestDiagFormat(bounded.line,sizeof(bounded.line),"bad stage",0,0,"us=0")>=0)return NO;
+  if(TestDiagFormat(bounded.line,sizeof(bounded.line),"bounds",0,0,"us=%0600u",0)>=0||bounded.sentinel!=73)return NO;
+  if(TestDiagFormat(bounded.line,1,"bounds",0,0,"us=0")>=0)return NO;
+  unsigned long long truncated=atomic_load(&diagTruncated);
+  Diag("bounds",DiagNoSequence,0,"us=%0600u",0);
+  if(diagEnabled&&atomic_load(&diagTruncated)!=truncated+1)return NO;
+  int stdoutFlags=fcntl(STDOUT_FILENO,F_GETFL);
+  int fd[2];if(pipe(fd))return NO;BOOL ok=DiagNonblocking(fd[1])&&fcntl(STDOUT_FILENO,F_GETFL)==stdoutFlags;
+  char filler[_POSIX_PIPE_BUF]={0};while(ok){ssize_t count=write(fd[1],filler,sizeof(filler));if(count<0){ok=errno==EAGAIN||errno==EWOULDBLOCK;break;}if(count==0){ok=NO;break;}}
+  unsigned long long before=atomic_load(&diagEagain);errno=EDOM;DiagWrite(fd[1],"test\n",5);
+  ok=ok&&errno==EDOM&&atomic_load(&diagEagain)==before+1;
+  // Drain once enough space is available, then verify a later summary exposes
+  // the cumulative loss despite the earlier failed diagnostic write.
+  ok=ok&&DiagNonblocking(fd[0]);while(read(fd[0],filler,sizeof(filler))>0){}
+  n=TestDiagFormat(bounded.line,sizeof(bounded.line),"diagnostics_aggregate",0,0,"eagain=%llu",DU(atomic_load(&diagEagain)));
+  if(n<=0)ok=NO;else {DiagWrite(fd[1],bounded.line,(size_t)n);char readback[_POSIX_PIPE_BUF];ssize_t got=read(fd[0],readback,sizeof(readback));ok=ok&&got==n&&!memcmp(readback,bounded.line,(size_t)n);}
+  close(fd[0]);close(fd[1]);
+  unsigned long long partial=atomic_load(&diagPartial),failed=atomic_load(&diagFailed);
+  DiagWriteResult(2,5,0);DiagWriteResult(-1,5,EINTR);
+  return ok&&atomic_load(&diagPartial)==partial+1&&atomic_load(&diagFailed)==failed+1;
+}
 static int SelfTest(void){
   int failures=0;
   #define CHECK(cond,name) do{if(!(cond)){fprintf(stderr,"FAIL %s\n",name);failures++;}else fprintf(stderr,"PASS %s\n",name);}while(0)
@@ -1087,6 +1204,8 @@ static int SelfTest(void){
   CHECK(TestDisplayIdentityLock(),"display-identity-lock-cross-process-release-symlink-hardlink-permissions");
   CHECK(TestCursorGuardIsolation(),"cursor-slow-guard-does-not-lock-video");
   CHECK(TestCursorBusyAndEpoch(),"cursor-busy-skips-and-stale-epoch-hides");
+  CHECK(DiagReasonCode("")==2166136261u && DiagReasonCode("a")==0xe40c292cu && DiagReasonCode("foobar")==0xbf9cf968u && DiagReasonCode("output stalled")==DiagReasonCode("output stalled"),"diagnostics-failure-fnv1a32-known-stable");
+  CHECK(TestDiagnosticRecords(),"diagnostics-bounds-identifiers-numeric-parser-nonblocking-loss-visibility");
   CHECK(TestWriterBackpressureOrdering(),"writer-backpressure-callbacks-return-two-slot-bound-and-order");
 
   CHECK(PumpWait(1,0)==0.025,"pump-long-wait-capped-25ms");
@@ -1431,6 +1550,7 @@ static int SelfTest(void){
   return failures?5:0;
 }
 int main(int argc,const char **argv){@autoreleasepool {
+  diagEnabled=DiagNonblocking(STDERR_FILENO);
   VideoFormat parsed;OwnedOrigin parsedOrigin;
   const char *parseArgs[argc];for(int i=0;i<argc;i++)parseArgs[i]=argv[i];
   if(argc>=2 && (!strcmp(argv[1],"--benchmark-tune")||!strcmp(argv[1],"--synthetic-tune")||!strcmp(argv[1],"--benchmark-nv12")||!strcmp(argv[1],"--benchmark-pipeline")||!strcmp(argv[1],"--benchmark-capture-old")||!strcmp(argv[1],"--benchmark-capture-latest")||!strcmp(argv[1],"--benchmark-new")||!strcmp(argv[1],"--benchmark-speed")||!strcmp(argv[1],"--benchmark-ratecontrol")))parseArgs[1]="--synthetic";
@@ -1714,6 +1834,6 @@ int main(int argc,const char **argv){@autoreleasepool {
   // Capture filter identity is locked to ownedID: non-owned displays are never
   // reachable through this stream, regardless of OS topology transients.
   double firstFrameDeadline=Now()+8,encodeDeadline=0;unsigned lastProgress=0;
-  for(;;){Pump(1.0/60.0);PublishCursor();if(!atomic_load(&emitted)&&Now()>firstFrameDeadline)Fail("first frame timeout");if(atomic_load(&inFlight)){unsigned progress=atomic_load(&emitted)+atomic_load(&encoderDropped);if(!encodeDeadline||progress!=lastProgress){encodeDeadline=Now()+5;lastProgress=progress;}if(Now()>encodeDeadline)Fail("encode timeout");}else encodeDeadline=0;}
+  for(;;){Pump(1.0/60.0);DiagPeriodic();PublishCursor();if(!atomic_load(&emitted)&&Now()>firstFrameDeadline)Fail("first frame timeout");if(atomic_load(&inFlight)){unsigned progress=atomic_load(&emitted)+atomic_load(&encoderDropped);if(!encodeDeadline||progress!=lastProgress){encodeDeadline=Now()+5;lastProgress=progress;}if(Now()>encodeDeadline)Fail("encode timeout");}else encodeDeadline=0;}
   (void)display;(void)stream;(void)sink;
 }}

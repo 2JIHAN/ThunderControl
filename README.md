@@ -12,6 +12,10 @@ v0.8.30 (build 60) is an experimental prerelease for two Apple Silicon Macs. Dis
 
 *Connection diagram, not an app screenshot.*
 
+## Diagnostics and reconnect intent test: 0.8.30.9
+
+[Latest test release](https://github.com/2JIHAN/ThunderControl/releases/tag/v0.8.30.9). Adds correlated pipeline diagnostics, bounded iCloud copying and narrow safe-reconnect fixes. Update both Macs for complete traces. Video settings and pacing policy are unchanged; actual cable recovery and panel continuity remain unverified. [Scope and instructions](docs/DEVELOPMENT_DIAGNOSTICS.md).
+
 ## Frame pacing test build: 0.8.30.8
 
 [Experimental test release](https://github.com/2JIHAN/ThunderControl/releases/tag/v0.8.30.8). The MacBook viewer uses a real display link and a bounded decoded-frame buffer. Local policy, decoder and native-viewer tests passed; actual two-Mac stutter improvement and physical-panel 60 fps remain unverified. This is a receiver-side change and does not change the video protocol. See the release notes before updating.

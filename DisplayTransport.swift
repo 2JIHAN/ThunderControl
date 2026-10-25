@@ -207,18 +207,34 @@ private final class DisplayTransportRun {
   var socket: OwnedSocket?, outgoing: DisplayChannelCipher?
   private var sentDisplayIdentity = false // Protected by txLock.
   var latency=DisplayHeartbeatState()
+  var diagnosticStream:String? // Diagnostic correlation only; not authentication or routing.
+  private var diagnosticStopRecorded=false
+  let diagnosticRecorder:DevelopmentDiagnostics
+  var diagnosticActivationHookForTests:(()->Void)?
+  func activateDiagnostics(stream:String)->Bool {
+    state.lock();defer{state.unlock()}
+    guard !context.cancelled,diagnosticStream==nil else{return false}
+    diagnosticActivationHookForTests?()
+    authenticated=true;lastRX=ProcessInfo.processInfo.systemUptime;diagnosticStream=stream
+    // Only a short memory lock; no disk or cloud calls. Cancellation captures the
+    // same stream under state, so it cannot return before this activation is retired.
+    diagnosticRecorder.start(role:sending ? "source":"viewer",stream:stream)
+    return true
+  }
   var authenticated = false, authStart: Double?, lastRX = ProcessInfo.processInfo.systemUptime
   var lastBridgeProof = ProcessInfo.processInfo.systemUptime
   var timers: [DispatchSourceTimer] = []
   let expectedPair:LayoutDevicePair
   let viewerFormat:DisplayVideoFormat
-  init(initial: OwnedSocket, bridge: Bridge, sending: Bool, remote: String?,expectedPair:LayoutDevicePair,viewerFormat:DisplayVideoFormat) {
+  init(initial: OwnedSocket, bridge: Bridge, sending: Bool, remote: String?,expectedPair:LayoutDevicePair,viewerFormat:DisplayVideoFormat,diagnosticRecorder:DevelopmentDiagnostics = .shared) {
+    self.diagnosticRecorder=diagnosticRecorder
     self.expectedPair=expectedPair;self.viewerFormat=viewerFormat
     self.initial = initial; context = SessionContext(initial); self.bridge = bridge; self.sending = sending; self.remote = remote
   }
   func cancel() {
     context.cancel(reason: "Display session stopped")
-    state.lock(); let sources = timers; timers.removeAll(); state.unlock()
+    state.lock(); let sources = timers; timers.removeAll(); let stream=diagnosticStopRecorded ? nil:diagnosticStream;diagnosticStopRecorded=true;state.unlock()
+    if let stream{diagnosticRecorder.record(stage:"transport_stop",stream:stream);diagnosticRecorder.stop(stream:stream)}
     for source in sources { source.cancel() }
   }
   func timer(interval: Double, queue: DispatchQueue, action: @escaping () -> Void) {
@@ -231,8 +247,10 @@ private final class DisplayTransportRun {
   func transmit(_ data: Data, requireAuthentication: Bool = true) throws {
     // A synchronous video/control caller and one heartbeat are the only writers.
     // No transport-side backlog is allocated.
+    let diagnosticStarted=ProcessInfo.processInfo.systemUptime
     txLock.lock(); defer { txLock.unlock() }
-    state.lock(); let sock = socket; let ready = authenticated; state.unlock()
+    let diagnosticLocked=ProcessInfo.processInfo.systemUptime
+    state.lock(); let sock = socket; let ready = authenticated; let stream=diagnosticStream;state.unlock()
     guard !context.cancelled, let socket = sock, !requireAuthentication || ready, var cipher = outgoing else { throw DisplayTransportError.stopped }
     if data.first == 1 || data.first == 2 || data.first == 6 || data.first == 7 {
       guard sending, DisplayChannelCipher.validPayload(data),
@@ -244,9 +262,16 @@ private final class DisplayTransportRun {
     } else if data.first == 4 {
       guard !sending, DisplayChannelCipher.validInputPayload(data) else { throw DisplayTransportError.invalid }
     }
+    let diagnosticSequence=data.first==6 ? (try? DisplayStreamFrameHeader(data))?.sequence:nil
+    let diagnosticSealStart=ProcessInfo.processInfo.systemUptime
     let frame = try cipher.seal(data); outgoing = cipher
+    if let sequence=diagnosticSequence,let stream{DevelopmentDiagnostics.shared.record(stage:"tx_seal",sequence:sequence,fields:["lockWaitMs":(diagnosticLocked-diagnosticStarted)*1000,"sealMs":(ProcessInfo.processInfo.systemUptime-diagnosticSealStart)*1000,"bytes":Double(frame.count)],stream:stream)}
     let writeStarted = ProcessInfo.processInfo.systemUptime
-    try displayWriteFrame(socket.fd, frame)
+    do{try displayWriteFrame(socket.fd, frame)}catch{
+      if let sequence=diagnosticSequence,let stream{DevelopmentDiagnostics.shared.record(stage:"tx_write_error",sequence:sequence,fields:["elapsedMs":(ProcessInfo.processInfo.systemUptime-writeStarted)*1000],stream:stream)}
+      throw error
+    }
+    if let sequence=diagnosticSequence,let stream{DevelopmentDiagnostics.shared.record(stage:"tx_write",sequence:sequence,fields:["elapsedMs":(ProcessInfo.processInfo.systemUptime-writeStarted)*1000],stream:stream)}
     if data.first == 6, let measured = try? DisplayStreamFrameHeader(data), measured.sequence % 120 == 0 {
       displayStageLog("Display source socketWriteMs=\((ProcessInfo.processInfo.systemUptime-writeStarted)*1000); deliveryNotMeasured=true")
     }
@@ -265,6 +290,7 @@ final class DisplayTransport: @unchecked Sendable {
   private var current: DisplayTransportRun?
   private var generation = UUID()
   private var pendingStart = false
+  var diagnosticStreamID:String? {lock.lock();let run=current;lock.unlock();guard let run else{return nil};run.state.lock();defer{run.state.unlock()};return run.diagnosticStream}
   deinit { stop() }
   private func isCurrent(_ run: DisplayTransportRun) -> Bool {
     lock.lock(); defer { lock.unlock() }; return current === run && !run.context.cancelled
@@ -322,7 +348,7 @@ final class DisplayTransport: @unchecked Sendable {
       run.state.lock(); let auth = run.authStart; let ready = run.authenticated; let rx = run.lastRX; let proof = run.lastBridgeProof; run.state.unlock()
       let now = ProcessInfo.processInfo.systemUptime
       if (startupDeadline != nil && !ready && now >= startupDeadline!) || now - proof > 4 || (auth != nil && !ready && now - auth! > 15) || (ready && now - rx > 6) {
-        self.fail(run, TCText("The screen connection stopped responding. Check the cable and the app on the other Mac, then restart."))
+        self.fail(run, TCText("The screen connection stopped responding. Check the cable and the app on the other Mac, then restart."),diagnosticReason:1)
       }
     }
     run.timer(interval: 1, queue: DispatchQueue(label: "ThunderControl.display.bridge")) { [weak self, weak run] in
@@ -332,12 +358,12 @@ final class DisplayTransport: @unchecked Sendable {
         run.state.lock(); let socket = run.socket; run.state.unlock()
         if let socket { try displayVerifySocket(socket.fd, bridge: run.bridge, remote: run.remote) }
         run.state.lock(); run.lastBridgeProof = ProcessInfo.processInfo.systemUptime; run.state.unlock()
-      } catch { self.fail(run, TCText("Screen transmission stopped because the Thunderbolt connection changed.")) }
+      } catch { self.fail(run, TCText("Screen transmission stopped because the Thunderbolt connection changed."),diagnosticReason:2) }
     }
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let self else { run.cancel(); return }
       do { try self.connect(run, remote: remote) }
-      catch { self.fail(run, TCText("Screen connection or authentication failed. Check that both Macs are running 0.8.22 or later, complete the input connection between the same two Macs first, then try again.")) }
+      catch { self.fail(run, TCText("Screen connection or authentication failed. Check that both Macs are running 0.8.22 or later, complete the input connection between the same two Macs first, then try again."),diagnosticReason:3) }
     }
   }
   func send(_ payload: Data) throws {
@@ -345,17 +371,19 @@ final class DisplayTransport: @unchecked Sendable {
     lock.lock(); let run = current; lock.unlock()
     guard let run, run.sending else { throw DisplayTransportError.stopped }
     do { try run.transmit(payload) }
-    catch { fail(run, TCText("Screen transmission interrupted. Reconnect to continue.")); throw error }
+    catch { fail(run, TCText("Screen transmission interrupted. Reconnect to continue."),diagnosticReason:4); throw error }
   }
   func sendInput(_ payload: Data) throws {
     guard !Thread.isMainThread, DisplayChannelCipher.validInputPayload(payload) else { throw DisplayTransportError.invalid }
     lock.lock(); let run = current; lock.unlock()
     guard let run, !run.sending else { throw DisplayTransportError.stopped }
     do { try run.transmit(payload) }
-    catch { fail(run, TCText("Screen control transmission interrupted. Reconnect to continue.")); throw error }
+    catch { fail(run, TCText("Screen control transmission interrupted. Reconnect to continue."),diagnosticReason:5); throw error }
   }
-  private func fail(_ run: DisplayTransportRun, _ message: String) {
+  private func fail(_ run: DisplayTransportRun, _ message: String, diagnosticReason:Double = 0) {
     lock.lock(); guard current === run else { lock.unlock(); return }; current = nil; let failedGeneration = generation; lock.unlock()
+    run.state.lock();let diagnosticStream=run.diagnosticStream;run.state.unlock()
+    if let diagnosticStream{DevelopmentDiagnostics.shared.record(stage:"transport_failure",fields:["reasonCode":diagnosticReason],stream:diagnosticStream)}
     run.cancel()
     DispatchQueue.main.async { [weak self] in
       guard let self else { return }
@@ -418,7 +446,9 @@ final class DisplayTransport: @unchecked Sendable {
     try run.transmit(capabilities, requireAuthentication: false)
     guard try incoming.open(displayReadFrame(fd, maximum: 64)) == capabilities else { throw DisplayTransportError.invalid }
     guard isCurrent(run) else { throw DisplayTransportError.stopped }
-    run.state.lock(); run.authenticated = true; run.lastRX = ProcessInfo.processInfo.systemUptime; run.state.unlock()
+    let diagnosticStream=SHA256.hash(data:Data(("ThunderControl/development-diagnostics/v1/"+senderNonce+receiverNonce).utf8)).map{String(format:"%02x",$0)}.joined()
+    guard run.activateDiagnostics(stream:diagnosticStream) else{throw DisplayTransportError.stopped}
+    DevelopmentDiagnostics.shared.record(stage:"stream_authenticated",fields:["width":Double(agreedFormat.width),"height":Double(agreedFormat.height),"scale":Double(agreedFormat.pixelScale)],stream:diagnosticStream)
     run.timer(interval: 1, queue: DispatchQueue(label: "ThunderControl.display.heartbeat")) { [weak self, weak run] in
       guard let self, let run, self.isCurrent(run) else { return }
       do {
@@ -426,14 +456,20 @@ final class DisplayTransport: @unchecked Sendable {
         if next.expired{DispatchQueue.main.async{[weak self] in guard let self,self.isCurrent(run) else{return};self.onLatency?(nil)}}
         try run.transmit(next.token.map{DisplayHeartbeatState.packet(token:$0,reply:false)} ?? Data([0]))
       }
-      catch { self.fail(run, TCText("Screen connection keepalive signal lost.")) }
+      catch { self.fail(run, TCText("Screen connection keepalive signal lost."),diagnosticReason:6) }
     }
     DispatchQueue.main.sync { if self.isCurrent(run) { self.onAuthenticated?(agreedFormat) } }
     var receivedDisplayIdentity = false
     var frameReadCadence = DisplayCadenceStats()
     var lastCadenceLog = ProcessInfo.processInfo.systemUptime
     while isCurrent(run) {
-      let payload = try incoming.open(displayReadFrame(fd, maximum: run.sending ? 4096 + 24 : DisplayChannelCipher.maximumFrame))
+      let diagnosticReadStarted=ProcessInfo.processInfo.systemUptime
+      let encrypted=try displayReadFrame(fd,maximum:run.sending ? 4096+24:DisplayChannelCipher.maximumFrame)
+      let diagnosticReadFinished=ProcessInfo.processInfo.systemUptime
+      let payload=try incoming.open(encrypted)
+      let diagnosticOpened=ProcessInfo.processInfo.systemUptime
+      let diagnosticFrame=payload.first==6 ? (try? DisplayStreamFrameHeader(payload)):nil
+      if let frame=diagnosticFrame{DevelopmentDiagnostics.shared.record(stage:"rx_open",sequence:frame.sequence,fields:["blockingReadMs":(diagnosticReadFinished-diagnosticReadStarted)*1000,"openMs":(diagnosticOpened-diagnosticReadFinished)*1000,"bytes":Double(encrypted.count)],stream:diagnosticStream)}
       run.state.lock(); run.lastRX = ProcessInfo.processInfo.systemUptime; run.state.unlock()
       if payload == Data([0]) { continue }
       if payload.first==0 {
@@ -465,6 +501,7 @@ final class DisplayTransport: @unchecked Sendable {
           if payload.first == 6, let measured = try? DisplayStreamFrameHeader(payload), measured.sequence % 120 == 0 {
             displayStageLog("Display receiver authenticatedReadToMainMs=\((ProcessInfo.processInfo.systemUptime-receivedAt)*1000); oneWayNetworkMs=unknown")
           }
+          if let frame=diagnosticFrame{DevelopmentDiagnostics.shared.record(stage:"rx_main",sequence:frame.sequence,fields:["queueMs":(ProcessInfo.processInfo.systemUptime-receivedAt)*1000],stream:diagnosticStream)}
           self.onPayload?(payload)
         }
       }
@@ -473,3 +510,33 @@ final class DisplayTransport: @unchecked Sendable {
 }
 
 func displayPeerBindingMatches(expected:LayoutDevicePair,local:String,peer:String)->Bool {LayoutDevicePair(localID:local,peerID:peer)==expected}
+
+// Isolated recorder + invalid descriptors only: no bridge/network/native UI.
+func verifyDisplayDiagnosticActivationForTests()->Bool {
+  guard let physical=realpath(FileManager.default.temporaryDirectory.path,nil) else{return false}
+  let root=URL(fileURLWithPath:String(cString:physical)).appendingPathComponent("tc-diag-activation-"+UUID().uuidString);free(physical)
+  let recorder=DevelopmentDiagnostics(root:root)
+  defer{_ = recorder.shutdown(timeout:2);try? FileManager.default.removeItem(at:root)}
+  let pair=LayoutDevicePair(localID:UUID().uuidString,peerID:UUID().uuidString)!
+  func fixture()->DisplayTransportRun{DisplayTransportRun(initial:OwnedSocket(-1),bridge:Bridge(name:"fixture",index:0,ip:"169.254.1.1"),sending:true,remote:nil,expectedPair:pair,viewerFormat:.standard,diagnosticRecorder:recorder)}
+  let a=fixture(),b=fixture(),streamA=String(repeating:"a",count:64),streamB=String(repeating:"b",count:64)
+  a.cancel()
+  guard !a.activateDiagnostics(stream:streamA),b.activateDiagnostics(stream:streamB),!a.activateDiagnostics(stream:streamA) else{return false}
+  do{try recorder.flushForTests()}catch{return false}
+  guard recorder.currentStream==streamB else{return false}
+  a.cancel();guard recorder.currentStream==streamB else{return false};b.cancel()
+  guard b.diagnosticStream==streamB else{return false} // Late events stay bound to retired B.
+  do{try recorder.flushForTests()}catch{return false}
+  guard recorder.currentStream==nil else{return false}
+  let racing=fixture(),entered=DispatchSemaphore(value:0),proceed=DispatchSemaphore(value:0),activated=DispatchSemaphore(value:0),cancelled=DispatchSemaphore(value:0)
+  racing.diagnosticActivationHookForTests={entered.signal();_ = proceed.wait(timeout:.now()+3)}
+  DispatchQueue.global().async{_ = racing.activateDiagnostics(stream:streamA);activated.signal()}
+  guard entered.wait(timeout:.now()+2) == .success else{proceed.signal();return false}
+  DispatchQueue.global().async{racing.cancel();cancelled.signal()}
+  let deadline=ProcessInfo.processInfo.systemUptime+1
+  while !racing.context.cancelled && ProcessInfo.processInfo.systemUptime<deadline{usleep(1000)}
+  let sawCancellation=racing.context.cancelled;proceed.signal()
+  guard activated.wait(timeout:.now()+3) == .success,cancelled.wait(timeout:.now()+3) == .success,sawCancellation else{return false}
+  do{try recorder.flushForTests()}catch{return false}
+  return recorder.currentStream==nil && !racing.activateDiagnostics(stream:streamA)
+}

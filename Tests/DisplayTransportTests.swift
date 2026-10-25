@@ -149,6 +149,7 @@ func runDisplayTransportTests() -> Int {
   } catch {failures += 1}
   let local=UUID().uuidString,peer=UUID().uuidString,other=UUID().uuidString
   if let pair=LayoutDevicePair(localID:local,peerID:peer) {verify(displayPeerBindingMatches(expected:pair,local:local,peer:peer));verify(!displayPeerBindingMatches(expected:pair,local:local,peer:other));verify(!displayPeerBindingMatches(expected:pair,local:peer,peer:local));verify(!displayPeerBindingMatches(expected:pair,local:local,peer:"invalid"))}else{verify(false)}
+  verify(verifyDisplayDiagnosticActivationForTests())
   print("Display transport offline crypto/framing tests: \(failures == 0 ? "PASS" : "FAIL"); no sockets, Keychain, capture, or input")
   return failures
 }

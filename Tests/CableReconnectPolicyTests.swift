@@ -12,6 +12,12 @@ func runCableReconnectPolicyTests()->Int {
   check(shouldSuspendAutomaticReconnect(stage:"Authenticated stream",error:Failure("Malformed authenticated packet"),terminalReason:nil))
   check(!shouldSuspendAutomaticReconnect(stage:"Authenticated stream",error:Failure("Peer closed the TCP connection (EOF)"),terminalReason:nil))
   check(!shouldSuspendAutomaticReconnect(stage:"Trusted pairing",error:PINPairingError.authenticationFailed,terminalReason:"Pairing transport interrupted"))
+  check(!shouldSuspendAutomaticReconnect(stage:"Authenticated stream",error:Failure("Inbound queue overload"),terminalReason:nil))
+  check(shouldSuspendAutomaticReconnect(stage:"Trusted pairing",error:Failure("Inbound queue overload"),terminalReason:nil))
+  check(shouldSuspendAutomaticReconnect(stage:"Authenticated stream",error:Failure("Inbound queue overload: malformed peer payload"),terminalReason:nil))
+  check(!automaticConnectionMayStart(configured:true,paused:true,suspended:false,permissions:true,sessionSafe:true,recovery:false,hasSession:false))
+  check(!automaticConnectionMayStart(configured:true,paused:false,suspended:false,permissions:true,sessionSafe:true,recovery:true,hasSession:false))
+  check(Relay.verifyDevelopmentReconnectTimeoutForTests())
   print("Cable reconnect policy: transport retry versus authentication/emergency suspension failures=\(failures)")
   return failures
 }

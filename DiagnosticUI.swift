@@ -54,6 +54,17 @@ import ApplicationServices
     check(fixture.relay.automaticReconnectSuspended && fixture.automaticConnectionPaused)
     print("PASS unlocked UI drops stale lock label without unpausing independent Stop; new transition discards both unlock proofs even while paused; no input/network")
   }
+  @objc func openDevelopmentDiagnostics() {
+    let url=DevelopmentDiagnostics.shared.localDirectoryURL
+    if FileManager.default.fileExists(atPath:url.path){NSWorkspace.shared.open(url)}else{
+      let alert=NSAlert();alert.messageText=TCText("Development diagnostics start after the screen connection is authenticated.");alert.beginSheetModal(for:window)
+    }
+  }
+  @objc func openCloudDevelopmentDiagnostics() {
+    if let url=DevelopmentDiagnostics.shared.cloudDirectoryURL{NSWorkspace.shared.open(url)}else{
+      let alert=NSAlert();alert.messageText=TCText("iCloud diagnostics are not available yet. Local diagnostics remain available; cloud copying retries automatically.");alert.beginSheetModal(for:window)
+    }
+  }
   @objc func exportDiagnostics() {
     let panel=NSOpenPanel();panel.canChooseDirectories=true;panel.canChooseFiles=false
     panel.allowsMultipleSelection=false;panel.canCreateDirectories=true
