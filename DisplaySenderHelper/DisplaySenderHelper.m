@@ -870,6 +870,12 @@ static void Pump(double t){@autoreleasepool {
     }
   }
 }}
+// Pump has its own inner pool, but diagnostics/cursor/session work after Pump
+// must also drain every iteration instead of accumulating in main's outer pool.
+// Keep the whole iteration (including deadline checks) inside the same boundary.
+static void RunPooledIteration(void (NS_NOESCAPE ^body)(void)){
+  @autoreleasepool {body();}
+}
 static void StartWatchdog(void){
   pid_t parent=getppid();parentPID=parent;if(parent<=1)Fail("parent unavailable");
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE,0),^{@autoreleasepool {
@@ -1112,6 +1118,38 @@ static BOOL TestWriterBackpressureOrdering(void){
   atomic_store(&emitted,0);atomic_store(&inFlight,0);atomic_store(&maximumInFlight,0);
   close(fd[0]);close(fd[1]);return ok;
 }
+// Offline lifetime sentinel: an autoreleasing store deliberately leaves its
+// last ownership in the current pool, just like autoreleased framework results.
+@interface HelperIterationTestSentinel:NSObject
+@property(assign) unsigned *deallocations;
+@end
+@implementation HelperIterationTestSentinel
+-(void)dealloc {if(_deallocations)(*_deallocations)++;}
+@end
+static BOOL TestIterationAutoreleaseBoundary(void){
+  __block unsigned destroyed=0;__block BOOL ok=YES;
+  __block __weak HelperIterationTestSentinel *weakSentinel=nil;
+  // Control: the sentinel must survive the local variable's scope and Pump's
+  // nested pool, so this fixture would catch a missing iteration boundary.
+  @autoreleasepool {
+    ^{
+      __autoreleasing HelperIterationTestSentinel *sentinel=[HelperIterationTestSentinel new];
+      sentinel.deallocations=&destroyed;weakSentinel=sentinel;
+    }();
+    Pump(0);ok=weakSentinel!=nil&&destroyed==0;
+  }
+  ok=ok&&weakSentinel==nil&&destroyed==1;
+  for(unsigned n=0;n<1024;n++){
+    RunPooledIteration(^{
+      __autoreleasing HelperIterationTestSentinel *sentinel=[HelperIterationTestSentinel new];
+      sentinel.deallocations=&destroyed;weakSentinel=sentinel;
+      Pump(0);ok=ok&&weakSentinel!=nil&&destroyed==n+1;
+    });
+    // Must drain before the next iteration, while main's outer pool is alive.
+    ok=ok&&weakSentinel==nil&&destroyed==n+2;
+  }
+  return ok;
+}
 // Optional GUI-session regression: application-local synthetic event only.
 // No window, virtual display, capture, network or CG input posting.
 @interface HelperPumpTestApplication:NSApplication
@@ -1127,7 +1165,7 @@ static int EventPumpSelfTest(void){
   HelperPumpTestApplication *app=[HelperPumpTestApplication sharedApplication];
   [app setActivationPolicy:NSApplicationActivationPolicyProhibited];[app finishLaunching];
   NSEvent *event=[NSEvent otherEventWithType:NSEventTypeApplicationDefined location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:0 context:nil subtype:0x5443 data1:0 data2:0];
-  if(!event)return 5;[app postEvent:event atStart:NO];Pump(.1);
+  if(!event)return 5;[app postEvent:event atStart:NO];RunPooledIteration(^{Pump(.1);});
   fprintf(stderr,"%s helper AppKit event pump: local event delivered, no window/display/capture/input posting\n",app.sawPumpTestEvent?"PASS":"FAIL");
   return app.sawPumpTestEvent?0:5;
 }
@@ -1208,6 +1246,7 @@ static int SelfTest(void){
   CHECK(TestDiagnosticRecords(),"diagnostics-bounds-identifiers-numeric-parser-nonblocking-loss-visibility");
   CHECK(TestWriterBackpressureOrdering(),"writer-backpressure-callbacks-return-two-slot-bound-and-order");
 
+  CHECK(TestIterationAutoreleaseBoundary(),"iteration-autorelease-sentinel-control-and-1024-drains");
   CHECK(PumpWait(1,0)==0.025,"pump-long-wait-capped-25ms");
   CHECK(PumpWait(1,1)==0 && PumpWait(1,2)==0 && PumpWait(-1,0)==0,"pump-expired-negative-no-wait");
   CHECK(PumpWait(INFINITY,0)==0 && PumpWait(NAN,0)==0 && PumpWait(1,INFINITY)==0 && PumpWait(1,NAN)==0 && PumpWait(-INFINITY,0)==0,"pump-nonfinite-fails-closed");
@@ -1833,7 +1872,7 @@ int main(int argc,const char **argv){@autoreleasepool {
   // Strong references remain alive for whole process; exit is the cleanup boundary.
   // Capture filter identity is locked to ownedID: non-owned displays are never
   // reachable through this stream, regardless of OS topology transients.
-  double firstFrameDeadline=Now()+8,encodeDeadline=0;unsigned lastProgress=0;
-  for(;;){Pump(1.0/60.0);DiagPeriodic();PublishCursor();if(!atomic_load(&emitted)&&Now()>firstFrameDeadline)Fail("first frame timeout");if(atomic_load(&inFlight)){unsigned progress=atomic_load(&emitted)+atomic_load(&encoderDropped);if(!encodeDeadline||progress!=lastProgress){encodeDeadline=Now()+5;lastProgress=progress;}if(Now()>encodeDeadline)Fail("encode timeout");}else encodeDeadline=0;}
+  double firstFrameDeadline=Now()+8;__block double encodeDeadline=0;__block unsigned lastProgress=0;
+  for(;;){RunPooledIteration(^{Pump(1.0/60.0);DiagPeriodic();PublishCursor();if(!atomic_load(&emitted)&&Now()>firstFrameDeadline)Fail("first frame timeout");if(atomic_load(&inFlight)){unsigned progress=atomic_load(&emitted)+atomic_load(&encoderDropped);if(!encodeDeadline||progress!=lastProgress){encodeDeadline=Now()+5;lastProgress=progress;}if(Now()>encodeDeadline)Fail("encode timeout");}else encodeDeadline=0;});}
   (void)display;(void)stream;(void)sink;
 }}

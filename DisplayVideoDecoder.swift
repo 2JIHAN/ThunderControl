@@ -815,15 +815,16 @@ struct DisplayViewerStartup {
             close(); return
         }
         let rendererReady = renderer.isReadyForMoreMediaData
-        frameTrace.record("renderer_control", fields: ["time": CACurrentMediaTime(), "target": targetTimestamp, "ready": rendererReady ? 1 : 0, "status": Double(renderer.status.rawValue), "pending": Double(pacedFrames.pendingCount), "readinessRequested": readinessRequested ? 1 : 0, "deferrals": Double(presentationStats.readinessDeferrals), "registrations": Double(readinessRegistrations), "callbacks": Double(readinessCallbacks)])
+        let pacingNow = CACurrentMediaTime()
+        frameTrace.record("renderer_control", fields: ["time": pacingNow, "pacingNow": pacingNow, "target": targetTimestamp, "ready": rendererReady ? 1 : 0, "status": Double(renderer.status.rawValue), "pending": Double(pacedFrames.pendingCount), "readinessRequested": readinessRequested ? 1 : 0, "deferrals": Double(presentationStats.readinessDeferrals), "registrations": Double(readinessRegistrations), "callbacks": Double(readinessCallbacks)])
         guard rendererReady else {
             presentationStats.readinessDeferrals &+= 1
             requestRendererReadiness(renderer)
             return
         }
         stopReadiness(ready: true)
-        guard let frame = pacedFrames.take(now:CACurrentMediaTime(),targetTimestamp:targetTimestamp) else { return }
-        frameTrace.record("pacer_select", identity: frame.identity, fields: ["target": targetTimestamp, "time": CACurrentMediaTime(), "pending": Double(pacedFrames.pendingCount)])
+        guard let frame = pacedFrames.take(now:pacingNow,targetTimestamp:targetTimestamp) else { return }
+        frameTrace.record("pacer_select", identity: frame.identity, fields: ["target": targetTimestamp, "time": CACurrentMediaTime(), "pacingNow": pacingNow, "pending": Double(pacedFrames.pendingCount)])
         let started = ProcessInfo.processInfo.systemUptime
         do {
             let sample = try displayImmediateImageSample(frame.pixel, format: self.format)

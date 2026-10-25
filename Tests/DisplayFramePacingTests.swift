@@ -66,9 +66,9 @@ func runDisplayFramePacingTests() -> Int {
         fast.offer(i, at: target - dt)
         if let frame = fast.take(now: target, targetTimestamp: target) { fastOutput.append(frame) }
     }
-    verify(fast.stats.selected == 60 && fast.stats.rateLimitedTicks == 60, "120Hz callbacks select only 60 frames")
-    verify(fastOutput == Array(stride(from: 0, to: 120, by: 2)) && fast.pendingCount == 1, "120Hz selects latest decoded frame in order")
-    verify(fast.stats.superseded == 59 && fast.stats.overflowReplaced == 0, "120Hz diagnostics account for discarded decoded frames")
+    verify(fast.stats.selected == 61 && fast.stats.rateLimitedTicks == 59, "120Hz callbacks spend at most one startup frame above 60fps")
+    verify(fastOutput == [0, 1] + Array(stride(from: 2, to: 120, by: 2)) && fast.pendingCount == 1, "120Hz selects latest decoded frame in order")
+    verify(fast.stats.superseded == 58 && fast.stats.overflowReplaced == 0, "120Hz diagnostics account for discarded decoded frames")
 
     var jitter = DisplayFramePacer<Int>()
     var jitterOutput: [Int] = []
@@ -86,7 +86,12 @@ func runDisplayFramePacingTests() -> Int {
         eight.offer(i, at: target - dt)
         if eight.take(now: target, targetTimestamp: target) != nil { times.append(target) }
     }
-    verify(zip(times, times.dropFirst()).allSatisfy { $1 - $0 >= dt - 0.00025 } && times.count <= 120, "8ms callbacks cannot burst or exceed 60fps")
+    // Intentional contract change: real 60Hz jitter has valid 9.3ms gaps.
+    // Replace the incompatible strict spacing minimum with a capacity-two
+    // cadence budget: any subwindow has N <= FPS * elapsed + 2.
+    verify(zip(times, times.dropFirst()).allSatisfy { $1 > $0 } &&
+           Double(times.count - 1) <= (times.last! - times.first!) / dt + 1.000001,
+           "8ms callbacks obey capacity-two burst bound and long-run 60fps budget")
     verify(eight.pendingCount <= 2 && eight.stats.offered == 250, "fast offers remain bounded and counted")
 
     var hidden = DisplayFramePacer<Int>()
@@ -103,9 +108,12 @@ func runDisplayFramePacingTests() -> Int {
     slower.offer(1, at: 0)
     let first = slower.take(now: dt, targetTimestamp: dt)
     slower.offer(2, at: 0)
-    let blocked = slower.take(now: 2 * dt, targetTimestamp: 2 * dt)
+    let borrowed = slower.take(now: 2 * dt, targetTimestamp: 2 * dt)
+    slower.offer(3, at: 0)
     let next = slower.take(now: 3 * dt, targetTimestamp: 3 * dt)
-    verify(first == 1 && blocked == nil && next == 2, "configured 30fps retains fixed 1/60 cushion")
+    slower.offer(4, at: 0)
+    let blocked = slower.take(now: 4 * dt, targetTimestamp: 4 * dt)
+    verify(first == 1 && borrowed == 2 && next == 3 && blocked == nil, "30fps permits bounded startup debt then enforces budget")
     var late = DisplayFramePacer<Int>(); late.offer(7, at: 0)
     verify(late.take(now: 0.1, targetTimestamp: 0.09) == 7, "slightly late callback accepted")
     var highArrival = DisplayFramePacer<Int>()
@@ -128,13 +136,124 @@ func runDisplayFramePacingTests() -> Int {
     verify(burst.take(now: 1.004, targetTimestamp: 1.004) == 3 && burst.pendingCount == 1,
            "burst fallback consumes older of bounded latest two")
     burst.offer(5, at: 1.005)
-    verify(burst.take(now: 1.012, targetTimestamp: 1.012) == nil && burst.stats.earlySelections == 1,
-           "early fallback never bypasses rate gate")
+    verify(burst.take(now: 1.012, targetTimestamp: 1.012) == 4 && burst.stats.earlySelections == 2,
+           "early fallback may spend bounded startup debt")
+    burst.offer(6, at: 1.013)
+    verify(burst.take(now: 1.014, targetTimestamp: 1.014) == nil, "third rapid fallback cannot bypass cadence budget")
     var future = DisplayFramePacer<Int>(); future.offer(1, at: 1); future.offer(2, at: 1.001)
     verify(future.take(now: 0.99, targetTimestamp: 0.99) == nil && future.pendingCount == 2,
            "full queue does not release future arrivals")
     verify(future.take(now: 1.002, targetTimestamp: 1.2) == nil && future.pendingCount == 2,
            "implausible target rejected without pending-frame loss")
+    // Actual callback clock and predicted display target may jitter independently.
+    var realistic = DisplayFramePacer<Int>()
+    var realisticOutput: [Int] = []
+    for i in 0..<3_600 {
+        let now = 10 + Double(i) * dt + (i % 2 == 0 ? 0.0036 : -0.0036)
+        let target = now + dt + (i % 3 == 0 ? 0.002 : 0)
+        realistic.offer(i, at: now - dt)
+        if let frame = realistic.take(now: now, targetTimestamp: target) { realisticOutput.append(frame) }
+    }
+    verify(realisticOutput == Array(0..<3_600), "9.47/23.87ms alternating 60Hz jitter keeps every frame for a minute")
+
+    for hz in [75.0, 90, 120, 144, 240, 1_000] {
+        var stress = DisplayFramePacer<Int>()
+        var outputTimes: [Double] = []
+        var lastFrame = -1
+        var ordered = true
+        for i in 0..<Int(hz * 20) {
+            let now = 100 + Double(i) / hz
+            stress.offer(i, at: now - dt)
+            if let frame = stress.take(now: now, targetTimestamp: now) {
+                ordered = ordered && frame > lastFrame
+                lastFrame = frame; outputTimes.append(now)
+            }
+            verify(stress.pendingCount <= 2, "bounded queue at high frequency")
+        }
+        verify(ordered && zip(outputTimes, outputTimes.dropFirst()).allSatisfy { $1 > $0 },
+               "high frequency has no duplicate/stale frames or zero-time selection")
+        var bounded = true
+        // Check every subwindow, not only a whole-run average that hides bursts.
+        for i in outputTimes.indices {
+            for j in i..<outputTimes.count {
+                bounded = bounded && Double(j - i) <= (outputTimes[j] - outputTimes[i]) / dt + 1.000001
+            }
+        }
+        verify(bounded, "every subwindow obeys configured FPS plus bounded endpoint phase difference")
+    }
+    var jitterFast = DisplayFramePacer<Int>()
+    var jitterFastTimes: [Double] = []
+    for i in 0..<12_000 {
+        let now = 200 + Double(i) / 120 + (i % 2 == 0 ? 0.001 : -0.001)
+        jitterFast.offer(i, at: now - dt)
+        if jitterFast.take(now: now, targetTimestamp: now + dt) != nil { jitterFastTimes.append(now) }
+    }
+    verify(Double(jitterFastTimes.count - 1) <= (jitterFastTimes.last! - jitterFastTimes.first!) / dt + 1.000001 &&
+           zip(jitterFastTimes, jitterFastTimes.dropFirst()).allSatisfy { $1 > $0 },
+           "jittered 120Hz callbacks over 100 seconds retain 60fps budget")
+    for offsets in [[0.0045, 0, -0.0045], [0.0042, -0.0042],
+                    [0.0078, 0, -0.0078], [0.008, -0.008]] {
+        var phased = DisplayFramePacer<Int>()
+        var count = 0
+        for i in 0..<3_600 {
+            let now = 10 + Double(i) * dt + offsets[i % offsets.count]
+            phased.offer(i, at: now - dt)
+            if phased.take(now: now, targetTimestamp: now) != nil { count += 1 }
+        }
+        verify(count == 3_600, "60Hz phase-span jitter including review counterexample retains all 3600 frames")
+        print("Pacing periodic offsets \(offsets): \(count)/3600 selections")
+    }
+    var burstBudget = DisplayFramePacer<Int>()
+    var startupBurst = 0, resumeBurst = 0
+    for i in 0..<1_000 {
+        let now = 10 + Double(i) * 0.000001
+        burstBudget.offer(i, at: now - dt)
+        if burstBudget.take(now: now, targetTimestamp: now) != nil { startupBurst += 1 }
+    }
+    for i in 0..<1_000 {
+        let now = 100 + Double(i) * 0.000001
+        burstBudget.offer(i + 1_000, at: now - dt)
+        if burstBudget.take(now: now, targetTimestamp: now) != nil { resumeBurst += 1 }
+    }
+    verify(startupBurst == 2 && resumeBurst == 1,
+           "1000 rapid callbacks spend at most two startup frames and exactly one idle-resume frame")
+    var idleYoung = DisplayFramePacer<Int>()
+    idleYoung.offer(1, at: 0)
+    _ = idleYoung.take(now: dt, targetTimestamp: dt)
+    idleYoung.offer(2, at: 10)
+    verify(idleYoung.take(now: 10, targetTimestamp: 10) == nil, "idle young frame still waits for eligibility")
+    verify(idleYoung.take(now: 10 + dt, targetTimestamp: 10 + dt) == 2, "idle frame becomes eligible")
+    idleYoung.offer(3, at: 10)
+    verify(idleYoung.take(now: 10 + dt + 0.001, targetTimestamp: 10 + dt + 0.001) == nil,
+           "idle debt reset survives intervening young-frame tick")
+    var sustainedThirty = DisplayFramePacer<Int>(framesPerSecond: 30)
+    var thirtyCount = 0
+    for i in 0..<1_200 {
+        let now = 10 + Double(i) * dt
+        sustainedThirty.offer(i, at: now - dt)
+        if sustainedThirty.take(now: now, targetTimestamp: now) != nil { thirtyCount += 1 }
+    }
+    verify(thirtyCount == 601, "configured 30fps has only one additive startup frame over 20 seconds")
+    var duplicate = DisplayFramePacer<Int>()
+    duplicate.offer(1, at: 0)
+    verify(duplicate.take(now: dt, targetTimestamp: dt) == 1, "duplicate test initial selection")
+    duplicate.offer(2, at: 0)
+    verify(duplicate.take(now: dt, targetTimestamp: dt) == nil &&
+           duplicate.take(now: 2 * dt, targetTimestamp: dt) == nil,
+           "duplicate target cannot spend another selection even with later callback clock")
+    verify(duplicate.take(now: 3 * dt, targetTimestamp: 3 * dt) == 2, "duplicate rejection does not poison cadence")
+    duplicate.offer(3, at: 1)
+    verify(duplicate.take(now: 10, targetTimestamp: 10) == 3, "long idle grants exactly one initial selection")
+    duplicate.offer(4, at: 1)
+    verify(duplicate.take(now: 10 + dt / 2, targetTimestamp: 10 + dt / 2) == nil,
+           "idle does not bank catch-up credits even at half-period boundary")
+    verify(duplicate.take(now: 9, targetTimestamp: 9) == nil &&
+           duplicate.take(now: 10 + dt, targetTimestamp: 10 + dt) == 4,
+           "backward callback cannot corrupt deadline")
+    var predictedFuture = DisplayFramePacer<Int>()
+    predictedFuture.offer(1, at: 1.01); predictedFuture.offer(2, at: 1.02)
+    verify(predictedFuture.take(now: 1, targetTimestamp: 1.05) == nil,
+           "future display prediction cannot release frame from future actual clock")
     print("Display frame pacing: \(checks) checks, \(failures) failures; synthetic policy only, not panel FPS")
     return failures
 }
