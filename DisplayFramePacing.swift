@@ -1,11 +1,16 @@
 /// Selection of already-decoded frames only; cadence and capacity are shared.
 enum DisplayFrameSelectionPolicy {
     case fifo25, latest
+    /// Build-70 rule: newest frame that arrived at least one 1/60 cushion before the
+    /// display target; under a full queue, the older of two. Smoothness over latency.
+    case latest70
     /// Oldest available decoded frame, with neither cushion nor age catchup.
     case buffered
 
     static var buildDefault: Self {
-#if TC_LATEST_DECODED
+#if TC_LEGACY70_SELECTION
+        .latest70
+#elseif TC_LATEST_DECODED
         .latest
 #else
         .fifo25
@@ -155,6 +160,9 @@ struct DisplayFramePacer<Frame> {
         case .buffered:
             eligibleIndex = queue.firstIndex { $0.arrival <= now && $0.arrival <= target }
             fallbackIndex = nil
+        case .latest70:
+            eligibleIndex = queue.lastIndex { $0.arrival <= now && $0.arrival <= target - cushion + 1e-9 }
+            fallbackIndex = queue.count == 2 && queue[0].arrival <= min(target, now) ? 0 : nil
         case .latest:
             // No fixed cushion or early fallback: use the newest decoded entry
             // already arrived by BOTH actual callback time and display target.
@@ -245,6 +253,9 @@ struct DisplayFramePacer<Frame> {
         switch selectionPolicy {
         case .buffered:
             index = queue.firstIndex { $0.arrival <= now && $0.arrival <= target }
+        case .latest70:
+            index = queue.lastIndex { $0.arrival <= now && $0.arrival <= target - cushion + 1e-9 }
+                ?? (queue.count == 2 && queue[0].arrival <= min(target, now) ? 0 : nil)
         case .latest:
             index = queue.lastIndex { $0.arrival <= now && $0.arrival <= target }
         case .fifo25:

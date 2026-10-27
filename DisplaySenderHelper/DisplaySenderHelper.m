@@ -1659,7 +1659,7 @@ int main(int argc,const char **argv){@autoreleasepool {
   encodingSlots=negotiatedFormat->pixelScale==2?2:1;
   if(!strcmp(argv[1],"--benchmark-capture-old")||!strcmp(argv[1],"--benchmark-capture-latest"))encodingSlots=1;
   captureBenchmark=nativeYUV||!strcmp(argv[1],"--benchmark-pipeline")||!strcmp(argv[1],"--benchmark-capture-old")||!strcmp(argv[1],"--benchmark-capture-latest");captureLegacy=!strcmp(argv[1],"--benchmark-capture-old");
-  benchmarkSpeed=!strcmp(argv[1],"--benchmark-speed");experimentalRateControl=!strcmp(argv[1],"--benchmark-ratecontrol");benchmark=captureBenchmark||benchmarkSpeed||experimentalRateControl||!strcmp(argv[1],"--benchmark-old")||!strcmp(argv[1],"--benchmark-new");legacyEncoder=!strcmp(argv[1],"--benchmark-old");targetFPS=legacyEncoder?30:60;if(LiveVideoMode(argv[1])&&StreamWidth==1512&&StreamHeight==950&&negotiatedFormat->pixelScale==2)targetFPS=72; // isolated 1.2x source-supply trial; viewer remains 60Hz
+  benchmarkSpeed=!strcmp(argv[1],"--benchmark-speed");experimentalRateControl=!strcmp(argv[1],"--benchmark-ratecontrol");benchmark=captureBenchmark||benchmarkSpeed||experimentalRateControl||!strcmp(argv[1],"--benchmark-old")||!strcmp(argv[1],"--benchmark-new");legacyEncoder=!strcmp(argv[1],"--benchmark-old");targetFPS=legacyEncoder?30:60;// 60Hz virtual display (same as 70.4): the 72Hz trial is removed.
   tuning=!strcmp(argv[1],"--benchmark-tune")||!strcmp(argv[1],"--synthetic-tune");
   if(tuning){
     const char *profile=getenv("TC_TUNE_PROFILE");if(!profile)profile="baseline";

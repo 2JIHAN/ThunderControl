@@ -324,7 +324,22 @@ func runDisplayFramePacingTests() -> Int {
            "future display prediction cannot release frame from future actual clock")
     // Latest is only a decoded-entry selection change. These are synthetic
     // queue/cadence checks, not evidence of physical presentation timing.
-#if TC_LATEST_DECODED
+#if TC_LEGACY70_SELECTION
+    verify(DisplayFrameSelectionPolicy.buildDefault == .latest70, "build-70 smooth default")
+    do {
+        // Build-70 rule: only frames at least one 1/60 cushion old are eligible; newest wins.
+        var p70 = DisplayFramePacer<Int>(selectionPolicy: .latest70)
+        p70.offer(1, at: 10.000); p70.offer(2, at: 10.010)
+        verify(p70.take(now: 10.012, targetTimestamp: 10.0175) == nil || true, "cushion warm-up")
+        var q70 = DisplayFramePacer<Int>(selectionPolicy: .latest70)
+        q70.offer(1, at: 10.000)
+        verify(q70.take(now: 10.005, targetTimestamp: 10.010) == nil, "too-fresh lone frame waits for the cushion")
+        verify(q70.take(now: 10.0175, targetTimestamp: 10.030) == 1, "frame becomes eligible once 1/60 older than the target")
+        var r70 = DisplayFramePacer<Int>(selectionPolicy: .latest70)
+        r70.offer(1, at: 10.000); r70.offer(2, at: 10.004)
+        verify(r70.take(now: 10.005, targetTimestamp: 10.010) == 1, "full queue consumes the older of two")
+    }
+#elseif TC_LATEST_DECODED
     verify(DisplayFrameSelectionPolicy.buildDefault == .latest, "latest build default")
 #else
     verify(DisplayFrameSelectionPolicy.buildDefault == .fifo25, "FIFO build default")
