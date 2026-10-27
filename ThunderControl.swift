@@ -4856,6 +4856,9 @@ final class PasteCommandProbe: NSResponder {
       if !self.displayMode.active && !self.displayMode.cleaning {
         timer.invalidate();self.quitAfterDisplayCleanupTimer=nil;NSApp.terminate(nil);return
       }
+      // A cleanup whose display restoration was unconfirmed stays in cleaning
+      // until stop() is requested again; stop() itself skips while one runs.
+      if !self.displayMode.active && self.displayMode.cleaning {self.displayMode.stop()}
       if ProcessInfo.processInfo.systemUptime>deadline {
         timer.invalidate();self.quitAfterDisplayCleanupTimer=nil;self.applicationIsQuitting=false
         self.displayStatus.stringValue=TCText("Quit paused: screen sharing cleanup did not finish. Choose Quit again after it finishes.")

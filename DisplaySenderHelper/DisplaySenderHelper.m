@@ -1169,13 +1169,38 @@ static BOOL TestIterationAutoreleaseBoundary(void){
   [super sendEvent:event];
 }
 @end
+// The helper lives inside the app bundle and registers with the SAME bundle id,
+// so "quit app id …" (AppleScript, installers) may be routed here instead of the
+// main app. A helper exit then looks like a video failure and the parent resumes
+// video while the user is actually quitting. Lifecycle belongs to the parent
+// (pipe/heartbeat/parent-exit), so a quit Apple event is acknowledged and ignored.
+@interface HelperQuitEventSink:NSObject
+@property(nonatomic) unsigned ignored;
+-(void)handleQuit:(NSAppleEventDescriptor*)event withReply:(NSAppleEventDescriptor*)reply;
+@end
+@implementation HelperQuitEventSink
+-(void)handleQuit:(NSAppleEventDescriptor*)event withReply:(NSAppleEventDescriptor*)reply{(void)event;(void)reply;self.ignored++;fprintf(stderr,"Display helper ignored a quit Apple event; the parent app owns helper lifetime\n");}
+@end
+static HelperQuitEventSink *helperQuitSink=nil;
+static void InstallHelperQuitSink(void){
+  if(!helperQuitSink)helperQuitSink=[HelperQuitEventSink new];
+  [[NSAppleEventManager sharedAppleEventManager] setEventHandler:helperQuitSink andSelector:@selector(handleQuit:withReply:) forEventClass:kCoreEventClass andEventID:kAEQuitApplication];
+}
 static int EventPumpSelfTest(void){
   HelperPumpTestApplication *app=[HelperPumpTestApplication sharedApplication];
   [app setActivationPolicy:NSApplicationActivationPolicyProhibited];[app finishLaunching];
   NSEvent *event=[NSEvent otherEventWithType:NSEventTypeApplicationDefined location:NSZeroPoint modifierFlags:0 timestamp:0 windowNumber:0 context:nil subtype:0x5443 data1:0 data2:0];
   if(!event)return 5;[app postEvent:event atStart:NO];RunPooledIteration(^{Pump(.1);});
   fprintf(stderr,"%s helper AppKit event pump: local event delivered, no window/display/capture/input posting\n",app.sawPumpTestEvent?"PASS":"FAIL");
-  return app.sawPumpTestEvent?0:5;
+  InstallHelperQuitSink();
+  NSAppleEventDescriptor *target=[NSAppleEventDescriptor descriptorWithProcessIdentifier:getpid()];
+  NSAppleEventDescriptor *quit=[NSAppleEventDescriptor appleEventWithEventClass:kCoreEventClass eventID:kAEQuitApplication targetDescriptor:target returnID:kAutoGenerateReturnID transactionID:kAnyTransactionID];
+  AppleEvent rawReply={typeNull,NULL};
+  [[NSAppleEventManager sharedAppleEventManager] dispatchRawAppleEvent:quit.aeDesc withRawReply:&rawReply handlerRefCon:(SRefCon)&rawReply];
+  AEDisposeDesc(&rawReply);
+  BOOL quitIgnored=helperQuitSink.ignored==1;
+  fprintf(stderr,"%s helper quit Apple event routed to ignoring sink; parent owns lifetime\n",quitIgnored?"PASS":"FAIL");
+  return app.sawPumpTestEvent&&quitIgnored?0:5;
 }
 static BOOL TestDisplayIdentityLock(void){
   char directory[PATH_MAX];
@@ -1672,6 +1697,7 @@ int main(int argc,const char **argv){@autoreleasepool {
   const OwnedOrigin ownedOrigin=savedOriginApplied?savedOrigin:DefaultOwnedOrigin(sessionFormat,placementPhysical,baselineCount,originalBounds);
   if(!ownedOrigin.requested)Fail("no safe default owned display placement");
   [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];[NSApp finishLaunching];
+  InstallHelperQuitSink(); // after finishLaunching, which installs AppKit's default quit handler
   void (^stop)(NSNotification*)=^(NSNotification *note){(void)note;Fail("session notification");};
   [NSWorkspace.sharedWorkspace.notificationCenter addObserverForName:NSWorkspaceWillSleepNotification object:nil queue:nil usingBlock:stop];
   [NSWorkspace.sharedWorkspace.notificationCenter addObserverForName:NSWorkspaceScreensDidSleepNotification object:nil queue:nil usingBlock:stop];
