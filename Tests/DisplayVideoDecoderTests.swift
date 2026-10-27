@@ -250,6 +250,98 @@ func runDisplayVideoDecoderTests() -> Int {
         let stats = DisplayPresentationStats()
         check(stats.decoded == 0 && stats.submitted == 0 && stats.replacedDecoded == 0 && stats.readinessDeferrals == 0)
     }
+    // Main delivery queued before clear, late callbacks and submit-return errors
+    // cannot resurrect an old image or open a failed submission gate.
+    if let pixel {
+        var drains: [() -> Void] = [], delivered = 0, errors = 0, spaces = 0
+        let box = DisplayDecodeMailbox(format: .standard, trace: DisplayFrameTrace(stream: nil), generation: 91,
+            scheduleDrain: { drains.append($0) }, deliver: { _, _ in delivered += 1 },
+            failure: { errors += 1 }, space: { _ in spaces += 1 })
+        let identity = DisplayFrameIdentity(sourceSequence: 42, cookie: 0, generation: 91)
+        check(box.reserve(sequence: 0, identity: identity))
+        box.complete(status: 0, flags: [], pixel: pixel, sequence: 0)
+        check(drains.count == 1)
+        box.invalidate()
+        for drain in drains { drain() }; drains.removeAll()
+        box.complete(status: 0, flags: [], pixel: pixel, sequence: 0)
+        check(delivered == 0 && errors == 0 && spaces == 0 && drains.isEmpty)
+        check(!box.maySubmit)
+        let failed = DisplayDecodeMailbox(format: .standard, trace: DisplayFrameTrace(stream: nil), generation: 92,
+            scheduleDrain: { drains.append($0) }, deliver: { _, _ in delivered += 1 },
+            failure: { errors += 1 }, space: { _ in spaces += 1 })
+        check(failed.reserve(sequence: 0, identity: identity))
+        failed.complete(status: 0, flags: [], pixel: pixel, sequence: 0)
+        failed.submissionFailed()
+        check(!failed.maySubmit)
+        for drain in drains { drain() }; drains.removeAll()
+        check(delivered == 0 && errors == 1 && spaces == 0)
+        failed.complete(status: 0, flags: [], pixel: pixel, sequence: 0)
+        check(drains.isEmpty)
+        failed.invalidate()
+    }
+    // Regression: a callback that arrives before DecodeFrame returns is not a
+    // completion yet. Drain the main delivery lane while a fake submit is blocked.
+    if let pixel {
+        final class Drains {
+            let lock = NSLock(); var work: [() -> Void] = []
+            let ready = DispatchSemaphore(value: 0)
+            func enqueue(_ f: @escaping () -> Void) { lock.lock(); work.append(f); lock.unlock(); ready.signal() }
+            func drain() { lock.lock(); let batch = work; work.removeAll(); lock.unlock(); for f in batch { f() } }
+        }
+        for returnsSuccess in [false, true] {
+            let drains = Drains(), entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+            let nextEntered = DispatchSemaphore(value: 0), nextRelease = DispatchSemaphore(value: 0)
+            let cleaned = DispatchSemaphore(value: 0)
+            var delivered = 0, completed = 0, refillAccepted = false
+            guard let lease = DisplayDecodeWorkerLease.acquire() else { check(false); continue }
+            let worker = DisplayDecodeWorker(lease: lease, cleanup: { cleaned.signal() })
+            let box = DisplayDecodeMailbox(format: .standard, trace: DisplayFrameTrace(stream: nil), generation: 93,
+                scheduleDrain: { drains.enqueue($0) }, deliver: { _, _ in delivered += 1 }, failure: {},
+                space: { cookies in
+                    completed += cookies.count
+                    // Three old jobs remain reserved while main refills the slot
+                    // released by the completed first call. This must NOT backlog.
+                    refillAccepted = worker.submit { _ in true }
+                })
+            let identity = DisplayFrameIdentity(sourceSequence: 43, cookie: 0, generation: 93)
+            check(box.reserve(sequence: 0, identity: identity, awaitingReturn: true))
+            check(worker.submit({ _ in
+                box.complete(status: 0, flags: [], pixel: pixel, sequence: 0)
+                entered.signal(); _ = release.wait(timeout: .now() + 3)
+                if !returnsSuccess { box.submissionFailed() }
+                return returnsSuccess
+            }, didReturn: { box.submissionSucceeded(sequence: 0) }))
+            check(entered.wait(timeout: .now() + 3) == .success)
+            for n in 1...3 {
+                check(worker.submit { _ in
+                    if n == 1 { nextEntered.signal(); _ = nextRelease.wait(timeout: .now() + 3) }
+                    return true
+                })
+            }
+            drains.drain()
+            check(delivered == 0 && completed == 0)
+            check(!worker.submit { _ in true })
+            release.signal()
+            if returnsSuccess {
+                check(drains.ready.wait(timeout: .now() + 3) == .success)
+                check(nextEntered.wait(timeout: .now() + 3) == .success)
+                drains.drain()
+                check(delivered == 1 && completed == 1 && refillAccepted)
+                nextRelease.signal()
+            } else {
+                let until = Date().addingTimeInterval(3)
+                while !worker.hasFailed && Date() < until { Thread.sleep(forTimeInterval: 0.001) }
+                check(worker.hasFailed)
+                drains.drain()
+                check(delivered == 0 && completed == 0 && !refillAccepted)
+            }
+            box.invalidate(); worker.retire()
+            check(cleaned.wait(timeout: .now() + 3) == .success)
+            let until = Date().addingTimeInterval(3)
+            while !worker.isDrained && Date() < until { Thread.sleep(forTimeInterval: 0.001) }
+            check(worker.isDrained)
+        }
+    }
     print("\(failures == 0 ? "PASS" : "FAIL") display video parser \(cases) cases: bounded negotiated SPS/PPS/AVCC and varied-aspect geometry, malformed lengths, reference limits, direct-buffer sample and latest decoded bounds; no UI/network/capture")
     return failures
 }

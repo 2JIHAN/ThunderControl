@@ -1,5 +1,9 @@
 [English](README.md) | [한국어](README.ko.md)
 
+## 현재 테스트 릴리스: 0.8.30.11 / build71
+
+커서 위치만으로 연결을 끊는 제한을 제거하고 수신 렌더러 표시와 드롭 통계를 추가했습니다. 내부 시험의8.33ms캡처/FIFO25/디코더worker를 포함합니다. 최종 수신60fps는 아직 확인되지 않았습니다. [릴리스 설명](RELEASE-0.8.30.11.md)을 확인하세요. 아래 이전 버전 설명은 과거 기록입니다.
+
 # <img src="docs/assets/app-icon.png" width="32" height="32" alt=""> ThunderControl
 
 Thunderbolt로 두 Mac을 직접 연결하고, MacBook의 키보드와 트랙패드, 화면으로 Mac mini에서 작업하세요.

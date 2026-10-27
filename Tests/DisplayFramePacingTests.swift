@@ -29,7 +29,71 @@ func runDisplayFramePacingTests() -> Int {
     verify(p.take(now: dt, targetTimestamp: dt) == 20 && p.pendingCount == 1, "future younger frame retained")
     verify(p.take(now: 2 * dt, targetTimestamp: 2 * dt) == 21, "retained younger frame later selected")
     p.clear(); p.offer(30, at: 0); p.offer(31, at: 0)
-    verify(p.take(now: dt, targetTimestamp: dt) == 31 && p.stats.offered == 2, "equal arrivals newest wins")
+    verify(p.take(now: dt, targetTimestamp: dt) == 30 && p.stats.offered == 2 && p.pendingCount == 1, "equal arrivals preserve FIFO insertion order")
+
+    // The 25ms switch is strict and uses actual callback age, not target age.
+    var threshold = DisplayFramePacer<Int>()
+    threshold.offer(1, at: 0); threshold.offer(2, at: 0.001)
+    verify(threshold.take(now: 0.025, targetTimestamp: 0.025) == 1 &&
+           threshold.pendingCount == 1 && threshold.stats.superseded == 0,
+           "exact 25ms remains FIFO when both entries eligible")
+    threshold.clear(); threshold.offer(1, at: 0); threshold.offer(2, at: 0.001)
+    let above25 = Double(0.025).nextUp
+    verify(threshold.take(now: above25, targetTimestamp: above25) == 2 &&
+           threshold.pendingCount == 0 && threshold.stats.superseded == 1,
+           "one representable step above 25ms catches up newest eligible")
+    threshold.clear(); threshold.offer(1, at: 0); threshold.offer(2, at: 0.001)
+    verify(threshold.take(now: 0.024, targetTimestamp: 0.05) == 1,
+           "future prediction cannot trigger actual-age catchup")
+    var fifo = DisplayFramePacer<Int>()
+    fifo.offer(1, at: 0); fifo.offer(2, at: 0.001)
+    verify(fifo.take(now: 0.02, targetTimestamp: 0.02) == 1 && fifo.pendingCount == 1,
+           "normal selection chooses oldest of two eligible entries")
+    verify(fifo.take(now: 0.021, targetTimestamp: 0.021) == 2 && !fifo.pending && fifo.stats.superseded == 0,
+           "FIFO drains retained entry in insertion order within existing startup budget")
+    var catchupEligibility = DisplayFramePacer<Int>()
+    catchupEligibility.offer(1, at: 0); catchupEligibility.offer(2, at: 0.029)
+    verify(catchupEligibility.take(now: 0.03, targetTimestamp: 0.03) == 1 &&
+           catchupEligibility.pendingCount == 1 && catchupEligibility.stats.superseded == 0,
+           "catchup selects newest ELIGIBLE not merely newest arrival")
+    catchupEligibility.clear(); catchupEligibility.offer(1, at: 0); catchupEligibility.offer(2, at: 0.04)
+    verify(catchupEligibility.take(now: 0.03, targetTimestamp: 0.07) == 1 && catchupEligibility.pendingCount == 1,
+           "catchup never selects future arrival even if predicted target permits it")
+    catchupEligibility.clear(); catchupEligibility.offer(1, at: 0); catchupEligibility.offer(2, at: 0.02)
+    verify(catchupEligibility.take(now: 0.03, targetTimestamp: 0.02) == 1 && catchupEligibility.pendingCount == 1,
+           "catchup honors past target cushion as well as actual clock")
+    var oldSingleton = DisplayFramePacer<Int>()
+    oldSingleton.offer(1, at: 0)
+    verify(oldSingleton.take(now: 1, targetTimestamp: 1) == 1 && oldSingleton.stats.superseded == 0,
+           "25ms is catchup threshold not a hard expiry for old singleton")
+    var noPoison = DisplayFramePacer<Int>()
+    noPoison.offer(1, at: 0); noPoison.offer(2, at: 0.001)
+    let beforeInvalid = noPoison.stats
+    verify(noPoison.take(now: 10, targetTimestamp: 20) == nil &&
+           noPoison.take(now: .nan, targetTimestamp: 10) == nil &&
+           noPoison.pendingCount == 2 && noPoison.stats.invalidInputs == beforeInvalid.invalidInputs + 2 &&
+           noPoison.stats.selected == 0 && noPoison.stats.waitingTicks == 0 &&
+           noPoison.stats.rateLimitedTicks == 0 && noPoison.stats.superseded == 0,
+           "invalid catchup ticks change only invalid counter")
+    verify(noPoison.take(now: 0.025, targetTimestamp: 0.025) == 1,
+           "invalid future tick does not poison clocks or FIFO threshold")
+    var discards: [(Int, DisplayFrameDiscardReason)] = []
+    var reasons = DisplayFramePacer<Int>(onDiscard: { discards.append(($0, $1)) })
+    reasons.offer(1, at: 0); reasons.offer(2, at: 0.001)
+    _ = reasons.take(now: 0.02, targetTimestamp: 0.02)
+    verify(discards.isEmpty && reasons.stats.selected == 1 && reasons.stats.superseded == 0 && reasons.stats.earlySelections == 0,
+           "FIFO selection does not report retained younger entry as discarded")
+    reasons.offer(3, at: 0.002)
+    verify(reasons.take(now: 0.03, targetTimestamp: 0.03) == 3 && discards.count == 1 &&
+           discards[0].0 == 2 && discards[0].1 == .superseded && reasons.stats.superseded == 1 &&
+           reasons.stats.selected == 2 && reasons.stats.earlySelections == 0,
+           "catchup reports only skipped older frame as superseded not early")
+    reasons.offer(4, at: 0.04); reasons.offer(5, at: 0.041); reasons.offer(6, at: 0.042)
+    reasons.offer(99, at: .nan); reasons.clear()
+    verify(discards.map { $0.0 } == [2, 4, 99, 5, 6] &&
+           discards.map { $0.1 } == [.superseded, .overflow, .invalidOffer, .clear, .clear] &&
+           reasons.stats == DisplayFramePacingStats() && !reasons.pending,
+           "discard callback reasons remain exact and clear resets all stats")
 
     p.clear(); p.offer(40, at: 1)
     var invalidOffersOK = true
@@ -67,8 +131,10 @@ func runDisplayFramePacingTests() -> Int {
         if let frame = fast.take(now: target, targetTimestamp: target) { fastOutput.append(frame) }
     }
     verify(fast.stats.selected == 61 && fast.stats.rateLimitedTicks == 59, "120Hz callbacks spend at most one startup frame above 60fps")
-    verify(fastOutput == [0, 1] + Array(stride(from: 2, to: 120, by: 2)) && fast.pendingCount == 1, "120Hz selects latest decoded frame in order")
-    verify(fast.stats.superseded == 58 && fast.stats.overflowReplaced == 0, "120Hz diagnostics account for discarded decoded frames")
+    verify(fastOutput == [0, 1, 2, 4, 5, 7, 10, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 33, 35, 37, 39, 41] +
+           Array(stride(from: 44, to: 120, by: 2)) && fast.pendingCount == 1,
+           "120Hz FIFO25 selection order including strict floating-point threshold boundaries")
+    verify(fast.stats.superseded == 40 && fast.stats.overflowReplaced == 18, "120Hz diagnostics account for discarded decoded frames")
 
     var jitter = DisplayFramePacer<Int>()
     var jitterOutput: [Int] = []

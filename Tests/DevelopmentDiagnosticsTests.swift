@@ -29,6 +29,40 @@ import Darwin
                 try Data(contentsOf: url).split(separator: 10).map { try JSONSerialization.jsonObject(with: Data($0)) as! [String: Any] }
             }
         }
+        // record() deliberately drops rather than waiting for ingress.try(). A
+        // fixture requiring a persisted row must first establish acceptance, unlike
+        // load, overflow and explicit contention tests whose attempts stay exact.
+        // snapshotForTests serializes behind the writer, so a retry follows any
+        // contending writer activity without sleeps or changing production policy.
+        enum FixtureError: Error { case acceptanceTimedOut(String) }
+        func accepted(_ recorder: DevelopmentDiagnostics, _ label: String, record: () -> Void) throws {
+            let before = recorder.snapshotForTests()["accepted"] as? Int64 ?? -1
+            for _ in 0..<32 {
+                record()
+                let after = recorder.snapshotForTests()["accepted"] as? Int64 ?? -1
+                if after == before + 1 { return }
+                guard after == before else { throw FixtureError.acceptanceTimedOut("unexpected accepted delta: " + label) }
+            }
+            throw FixtureError.acceptanceTimedOut(label)
+        }
+        func rejectedAsStale(_ recorder: DevelopmentDiagnostics, _ label: String, record: () -> Void) throws {
+            let before = recorder.snapshotForTests()
+            let acceptedBefore = before["accepted"] as? Int64 ?? -1
+            let staleBefore = before["stale"] as? Int64 ?? -1
+            for _ in 0..<32 {
+                record()
+                let after = recorder.snapshotForTests()
+                // Never turn privacy validation into an eventual-accept fixture.
+                guard after["accepted"] as? Int64 == acceptedBefore else {
+                    throw FixtureError.acceptanceTimedOut("stale input was accepted: " + label)
+                }
+                if after["stale"] as? Int64 == staleBefore + 1 { return }
+                guard after["stale"] as? Int64 == staleBefore else {
+                    throw FixtureError.acceptanceTimedOut("unexpected stale delta: " + label)
+                }
+            }
+            throw FixtureError.acceptanceTimedOut("missing stale rejection: " + label)
+        }
         let root = temp.appendingPathComponent("privacy")
         let recorder = DevelopmentDiagnostics(root: root)
         check(!fm.fileExists(atPath: root.path), "init has no disk effects")
@@ -41,24 +75,24 @@ import Darwin
         let session = recorder.snapshotForTests()["session"] as? String
         recorder.start(role: "source", stream: stream); try recorder.flushForTests()
         check(recorder.snapshotForTests()["session"] as? String == session, "idempotent start")
-        recorder.record(stage: "capture", sequence: UInt64.max, fields: ["duration_ms": 2.5], stream: stream)
+        try accepted(recorder, "capture") { recorder.record(stage: "capture", sequence: UInt64.max, fields: ["duration_ms": 2.5], stream: stream) }
         recorder.record(stage: "secret input text", fields: [:])
         recorder.record(stage: "valid", fields: ["raw key text": 1])
         recorder.record(stage: "valid", fields: ["nan": .nan])
         recorder.record(stage: "valid", fields: ["infinity": .infinity])
-        recorder.recordHelperLine("TC_DIAG stage=capture seq=9 capture=1 duration_ms=2.0", stream: stream)
-        recorder.recordHelperLine("TC_DIAG stage=helper_failure reason_code=4294967295", stream: stream)
+        try accepted(recorder, "helper capture") { recorder.recordHelperLine("TC_DIAG stage=capture seq=9 capture=1 duration_ms=2.0", stream: stream) }
+        try accepted(recorder, "helper failure") { recorder.recordHelperLine("TC_DIAG stage=helper_failure reason_code=4294967295", stream: stream) }
         recorder.recordHelperLine("TC_DIAG stage=capture seq=123456789",stream:nil)
         for line in ["private input", "TC_DIAG stage=privatehostname capture=1", "TC_DIAG stage=encode host=private-host.example", "TC_DIAG stage=encode x=nan", "TC_DIAG stage=encode seq=-1", "TC_DIAG stage=encode x=1 x=2", "TC_DIAG stage=encode bad-key=3", "TC_DIAG stage=encode x=1\ninput"] {
             recorder.recordHelperLine(line, stream: stream)
         }
-        recorder.record(stage: "stale", stream: second)
+        try rejectedAsStale(recorder, "wrong stream") { recorder.record(stage: "stale", stream: second) }
         recorder.stop(stream: second)
         check(recorder.currentStream == stream, "stale stop rejected")
-        recorder.record(stage: "old_context", sequence: 10)
+        try accepted(recorder, "old context") { recorder.record(stage: "old_context", sequence: 10) }
         recorder.start(role: "viewer", stream: second)
-        recorder.record(stage: "new_context", sequence: 11)
-        recorder.recordHelperLine("TC_DIAG stage=encode capture=2", stream: stream)
+        try accepted(recorder, "new context") { recorder.record(stage: "new_context", sequence: 11) }
+        try rejectedAsStale(recorder, "old helper stream") { recorder.recordHelperLine("TC_DIAG stage=encode capture=2", stream: stream) }
         recorder.stop(stream: second); try recorder.flushForTests()
         check(recorder.currentStream == nil, "stop clears active stream and flushes")
         let events = try rows(root)
@@ -78,8 +112,61 @@ import Darwin
             check((attrs[.posixPermissions] as? NSNumber)?.intValue == 0o600, "private file permissions")
         }
         check((try fm.attributesOfItem(atPath: own(root).path)[.posixPermissions] as? NSNumber)?.intValue == 0o700, "private directory permissions")
+        let contentionBefore = recorder.snapshotForTests()["lockContention"] as? Int64 ?? -1
         recorder.withIngressLockedForTests { recorder.record(stage: "contended"); _ = recorder.currentStream }
-        check(recorder.snapshotForTests()["lockContention"] as? Int64 == 2, "contention counted without waiting")
+        let contentionAfter = recorder.snapshotForTests()["lockContention"] as? Int64 ?? -1
+        check(contentionAfter - contentionBefore == 2, "contention counted without waiting")
+
+        // Unlike accepted()-observed fixtures, this writer handshake deliberately
+        // holds the old row before persistence while role/stream and pending data
+        // change. Never snapshot/flush synchronously while the writer is gated.
+        let queuedRoot = temp.appendingPathComponent("queued-context")
+        let queuedGate = DispatchSemaphore(value: 0), queuedRelease = DispatchSemaphore(value: 0)
+        let queuedFlushDone = DispatchSemaphore(value: 0), queuedProgress = DispatchSemaphore(value: 0)
+        defer { for _ in 0..<4 { queuedRelease.signal() } }
+        final class FlushOutcome: @unchecked Sendable {
+            let lock = NSLock(); private var errors = 0
+            func failed() { lock.lock(); errors += 1; lock.unlock() }
+            var count: Int { lock.lock(); defer { lock.unlock() }; return errors }
+        }
+        let queuedOutcome = FlushOutcome()
+        let queued = DevelopmentDiagnostics(root: queuedRoot, beforeDrain: {
+            queuedGate.signal(); queuedProgress.signal(); queuedRelease.wait()
+        })
+        queued.start(role: "source", stream: stream); try queued.flushForTests()
+        // Empty flushes finish immediately. A nonempty old batch signals the gate
+        // and cannot finish until released, proving acceptance without a snapshot.
+        var oldBatchHeld = false
+        for _ in 0..<32 {
+            queued.record(stage: "old_context", sequence: 10, stream: stream)
+            DispatchQueue.global(qos: .utility).async {
+                do { try queued.flushForTests() } catch { queuedOutcome.failed() }
+                queuedFlushDone.signal(); queuedProgress.signal()
+            }
+            guard queuedProgress.wait(timeout: .now() + 3) == .success else { break }
+            if queuedGate.wait(timeout: .now()) == .success { oldBatchHeld = true; break }
+            check(queuedFlushDone.wait(timeout: .now()) == .success, "empty queued fixture retry completes")
+        }
+        check(oldBatchHeld, "old accepted batch held before persistence")
+        if oldBatchHeld {
+            // Both lifecycle calls must return while the disk writer is blocked.
+            queued.start(role: "viewer", stream: second)
+            queued.record(stage: "new_context", sequence: 11, stream: second)
+            queued.stop(stream: second)
+            // First old batch and second new batch each invoke beforeDrain.
+            // Surplus permits make all queued cleanup paths safe, including defer.
+            for _ in 0..<4 { queuedRelease.signal() }
+            check(queuedFlushDone.wait(timeout: .now() + 3) == .success, "old queued flush completes after release")
+            try queued.flushForTests()
+            let queuedRows = try rows(queuedRoot)
+            let old = queuedRows.first { $0["stage"] as? String == "old_context" }
+            let new = queuedRows.first { $0["stage"] as? String == "new_context" }
+            check(queuedOutcome.count == 0, "gated queued flush has no runtime error")
+            check(queuedRows.count == 2 && queued.currentStream == nil, "gated queued lifecycle retains both events and stops")
+            check(old?["stream"] as? String == stream && old?["role"] as? String == "source", "held old batch keeps original context")
+            check(new?["stream"] as? String == second && new?["role"] as? String == "viewer", "queued new batch keeps new context")
+            check(old?["session"] as? String != new?["session"] as? String, "queued context sessions remain distinct")
+        }
 
         let gate = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
         let boundedRoot = temp.appendingPathComponent("bounded")
@@ -105,7 +192,7 @@ import Darwin
         var date = Date()
         let rotation = DevelopmentDiagnostics(root: rotationRoot, clock: { date }, chunkBytes: 900, diskBytes: 2200)
         rotation.start(role: "source", stream: stream)
-        for i in 0..<20 { rotation.record(stage: "frame", sequence: UInt64(i)) }
+        for i in 0..<20 { try accepted(rotation, "rotation frame") { rotation.record(stage: "frame", sequence: UInt64(i)) } }
         try rotation.flushForTests()
         let files = try chunks(rotationRoot)
         check(files.count >= 2, "immutable numbered rotation")
@@ -120,11 +207,11 @@ import Darwin
         check(try String(contentsOf: unknown, encoding: .utf8) == "preserve me", "unknown user files preserved")
         let previousDevice = try own(rotationRoot)
         let next = DevelopmentDiagnostics(root: rotationRoot, diskBytes: 2200)
-        next.start(role: "viewer", stream: second); next.record(stage: "frame"); try next.flushForTests()
+        next.start(role: "viewer", stream: second); try accepted(next, "next session frame") { next.record(stage: "frame") }; try next.flushForTests()
         check(try own(rotationRoot) == previousDevice, "stable private device folder")
         let third = DevelopmentDiagnostics(root: rotationRoot, diskBytes: 500)
         third.start(role: "source", stream: stream)
-        for i in 0..<10 { third.record(stage: "frame", sequence: UInt64(i)) }
+        for i in 0..<10 { try accepted(third, "retention frame") { third.record(stage: "frame", sequence: UInt64(i)) } }
         try third.flushForTests()
         let acrossSessionBytes = try chunks(rotationRoot).reduce(0) { try $0 + Data(contentsOf: $1).count }
         check(acrossSessionBytes <= 500 && (third.snapshotForTests()["retentionEvictions"] as? Int64 ?? 0) > 0, "retention spans previous sessions")
@@ -134,19 +221,19 @@ import Darwin
         let link = temp.appendingPathComponent("link")
         try fm.createSymbolicLink(at: link, withDestinationURL: outside)
         let unsafe = DevelopmentDiagnostics(root: link.appendingPathComponent("nested"))
-        unsafe.start(role: "source", stream: stream); unsafe.record(stage: "frame")
+        unsafe.start(role: "source", stream: stream); try accepted(unsafe, "unsafe-root frame") { unsafe.record(stage: "frame") }
         do { try unsafe.flushForTests(); check(false, "symlink root refused") } catch { }
         check(try fm.contentsOfDirectory(atPath: outside.path).isEmpty, "no symlink traversal")
         let missingCloud = temp.appendingPathComponent("missing-cloud")
         let absent = DevelopmentDiagnostics(root: temp.appendingPathComponent("absent"), cloudRoot: missingCloud)
-        absent.start(role: "viewer", stream: stream); absent.record(stage: "frame"); try absent.flushForTests()
+        absent.start(role: "viewer", stream: stream); try accepted(absent, "absent-cloud frame") { absent.record(stage: "frame") }; try absent.flushForTests()
         check(!fm.fileExists(atPath: missingCloud.path), "never creates fake cloud root")
         let cloud = temp.appendingPathComponent("cloud")
         try fm.createDirectory(at: cloud, withIntermediateDirectories: false)
         let broken = cloud.appendingPathComponent("ThunderControl-진단")
         try fm.createSymbolicLink(at: broken, withDestinationURL: outside)
         let mirrorFailure = DevelopmentDiagnostics(root: temp.appendingPathComponent("mirror-error"), cloudRoot: cloud)
-        mirrorFailure.start(role: "source", stream: stream); mirrorFailure.record(stage: "frame"); try mirrorFailure.flushForTests()
+        mirrorFailure.start(role: "source", stream: stream); try accepted(mirrorFailure, "mirror-error frame") { mirrorFailure.record(stage: "frame") }; try mirrorFailure.flushForTests()
         check(mirrorFailure.snapshotForTests()["mirrorError"] as? Bool == true, "cloud error local status")
         check(try fm.contentsOfDirectory(atPath: outside.path).isEmpty, "cloud symlink not followed")
         try fm.removeItem(at: broken)
@@ -154,14 +241,14 @@ import Darwin
         let mirroredRoot = temp.appendingPathComponent("mirrored")
         let mirrored = DevelopmentDiagnostics(root: mirroredRoot, cloudRoot: cloud, clock: { cloudDate }, monotonicClock: { cloudDate.timeIntervalSince1970 })
         mirrored.start(role: "source", stream: stream); try mirrored.flushForTests()
-        mirrored.record(stage: "frame"); cloudDate = cloudDate.addingTimeInterval(6); try mirrored.flushForTests()
+        try accepted(mirrored, "mirrored frame") { mirrored.record(stage: "frame") }; cloudDate = cloudDate.addingTimeInterval(6); try mirrored.flushForTests()
         let cloudDevice = cloud.appendingPathComponent("ThunderControl-진단").appendingPathComponent(try own(mirroredRoot).lastPathComponent)
         check(try fm.contentsOfDirectory(atPath: cloudDevice.path).contains(where: { $0.hasPrefix("chunk-") }), "new chunk mirrored")
         check(mirrored.snapshotForTests()["cloudLastSuccessfulLocalCopy"] != nil, "local cloud copy timestamp, not delivery claim")
         // Lifecycle cannot be silently skipped when a recorder lock is momentarily busy.
         let lifecycle = DevelopmentDiagnostics(root: temp.appendingPathComponent("lifecycle"))
         lifecycle.start(role: "source", stream: stream); try lifecycle.flushForTests()
-        lifecycle.record(stage: "before_switch", stream: stream)
+        try accepted(lifecycle, "before lifecycle switch") { lifecycle.record(stage: "before_switch", stream: stream) }
         let entered = DispatchSemaphore(value: 0), completed = DispatchSemaphore(value: 0)
         lifecycle.withIngressLockedForTests {
             DispatchQueue.global(qos: .utility).async {
@@ -172,7 +259,7 @@ import Darwin
             lifecycle.record(stage: "contended_hot_event")
         }
         check(completed.wait(timeout: .now() + 2) == .success, "concurrent start completes after unlock")
-        lifecycle.record(stage: "after_switch", stream: second)
+        try accepted(lifecycle, "after lifecycle switch") { lifecycle.record(stage: "after_switch", stream: second) }
         lifecycle.withIngressLockedForTests {
             DispatchQueue.global(qos: .utility).async {
                 entered.signal(); lifecycle.stop(stream: second); completed.signal()

@@ -224,7 +224,9 @@ final class DisplayDecodeMailbox {
     let lock = NSLock()
     let format: DisplayVideoFormat
     var valid = true, scheduled = false, inFlight = 0, failed = false
-    private struct Submission { let at: Double; let identity: DisplayFrameIdentity }
+    private struct Submission { let at: Double; let identity: DisplayFrameIdentity; var returned: Bool }
+    private struct ProvisionalCallback { let status: OSStatus; let flags: VTDecodeInfoFlags; let pixel: CVPixelBuffer?; let at: Double }
+    private var provisional: [Int64: ProvisionalCallback] = [:]
     private var submittedAt: [Int64: Submission] = [:]
     private let trace: DisplayFrameTrace
     private let generation: UInt64
@@ -245,17 +247,41 @@ final class DisplayDecodeMailbox {
         self.format = format; self.trace = trace; self.generation = generation; self.scheduleDrain = scheduleDrain
         self.deliver = deliver; self.failure = failure; self.space = space
     }
-    func reserve(sequence: Int64, identity: DisplayFrameIdentity) -> Bool {
+    func reserve(sequence: Int64, identity: DisplayFrameIdentity, awaitingReturn: Bool = false) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        guard valid, !failed, inFlight < 4, submittedAt.count < 4 else { return false }; inFlight += 1; submittedAt[sequence] = Submission(at: ProcessInfo.processInfo.systemUptime, identity: identity); trace.record("decoder_submit", identity: identity, fields: ["inFlight": Double(inFlight)]); return true
+        guard valid, !failed, inFlight < 4, submittedAt.count < 4 else { return false }; inFlight += 1; submittedAt[sequence] = Submission(at: ProcessInfo.processInfo.systemUptime, identity: identity, returned: !awaitingReturn); trace.record("decoder_submit", identity: identity, fields: ["inFlight": Double(inFlight)]); return true
     }
-    func complete(status: OSStatus, flags: VTDecodeInfoFlags, pixel: CVPixelBuffer?, sequence: Int64) {
-        let now = ProcessInfo.processInfo.systemUptime
+    // Called only AFTER the worker releases its executing-job reservation.
+    func submissionSucceeded(sequence: Int64) {
         lock.lock()
-        guard valid, let submission = submittedAt.removeValue(forKey: sequence) else {
+        guard valid, !failed, var submission = submittedAt[sequence] else { lock.unlock(); return }
+        submission.returned = true; submittedAt[sequence] = submission
+        let callback = provisional.removeValue(forKey: sequence)
+        lock.unlock()
+        if let callback { complete(status: callback.status, flags: callback.flags, pixel: callback.pixel, sequence: sequence, callbackAt: callback.at) }
+    }
+    var maySubmit: Bool {
+        lock.lock(); defer { lock.unlock() }; return valid && !failed
+    }
+    // DecodeFrame may return an error after an inline callback. Suppress even an
+    // already queued successful image before marshaling the actual submit failure.
+    func submissionFailed() {
+        lock.lock(); failed = true; provisional.removeAll(); latest = nil; latestIdentity = nil; latestCallbackAt = nil; lock.unlock()
+    }
+    func complete(status: OSStatus, flags: VTDecodeInfoFlags, pixel: CVPixelBuffer?, sequence: Int64, callbackAt: Double? = nil) {
+        let now = callbackAt ?? ProcessInfo.processInfo.systemUptime
+        lock.lock()
+        guard valid, !failed, let submission = submittedAt[sequence] else {
             trace.record("decoder_callback_ignored", fields: ["decoderCookie": Double(sequence), "decoderGeneration": Double(generation), "valid": valid ? 1 : 0])
             lock.unlock(); return
         }
+        guard submission.returned else {
+            // No image, completion or failure can escape while DecodeFrame is
+            // still executing: its eventual return status remains authoritative.
+            if provisional[sequence] == nil { provisional[sequence] = ProvisionalCallback(status: status, flags: flags, pixel: pixel, at: now) }
+            lock.unlock(); return
+        }
+        submittedAt.removeValue(forKey: sequence)
         let identity = submission.identity
         trace.record("decoder_callback", identity: identity, fields: ["status": Double(status), "flags": Double(flags.rawValue), "time": now, "submitToCallbackMs": (now-submission.at)*1000])
         inFlight -= 1; completed.append(sequence)
@@ -311,7 +337,7 @@ final class DisplayDecodeMailbox {
         if latest != nil { trace.record("mailbox_clear_discard", identity: latestIdentity) }
         for submission in submittedAt.values { trace.record("decoder_retire", identity: submission.identity) }
         latestIdentity = nil
-        valid = false; submittedAt.removeAll(); latest = nil; latestCallbackAt = nil; deliver = nil; failure = nil; space = nil; completed.removeAll(); failureDetail = nil
+        valid = false; submittedAt.removeAll(); provisional.removeAll(); latest = nil; latestCallbackAt = nil; deliver = nil; failure = nil; space = nil; completed.removeAll(); failureDetail = nil
         lock.unlock()
         if let summary { displayStageLog(summary+" final=true") }
     }
@@ -328,6 +354,7 @@ private let displayDecodeCallback: VTDecompressionOutputCallback = { reference, 
 /// This is also usable by a no-window synthetic integration harness.
 @MainActor final class DisplayH264Decoder {
     private var session: VTDecompressionSession?
+    private var worker: DisplayDecodeWorker?
     let format: DisplayVideoFormat
     private var description: CMVideoFormatDescription?
     private var parameters: (Data, Data)?
@@ -346,9 +373,7 @@ private let displayDecodeCallback: VTDecompressionOutputCallback = { reference, 
     init(format: DisplayVideoFormat = .standard, trace: DisplayFrameTrace = DisplayFrameTrace(), tracedOutput: ((CVPixelBuffer, DisplayFrameIdentity) -> Void)? = nil, output: @escaping (CVPixelBuffer) -> Void, failure: @escaping () -> Void) { self.format = format; self.trace = trace; self.tracedOutput = tracedOutput; self.output = output; self.failure = failure }
     deinit {
         mailbox?.invalidate()
-        // Teardown retains the callback box through the existing VT drain boundary.
-        if let session { VTDecompressionSessionInvalidate(session); VTDecompressionSessionWaitForAsynchronousFrames(session) }
-        withExtendedLifetime(mailbox) {}
+        worker?.retire()
     }
     func clear() {
         admission.clear(); completedSubmissions = 0
@@ -358,11 +383,9 @@ private let displayDecodeCallback: VTDecompressionOutputCallback = { reference, 
     private func retireSession() {
         Self.nextTraceGeneration &+= 1
         traceGeneration = Self.nextTraceGeneration
-        let oldBox = mailbox
-        oldBox?.invalidate()
-        if let session { VTDecompressionSessionInvalidate(session); VTDecompressionSessionWaitForAsynchronousFrames(session) }
-        withExtendedLifetime(oldBox) {}
-        session = nil; description = nil; parameters = nil; mailbox = nil
+        mailbox?.invalidate()
+        worker?.retire()
+        worker = nil; session = nil; description = nil; parameters = nil; mailbox = nil
     }
     private func logFailure(_ error: Error, stage: String, status: OSStatus? = nil, flags: VTDecodeInfoFlags = []) {
         let category: Double
@@ -416,6 +439,7 @@ private let displayDecodeCallback: VTDecompressionOutputCallback = { reference, 
             guard packet.isKeyFrame else { throw DisplayVideoError.malformed }
             let configurationStarted = ProcessInfo.processInfo.systemUptime
             retireSession()
+            guard let lease = DisplayDecodeWorkerLease.acquire() else { throw DisplayVideoError.backlog }
             let description = try packet.formatDescription()
             let epoch = admission.epoch
             let box = DisplayDecodeMailbox(format: format, trace: trace, generation: traceGeneration, deliver: { [weak self] pixel, identity in
@@ -434,11 +458,16 @@ private let displayDecodeCallback: VTDecompressionOutputCallback = { reference, 
                     kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary,
                 outputCallback: &callback, decompressionSessionOut: &created)
             guard status == noErr, let created else { logFailure(DisplayVideoError.decoderFailed, stage: "configure", status: status); throw DisplayVideoError.decoderFailed }
+            worker = DisplayDecodeWorker(lease: lease) {
+                VTDecompressionSessionInvalidate(created)
+                VTDecompressionSessionWaitForAsynchronousFrames(created)
+                withExtendedLifetime(box) {}
+            }
             session = created; self.description = description; parameters = (packet.sps, packet.pps); mailbox = box
             _ = VTSessionSetProperty(created, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
             displayStageLog("Display decoder configuration setupMs=\((ProcessInfo.processInfo.systemUptime-configurationStarted)*1000); reconfigurationNotSteadyState=true")
         }
-        guard let session, let description, let mailbox else { throw DisplayVideoError.decoderFailed }
+        guard let session, let description, let mailbox, let worker else { throw DisplayVideoError.decoderFailed }
         var block: CMBlockBuffer?
         let blockStatus = CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil,
             blockLength: packet.avcc.count, blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
@@ -455,10 +484,34 @@ private let displayDecodeCallback: VTDecompressionOutputCallback = { reference, 
             sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
             sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &sample)
         guard sampleStatus == noErr, let sample else { logFailure(DisplayVideoError.decoderFailed, stage: "sample", status: sampleStatus); throw DisplayVideoError.decoderFailed }
-        guard sequence >= 0, sequence < Int64.max, mailbox.reserve(sequence: sequence, identity: DisplayFrameIdentity(sourceSequence: submission.sourceSequence, cookie: sequence, generation: traceGeneration)) else { throw DisplayVideoError.backlog }
-        var infoFlags: VTDecodeInfoFlags = []
-        let status = VTDecompressionSessionDecodeFrame(session, sampleBuffer: sample, flags: [._EnableAsynchronousDecompression], frameRefcon: UnsafeMutableRawPointer(bitPattern: UInt(sequence) + 1), infoFlagsOut: &infoFlags)
-        guard status == noErr else { logFailure(DisplayVideoError.decoderFailed, stage: "submit", status: status, flags: infoFlags); throw DisplayVideoError.decoderFailed }
+        guard sequence >= 0, sequence < Int64.max, mailbox.reserve(sequence: sequence, identity: DisplayFrameIdentity(sourceSequence: submission.sourceSequence, cookie: sequence, generation: traceGeneration), awaitingReturn: true) else { throw DisplayVideoError.backlog }
+        let cookie = sequence
+        let identity = DisplayFrameIdentity(sourceSequence: submission.sourceSequence, cookie: cookie, generation: traceGeneration)
+        let epoch = admission.epoch
+        let trace = self.trace
+        guard worker.submit({ [weak self] queueWaitMs in
+            guard mailbox.maySubmit else { return false }
+            trace.record("decoder_call", identity: identity, fields: ["time": ProcessInfo.processInfo.systemUptime, "queueWaitMs": queueWaitMs])
+            var infoFlags: VTDecodeInfoFlags = []
+            // Keep diagnostic logging outside the measured VT API boundary.
+            let started = ProcessInfo.processInfo.systemUptime
+            let status = VTDecompressionSessionDecodeFrame(session, sampleBuffer: sample,
+                flags: [._EnableAsynchronousDecompression],
+                frameRefcon: UnsafeMutableRawPointer(bitPattern: UInt(cookie) + 1), infoFlagsOut: &infoFlags)
+            let ended = ProcessInfo.processInfo.systemUptime
+            trace.record("decoder_return", identity: identity, fields: ["time": ended,
+                "elapsedMs": (ended - started) * 1000, "queueWaitMs": queueWaitMs, "startedAt": started,
+                "status": Double(status), "flags": Double(infoFlags.rawValue)])
+            guard status != noErr else { return true }
+            mailbox.submissionFailed()
+            let returnedFlags = infoFlags
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.admission.epoch == epoch, self.mailbox === mailbox else { return }
+                self.logFailure(DisplayVideoError.decoderFailed, stage: "submit", status: status, flags: returnedFlags)
+                self.clear(); self.failure()
+            }
+            return false
+        }, didReturn: { mailbox.submissionSucceeded(sequence: cookie) }) else { throw DisplayVideoError.backlog }
     }
 }
 
@@ -622,6 +675,11 @@ struct DisplayViewerStartup {
     private var pacingLink: AnyObject?
     private var pacingTarget: DisplayPacingLinkTarget?
     private var pacingGeneration: UInt64 = 0
+    // Keep an in-flight request occupied across clear/reopen until its callback
+    // returns. pacingGeneration retires its result without overlapping requests.
+    private var rendererMetricsPending = false
+    private var rendererMetricsRequestedAt: Double?
+    private var rendererMetricsSample: [String: Double]?
     private var displayLinkCadence = DisplayCadenceStats()
     private var readinessRequested = false
     private var readinessEpoch: UInt64 = 0
@@ -747,7 +805,8 @@ struct DisplayViewerStartup {
         guard window === viewerWindow, !closing else { return }
         finishFullScreenFallback(window,reason:"appkit-rejected")
     }
-    func accept(_ payload: Data) throws {
+    func accept(_ payload: Data, guardMilliseconds: Double? = nil) throws {
+        let preAcceptStartedAt = ProcessInfo.processInfo.systemUptime
         guard viewerWindow != nil, !closing else { throw DisplayVideoError.decoderFailed }
         if decoder == nil {
             decoder = DisplayH264Decoder(format: self.format, trace: frameTrace, tracedOutput: { [weak self] pixel, identity in self?.present(pixel, identity: identity) }, output: { _ in }, failure: { [weak self] in self?.close() })
@@ -767,7 +826,10 @@ struct DisplayViewerStartup {
         }
         mainVideoCadence.observe(ProcessInfo.processInfo.systemUptime)
         logCadence()
-        frameTrace.record("receiver_accept", sequence: packetSequence, fields: ["time": ProcessInfo.processInfo.systemUptime])
+        let acceptedAt = ProcessInfo.processInfo.systemUptime
+        var acceptFields: [String: Double] = ["time": acceptedAt, "preAcceptMs": (acceptedAt-preAcceptStartedAt)*1000, "preAcceptStart": preAcceptStartedAt]
+        if let guardMilliseconds, guardMilliseconds.isFinite, guardMilliseconds >= 0 { acceptFields["guardMs"] = guardMilliseconds }
+        frameTrace.record("receiver_accept", sequence: packetSequence, fields: acceptFields)
         do { try decoder!.accept(video, sourceSequence: packetSequence) } catch { clear(); throw error }
     }
     private func present(_ pixel: CVPixelBuffer, identity: DisplayFrameIdentity) {
@@ -775,8 +837,10 @@ struct DisplayViewerStartup {
         lastDecodedAt = ProcessInfo.processInfo.systemUptime
         decodedMainCadence.observe(lastDecodedAt)
         receivedFrameCount += 1; presentationStats.decoded &+= 1
-        frameTrace.record("pacer_offer", identity: identity, fields: ["time": lastDecodedAt, "pending": Double(pacedFrames.pendingCount)])
-        if pacedFrames.offer(DisplayTracedFrame(pixel: pixel, identity: identity, decodedMainAt: lastDecodedAt), at:CACurrentMediaTime()) { presentationStats.replacedDecoded &+= 1 }
+        // Record the exact receiver-local clock passed to the pacing policy.
+        let pacingArrival = CACurrentMediaTime()
+        frameTrace.record("pacer_offer", identity: identity, fields: ["time": lastDecodedAt, "offerTime": pacingArrival, "pending": Double(pacedFrames.pendingCount)])
+        if pacedFrames.offer(DisplayTracedFrame(pixel: pixel, identity: identity, decodedMainAt: lastDecodedAt), at:pacingArrival) { presentationStats.replacedDecoded &+= 1 }
         drainPresentation()
     }
     private func ensurePacingLink() {
@@ -799,6 +863,9 @@ struct DisplayViewerStartup {
         displayLinkCadence.observe(ProcessInfo.processInfo.systemUptime)
         drainPresentation(targetTimestamp:targetTimestamp)
     }
+    var rendererMetricsForTests: [String: Double]? { rendererMetricsSample }
+    var rendererMetricsPendingForTests: Bool { rendererMetricsPending }
+    @discardableResult func requestRendererMetricsForTests() -> Bool { requestRendererMetrics() }
     var pacingActiveForTests: Bool { pacingLink != nil }
     var pacingTicksForTests: UInt64 { displayLinkCadence.count }
     var pacingPendingForTests: Int { pacedFrames.pendingCount }
@@ -865,11 +932,52 @@ struct DisplayViewerStartup {
         }
         readinessRequested = false; readinessStartedAt = nil
     }
+    /// Renderer-reported cumulative quality counters, not physical-panel frame
+    /// timestamps. Total includes frames that would have displayed without drops;
+    /// neither it nor enqueue counts alone establishes stable 60 Hz presentation.
+    @discardableResult private func requestRendererMetrics() -> Bool {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard !closing, !rendererMetricsPending,
+              rendererMetricsRequestedAt.map({ now - $0 >= 2 }) ?? true,
+              #available(macOS 14.4, *), let renderer = surface?.videoLayer?.sampleBufferRenderer else { return false }
+        rendererMetricsPending = true; rendererMetricsRequestedAt = now
+        let generation = pacingGeneration
+        renderer.loadVideoPerformanceMetrics { [weak self] metrics in
+            // Capture the receiver-local callback time, not when main gets around
+            // to logging it. Do not wait on the renderer from the frame path.
+            let sampledAt = ProcessInfo.processInfo.systemUptime
+            var fields: [String: Double] = ["available": metrics == nil ? 0 : 1, "sampleTime": sampledAt]
+            if let metrics {
+                fields["totalNumberOfFrames"] = Double(metrics.totalNumberOfFrames)
+                fields["numberOfDroppedFrames"] = Double(metrics.numberOfDroppedFrames)
+                fields["numberOfCorruptedFrames"] = Double(metrics.numberOfCorruptedFrames)
+                fields["totalAccumulatedFrameDelay"] = metrics.totalAccumulatedFrameDelay
+            }
+            let sample = fields
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.rendererMetricsPending = false
+                    guard !self.closing, self.pacingGeneration == generation else { return }
+                    self.rendererMetricsSample = sample
+                    self.frameTrace.record("renderer_metrics", fields: sample)
+                    if let total = sample["totalNumberOfFrames"], let dropped = sample["numberOfDroppedFrames"],
+                       let corrupted = sample["numberOfCorruptedFrames"], let delay = sample["totalAccumulatedFrameDelay"] {
+                        displayStageLog("Display renderer metrics: available=true total=\(total) dropped=\(dropped) corrupted=\(corrupted) accumulatedFrameDelaySeconds=\(delay) receiverSampleTime=\(sampledAt); rendererCountersNotPanel=true stable60Unproven=true")
+                    } else {
+                        displayStageLog("Display renderer metrics: available=false receiverSampleTime=\(sampledAt); rendererCountersNotPanel=true")
+                    }
+                }
+            }
+        }
+        return true
+    }
     private func logCadence(force: Bool = false) {
         let now = ProcessInfo.processInfo.systemUptime
         guard mainVideoCadence.count > 0, force || now-cadenceLoggedAt >= 2 else { return }
         cadenceLoggedAt = now
-        displayStageLog("Display cadence viewer: encodedMain[\(mainVideoCadence.summary)] decodedMain[\(decodedMainCadence.summary)] rendererEnqueue[\(rendererCadence.summary)] sourceAdmission[\(sourceAdmissionTiming.summary)] sourceEncode[\(sourceEncodeTiming.summary)] sourceEncodeSequenceSkips=\(sourceSequenceSkips) latestDecodedReplaced=\(presentationStats.replacedDecoded) readinessDeferrals=\(presentationStats.readinessDeferrals) registrations=\(readinessRegistrations) callbacks=\(readinessCallbacks) cancelled=\(readinessCancelled) readinessWait[\(readinessWait.summary)] displayLink[\(displayLinkCadence.summary)] pacedPending=\(pacedFrames.pendingCount) pacing=\(pacedFrames.stats); pacingHoldNominalMs=16.667 contentMayBeIdle=true enqueueNotPanel=true final=\(force)")
+        if !force { requestRendererMetrics() }
+        displayStageLog("Display cadence viewer: encodedMain[\(mainVideoCadence.summary)] decodedMain[\(decodedMainCadence.summary)] rendererEnqueue[\(rendererCadence.summary)] sourceAdmission[\(sourceAdmissionTiming.summary)] sourceEncode[\(sourceEncodeTiming.summary)] sourceEncodeSequenceSkips=\(sourceSequenceSkips) latestDecodedReplaced=\(presentationStats.replacedDecoded) readinessDeferrals=\(presentationStats.readinessDeferrals) registrations=\(readinessRegistrations) callbacks=\(readinessCallbacks) cancelled=\(readinessCancelled) readinessWait[\(readinessWait.summary)] displayLink[\(displayLinkCadence.summary)] pacedPending=\(pacedFrames.pendingCount) pacing=\(pacedFrames.stats); pacingPolicy=fifo25 catchUpAgeMs=25 hardAgeCap=false pacingHoldNominalMs=16.667 contentMayBeIdle=true enqueueNotPanel=true final=\(force)")
     }
     func acceptCursor(_ payload: Data) throws {
         let next = try DisplayCursorMetadata(payload)
@@ -907,6 +1015,7 @@ struct DisplayViewerStartup {
     func clear() {
         forwardedButtons.removeAll()
         stopReadiness(); stopPacingLink()
+        rendererMetricsSample = nil
         logCadence(force: true)
         pacedFrames.clear(); displayLinkCadence=DisplayCadenceStats()
         cursorExpiry?.cancel(); cursorExpiry = nil; cursorMetadata = nil; cursorOverlay.removeFromSuperlayer(); cursorGlyphs.removeAll()

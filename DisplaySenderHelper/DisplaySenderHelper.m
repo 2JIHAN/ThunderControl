@@ -1864,7 +1864,7 @@ int main(int argc,const char **argv){@autoreleasepool {
   if(!target||target.width!=StreamWidth||target.height!=StreamHeight || !OwnedSafe())Fail("owned capture display missing");
   fprintf(stderr,"Capture contract: logical=%ux%u physical=%ux%u scale=%u nativeCGVerified=yes SCDisplayPointsVerified=yes\n",StreamWidth,StreamHeight,PixelWidth,PixelHeight,negotiatedFormat->pixelScale);
   SCContentFilter *filter=[[SCContentFilter alloc]initWithDisplay:target excludingWindows:@[]];
-  SCStreamConfiguration *cfg=[SCStreamConfiguration new];cfg.width=PixelWidth;cfg.height=PixelHeight;cfg.pixelFormat=kCVPixelFormatType_32BGRA;cfg.minimumFrameInterval=CMTimeMake(1,targetFPS);cfg.queueDepth=3;cfg.showsCursor=NO;cfg.capturesAudio=NO;
+  SCStreamConfiguration *cfg=[SCStreamConfiguration new];cfg.width=PixelWidth;cfg.height=PixelHeight;cfg.pixelFormat=kCVPixelFormatType_32BGRA;cfg.minimumFrameInterval=CMTimeMake(1,targetFPS*2);cfg.queueDepth=3;cfg.showsCursor=NO;cfg.capturesAudio=NO;
   FrameSink * __attribute__((objc_precise_lifetime)) sink=[FrameSink new];SCStream * __attribute__((objc_precise_lifetime)) stream=[[SCStream alloc]initWithFilter:filter configuration:cfg delegate:sink];
   frameQueue=dispatch_queue_create("local.ThunderControl.display.capture",DISPATCH_QUEUE_SERIAL);NSError *error=nil;
   if(![stream addStreamOutput:sink type:SCStreamOutputTypeScreen sampleHandlerQueue:frameQueue error:&error])Fail("capture output setup");

@@ -462,14 +462,27 @@ final class DisplayTransport: @unchecked Sendable {
     var receivedDisplayIdentity = false
     var frameReadCadence = DisplayCadenceStats()
     var lastCadenceLog = ProcessInfo.processInfo.systemUptime
+    // One scalar boundary, not a frame queue. A heartbeat may consume the next
+    // read; in that case the following video correctly has no post-main field.
+    var priorMainReturn: (time:Double,sequence:UInt64?)?
     while isCurrent(run) {
       let diagnosticReadStarted=ProcessInfo.processInfo.systemUptime
+      let diagnosticPriorMainReturn=priorMainReturn
+      priorMainReturn=nil
       let encrypted=try displayReadFrame(fd,maximum:run.sending ? 4096+24:DisplayChannelCipher.maximumFrame)
       let diagnosticReadFinished=ProcessInfo.processInfo.systemUptime
       let payload=try incoming.open(encrypted)
       let diagnosticOpened=ProcessInfo.processInfo.systemUptime
       let diagnosticFrame=payload.first==6 ? (try? DisplayStreamFrameHeader(payload)):nil
-      if let frame=diagnosticFrame{DevelopmentDiagnostics.shared.record(stage:"rx_open",sequence:frame.sequence,fields:["blockingReadMs":(diagnosticReadFinished-diagnosticReadStarted)*1000,"openMs":(diagnosticOpened-diagnosticReadFinished)*1000,"bytes":Double(encrypted.count)],stream:diagnosticStream)}
+      if let frame=diagnosticFrame {
+        var fields:[String:Double] = ["blockingReadMs":(diagnosticReadFinished-diagnosticReadStarted)*1000,"openMs":(diagnosticOpened-diagnosticReadFinished)*1000,"bytes":Double(encrypted.count),"readStart":diagnosticReadStarted]
+        if let previous=diagnosticPriorMainReturn {
+          fields["postMainReturnMs"]=(diagnosticReadStarted-previous.time)*1000
+          fields["priorMainReturn"]=previous.time
+          if let sequence=previous.sequence {fields["priorMainSeq"]=Double(sequence)}
+        }
+        DevelopmentDiagnostics.shared.record(stage:"rx_open",sequence:frame.sequence,fields:fields,stream:diagnosticStream)
+      }
       run.state.lock(); run.lastRX = ProcessInfo.processInfo.systemUptime; run.state.unlock()
       if payload == Data([0]) { continue }
       if payload.first==0 {
@@ -496,7 +509,11 @@ final class DisplayTransport: @unchecked Sendable {
           displayStageLog("Display cadence read: \(frameReadCadence.summary); contentMayBeIdle=true panelUnmeasured=true")
         }
       }
+      let diagnosticSyncStarted=ProcessInfo.processInfo.systemUptime
+      var diagnosticBlockStarted=diagnosticSyncStarted,diagnosticBlockEnded=diagnosticSyncStarted
       DispatchQueue.main.sync {
+        diagnosticBlockStarted=ProcessInfo.processInfo.systemUptime
+        defer {diagnosticBlockEnded=ProcessInfo.processInfo.systemUptime}
         if self.isCurrent(run) {
           if payload.first == 6, let measured = try? DisplayStreamFrameHeader(payload), measured.sequence % 120 == 0 {
             displayStageLog("Display receiver authenticatedReadToMainMs=\((ProcessInfo.processInfo.systemUptime-receivedAt)*1000); oneWayNetworkMs=unknown")
@@ -504,6 +521,12 @@ final class DisplayTransport: @unchecked Sendable {
           if let frame=diagnosticFrame{DevelopmentDiagnostics.shared.record(stage:"rx_main",sequence:frame.sequence,fields:["queueMs":(ProcessInfo.processInfo.systemUptime-receivedAt)*1000],stream:diagnosticStream)}
           self.onPayload?(payload)
         }
+      }
+      let diagnosticSyncReturned=ProcessInfo.processInfo.systemUptime
+      priorMainReturn=(diagnosticSyncReturned,diagnosticFrame?.sequence)
+      let diagnosticSyncMs=(diagnosticSyncReturned-diagnosticSyncStarted)*1000
+      if diagnosticSyncMs>=2 {
+        DevelopmentDiagnostics.shared.record(stage:"rx_main_return",sequence:diagnosticFrame?.sequence,fields:["kind":Double(payload.first ?? 255),"elapsedMs":diagnosticSyncMs,"blockMs":(diagnosticBlockEnded-diagnosticBlockStarted)*1000,"waitMs":(diagnosticBlockStarted-diagnosticSyncStarted)*1000,"returnMs":(diagnosticSyncReturned-diagnosticBlockEnded)*1000,"startedAt":diagnosticSyncStarted,"time":diagnosticSyncReturned],stream:diagnosticStream)
       }
     }
   }

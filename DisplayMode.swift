@@ -128,13 +128,22 @@ struct OwnedDisplayMonitor {
     }
     t.onPayload = {[weak self] data in
       guard let self,self.active,self.epoch==token else{return}
-      guard self.safe else{self.stop(message:TCText("Screen transmission stopped because the session's safety state changed."));return}
+      // Keep the safety query and gate in their original order, once per payload.
+      let guardStartedAt=ProcessInfo.processInfo.systemUptime
+      let payloadSafe=self.safe
+      let guardFinishedAt=ProcessInfo.processInfo.systemUptime
+      let guardMs=(guardFinishedAt-guardStartedAt)*1000
+      if guardMs>=2,let stream=self.transport?.diagnosticStreamID {
+        let sequence=data.first==6 ? (try? DisplayStreamFrameHeader(data))?.sequence:nil
+        DevelopmentDiagnostics.shared.record(stage:"receiver_guard_slow",sequence:sequence,fields:["kind":Double(data.first ?? 255),"elapsedMs":guardMs,"startedAt":guardStartedAt,"time":guardFinishedAt,"allowed":payloadSafe ? 1:0],stream:stream)
+      }
+      guard payloadSafe else{self.stop(message:TCText("Screen transmission stopped because the session's safety state changed."));return}
       guard !sending else{self.stop(message:TCText("Received data not allowed on the video-only channel."));return}
       if data.first==7 {
         do {try self.viewer?.acceptCursor(data)} catch {self.stop(message:TCText("Invalid screen video frame."))};return
       }
       if data.first==2 || data.first==6 {
-        do {guard let viewer=self.viewer else{throw DisplayVideoError.decoderFailed};try viewer.accept(data);self.receivedFirstFrame=true;self.receivedVideo+=1}
+        do {guard let viewer=self.viewer else{throw DisplayVideoError.decoderFailed};try viewer.accept(data,guardMilliseconds:guardMs);self.receivedFirstFrame=true;self.receivedVideo+=1}
         catch{self.stop(message:TCText("Could not decode incoming video. This video error is separate from the input connection."))}
       }
     }

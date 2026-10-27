@@ -185,6 +185,36 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     let readinessBefore = viewer.readinessCallbacksForTests
     try displayLiveRequire(viewer.requestReadinessForTests(), "register actual native renderer readiness callback")
     try await pump(until:{viewer.readinessCallbacksForTests == readinessBefore+1 && !viewer.readinessRequestedForTests}, maximum:2, stage:"one-shot readiness callback with no pending pixel")
+    // Exercise the real asynchronous renderer API on this native generated-video
+    // surface. Delivery is cumulative/asynchronous: do not equate total with our
+    // eight enqueue calls or interpret these counters as physical panel refresh.
+    if #available(macOS 14.4, *) {
+        let metricsStartedAt = ProcessInfo.processInfo.systemUptime
+        let metricsEnd = min(deadline, metricsStartedAt + 6)
+        var lastMetricsRequestAt: Double?
+        while ((viewer.rendererMetricsForTests?["sampleTime"] ?? 0) < metricsStartedAt || (viewer.rendererMetricsForTests?["totalNumberOfFrames"] ?? 0) <= 0) && ProcessInfo.processInfo.systemUptime < metricsEnd {
+            let requested = viewer.requestRendererMetricsForTests()
+            if requested {
+                let requestedAt = ProcessInfo.processInfo.systemUptime
+                if let previous = lastMetricsRequestAt { try displayLiveRequire(requestedAt - previous >= 1.999, "renderer metrics requests at most once per two seconds") }
+                lastMetricsRequestAt = requestedAt
+                try displayLiveRequire(viewer.rendererMetricsPendingForTests && !viewer.requestRendererMetricsForTests(), "renderer metrics single pending request")
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        guard let sample = viewer.rendererMetricsForTests else { throw DisplayLiveUITestError.failed("native renderer metrics callback") }
+        try displayLiveRequire(sample["available"] == 1 && (sample["sampleTime"] ?? 0) >= metricsStartedAt && (sample["totalNumberOfFrames"] ?? 0) > 0, "native renderer nonnil metrics and positive cumulative total")
+        for name in ["numberOfDroppedFrames", "numberOfCorruptedFrames", "totalAccumulatedFrameDelay", "sampleTime"] {
+            guard let value = sample[name] else { throw DisplayLiveUITestError.failed("renderer metric missing: " + name) }
+            try displayLiveRequire(value.isFinite && value >= 0, "finite nonnegative renderer metric: " + name)
+        }
+        // Only test the post-completion throttle while still inside the request
+        // interval. A very delayed callback may legitimately finish after it.
+        if let requestedAt = lastMetricsRequestAt, ProcessInfo.processInfo.systemUptime - requestedAt < 2 {
+            try displayLiveRequire(!viewer.requestRendererMetricsForTests(), "renderer metrics two-second rate limit after completed sample")
+        }
+        print("PASS native renderer metrics: submitted=\(viewer.presentationStats.submitted) sample=\(sample); cumulative asynchronous API counts, not enqueue equality or physical-panel/stable60 proof")
+    }
     try viewer.acceptCursor(cursor(0, visible:true))
     try displayLiveRequire(viewer.cursorVisibleForTests && viewer.cursorFrameForTests.width > 0 && viewer.cursorFrameForTests.height > 0, "separate cursor has actual layer and image")
     let centerCursor = viewer.cursorFrameForTests
@@ -213,13 +243,26 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     try displayLiveRequire(closed == 0 && ProcessInfo.processInfo.systemUptime < deadline, "test final state")
     try displayLiveRequire(viewer.readinessCallbacksForTests == readinessBefore+1 && !viewer.readinessRequestedForTests, "no repeated empty readiness callbacks after further native pumping")
     let wasFullscreen=viewer.isFullScreenForTests
+    if #available(macOS 14.4, *) {
+        // Retire a genuine pending request synchronously before its main-queue
+        // completion can run. close/clear must not resurrect its metrics sample.
+        var requested = viewer.requestRendererMetricsForTests()
+        let requestEnd = min(deadline, ProcessInfo.processInfo.systemUptime + 3)
+        while !requested && ProcessInfo.processInfo.systemUptime < requestEnd {
+            try await Task.sleep(nanoseconds: 10_000_000)
+            requested = viewer.requestRendererMetricsForTests()
+        }
+        try displayLiveRequire(requested && viewer.rendererMetricsPendingForTests, "pending renderer metrics before close")
+    }
     try displayLiveRequire(viewer.requestReadinessForTests(), "pending readiness before close")
     viewer.close()
+    try displayLiveRequire(viewer.rendererMetricsForTests == nil, "close clears renderer metrics snapshot")
     try displayLiveRequire(!viewer.cursorVisibleForTests && !viewer.readinessRequestedForTests, "close clears cursor and renderer request")
     try displayLiveRequire(!viewer.pacingActiveForTests && viewer.pacingTicksForTests == 0 && viewer.pacingPendingForTests == 0, "close invalidates display link and clears paced frames")
     try displayLiveRequire(!ownershipFixture.sourceWindowOwnership.hasStableOwnership,"closed viewer cannot leave stale source ownership or activate HUD")
     let closedSettle = ProcessInfo.processInfo.systemUptime + 0.1
     try await pump(until:{ProcessInfo.processInfo.systemUptime >= closedSettle},maximum:0.5,stage:"closed readiness late callback")
+    try displayLiveRequire(viewer.rendererMetricsForTests == nil, "late renderer metrics cannot resurrect closed snapshot")
     try displayLiveRequire(!viewer.readinessRequestedForTests && viewer.readinessCallbacksForTests == 0, "no callback resurrects closed viewer readiness counters")
     print("PASS native viewer: activationPolicy=\(application.activationPolicy().rawValue) coordinator=true fullscreen=\(wasFullscreen) decoded=8 submitted=8 colorfulSamples=\(colorfulSamples) focusLossCallbacks=\(lost) focusGainCallbacks=\(gained) expectedClose=1 newFrameWhileUnfocused=true stampedFrames=true separateCursor=true cursorExpiry=true cadence=true readinessCallbackOneShot=true realDisplayLinkPacing=true; own-window generated-pattern screenshot only; no network, virtual display or input posting")
 }

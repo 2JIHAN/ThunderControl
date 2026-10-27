@@ -1251,7 +1251,6 @@ final class Relay {
     onConsole: nil, loginDone: nil, screenLocked: nil)
   private var lastSessionPoll = 0.0
   private var pendingForegroundToken: String?
-  private var cursorPin: CGPoint?
   private var entryMotion=EntryMotionBuffer()
   private var returnMotion=ReturnMotionCarry()
   private var activationRestorePending=false
@@ -2146,7 +2145,6 @@ final class Relay {
     entryMotion.reset();returnMotion.reset();returnStartedAt=nil;receiverActivationPendingToken=nil;receiverActivationDeadline=nil
     pendingForegroundToken = nil
     sourceActivationCheckScheduled=false
-    cursorPin = nil
     let result = cursorResources.restore(point: point, expectedLeaseID: lease)
     noteRecovery(result)
     if dockSource.active {dockOrphanMotion=dockSource.motion}
@@ -2706,13 +2704,6 @@ final class Relay {
       if !self.sender,self.authenticated,!self.syncReceiverCursor() {self.safetyStop("Receiver cursor visibility could not be restored");return}
       if let reason = self.currentSessionBlockReason() {
         self.sessionBecameUnsafe(reason,origin:self.polledSessionSuspensionOrigin)
-        return
-      }
-      if self.sender && self.handoff.phase == .remote,
-        cursorIsolationVerdict(pin:self.cursorPin,live:CGEvent(source:nil)?.location) != .stable
-      {
-        self.safetyStop("Live cursor isolation lost or unavailable (timer)")
-        self.status("Cursor isolation lost; all relay stopped")
         return
       }
       if self.sender && (self.forward || self.handoff.phase == .remote) && !NSApp.isActive {
@@ -3299,18 +3290,6 @@ final class Relay {
       allowed(type.rawValue, !auto && experimental && gestureCompatible),
       validFields(e, type.rawValue), let d = e.data as Data?
     else { return false }
-    let isolationVerdict:CursorIsolationVerdict = remote && positionalMouseTypes.contains(type.rawValue) ? cursorIsolationVerdict(pin:cursorPin,live:CGEvent(source:nil)?.location):.stable
-    if isolationVerdict != .stable {
-      automaticReconnectSuspended=true
-      stop(reason:isolationVerdict == .unavailable ? "Live cursor position unavailable or invalid":"Live cursor displaced beyond isolation tolerance")
-      status("Live cursor isolation failed: relay stopped instead of moving both cursors")
-      if [6, 7, 27].contains(type.rawValue),
-        ownership.orphans.contains(.button(e.getIntegerValueField(.mouseEventButtonNumber)))
-      {
-        return true
-      }
-      return ownership.filter(input, down: down, repeatKey: false)
-    }
     if remote && multiDisplayDesktopCompatible {
       guard let desktop=receiverDesktop,let revision=desktopHandoffRevision,revision==desktop.revision,let previous=desktopGlobalPointer,let portal=desktopPortal else{forceLocal();return ownership.filter(input,down:down,repeatKey:e.getIntegerValueField(.keyboardEventAutorepeat) != 0)}
       if [5,6,7,27].contains(type.rawValue) {
@@ -3384,8 +3363,7 @@ final class Relay {
     let orphanCodes=Set(ownership.orphans.compactMap{input -> CGKeyCode? in if case .modifier(let key)=input{return key};return nil})
     outgoing.flags=filteredModifierFlags(event.flags,orphanCodes:orphanCodes,ambiguous:ownership.ambiguousModifiers)
     guard NSApp.isActive,sourceOwnershipConfirmed?()==true,currentSessionBlockReason()==nil,
-      AXIsProcessTrusted(),topologyUnchanged(),let pin=cursorPin,
-      let actual=CGEvent(source:nil)?.location,hypot(actual.x-pin.x,actual.y-pin.y)<=2,
+      AXIsProcessTrusted(),topologyUnchanged(),
       let token=handoff.token,let id=route.id,
       let data=outgoing.data as Data?,!data.isEmpty,data.count<=AppGestureCodec.maximumDataSize,
       handoff.width>1,handoff.height>1 else {
@@ -3684,12 +3662,6 @@ final class Relay {
         case .failure(let error):
           stop()
           status("Cursor acquisition failed: \(error). " + recoveryNotice)
-          return
-        }
-        cursorPin = desktopFocusSafetyForTests != nil ? targetTopology.bounds.origin:CGEvent(source: nil)?.location
-        guard cursorPin != nil else {
-          stop()
-          status("Cannot verify source cursor isolation")
           return
         }
         guard flushEntryMotion(token:token) else{return}
@@ -5397,7 +5369,7 @@ struct ThunderControlMain {
     } else if CommandLine.arguments.contains("--desktop-map-self-test") {
       exit(runDesktopMapTransitionTests()==0 ? 0:1)
     } else if CommandLine.arguments.contains("--self-test") {
-      do { try tests();check(runLocalizationTests()==0);check(runConcurrentDisplayTests()==0);check(runReceiverDesktopRelayTests()==0);check(runReceiverDesktopTests()==0);check(runSavedDesktopPlacementTests()==0);check(runReceiverDesktopUITests()==0);check(runDesktopMapTransitionTests()==0);check(runDesktopHandoffRoutingTests()==0);check(runDesktopEntryPolicyTests()==0);check(runDisplayHeartbeatTests()==0);check(runDisplayTrustTests()==0);check(runDisplayRemoteInputTests()==0);check(runDisplayTransportTests()==0);check(runDisplayCadenceTests()==0);check(runDisplayFramePacingTests()==0);check(runDisplayVideoFormatTests()==0);check(runSavedSharingStateTests()==0);check(runAutomaticSharingResumeTests()==0);check(runSharingLifecycleIntegrationTests()==0);check(runDisplayPreferenceTests()==0);check(runUpdateReleaseTests()==0);check(runSavedVirtualDisplayPlacementTests()==0);check(runVirtualDisplayPlacementSessionTests()==0);check(runDisplayVideoDecoderTests()==0);check(runScrollReplayTests()==0);check(runDiscoveryRecoveryPolicyTests()==0);check(runNativeGestureTests()==0);check((runDockTransferStateTests()+runDesktopSystemGestureTests())==0);check(runTransitionMotionTests()==0);check(runGestureTraceTests()==0);check(runCursorIsolationTests()==0);check(runCursorVisibilityTests()==0);check(runConnectedLayoutTests()==0);check(runCursorModeProtocolTests()==0);ReceiverCursorFocusTests.run();check(runAutomaticConnectionPolicyTests()==0);check(runCableReconnectPolicyTests()==0);check(runReceiverFocusRetryTests()==0);check(runReturnWarpResumeTests()==0);check(runDiagnosticStoreTests()==0);check(runDevelopmentDiagnosticsTests()==0);check(runDevelopmentFrameTraceTests()==0);check(runDisplayDiagnosticLinesTests()==0);check(runTrustedPairingTests()==0);check(runConnectionNotificationTests()==0);check(runSingleConnectionNotificationTests()==0);check(runAppAppearancePreferencesTests()==0);check(runAppWindowPresentationPolicyTests()==0);check(runConnectedWindowVisibilityTests()==0);check(runSavedScreenLayoutTests()==0);check(Relay.verifyDeviceLayoutPersistenceForTests());check(runSessionAutoResumeTests()==0);check(runSessionSuspensionOriginTests()==0);check(Relay.verifySessionSuspensionOriginsForTests());check(runAutomaticReconnectBackoffTests()==0);check(runBridgeRecoverySchedulingTests()==0);check(runLockedTransportPolicyTests()==0);check(runAuthenticatedRouteHintTests()==0);check(runFastReconnectPolicyTests()==0);check(Relay.verifyLockedTransportInputBarrierForTests());check(!Relay().receiverWantsCursorHidden);ScreenArrangementDragTests.run();check(Relay.verifyReceiverRecoveryBlocksStartForTests());check(Relay.verifyReceiverPhysicalInputCancelsActivationForTests());try dockProtocolTests();try appGesturePacketTests();print("PASS gesture memory classification and system stream ordering; no posting") } catch {
+      do { try tests();check(runLocalizationTests()==0);check(runConcurrentDisplayTests()==0);check(runReceiverDesktopRelayTests()==0);check(runReceiverDesktopTests()==0);check(runSavedDesktopPlacementTests()==0);check(runReceiverDesktopUITests()==0);check(runDesktopMapTransitionTests()==0);check(runDesktopHandoffRoutingTests()==0);check(runDesktopEntryPolicyTests()==0);check(runDisplayHeartbeatTests()==0);check(runDisplayTrustTests()==0);check(runDisplayRemoteInputTests()==0);check(runDisplayTransportTests()==0);check(runDisplayCadenceTests()==0);check(runDisplayFramePacingTests()==0);check(runDisplayVideoFormatTests()==0);check(runSavedSharingStateTests()==0);check(runAutomaticSharingResumeTests()==0);check(runSharingLifecycleIntegrationTests()==0);check(runDisplayPreferenceTests()==0);check(runUpdateReleaseTests()==0);check(runSavedVirtualDisplayPlacementTests()==0);check(runVirtualDisplayPlacementSessionTests()==0);check(runDisplayVideoDecoderTests()==0);check(runDisplayDecodeWorkerTests()==0);check(runScrollReplayTests()==0);check(runDiscoveryRecoveryPolicyTests()==0);check(runNativeGestureTests()==0);check((runDockTransferStateTests()+runDesktopSystemGestureTests())==0);check(runTransitionMotionTests()==0);check(runGestureTraceTests()==0);check(runCursorVisibilityTests()==0);check(runConnectedLayoutTests()==0);check(runCursorModeProtocolTests()==0);ReceiverCursorFocusTests.run();check(runAutomaticConnectionPolicyTests()==0);check(runCableReconnectPolicyTests()==0);check(runReceiverFocusRetryTests()==0);check(runReturnWarpResumeTests()==0);check(runDiagnosticStoreTests()==0);check(runDevelopmentDiagnosticsTests()==0);check(runDevelopmentFrameTraceTests()==0);check(runDisplayDiagnosticLinesTests()==0);check(runTrustedPairingTests()==0);check(runConnectionNotificationTests()==0);check(runSingleConnectionNotificationTests()==0);check(runAppAppearancePreferencesTests()==0);check(runAppWindowPresentationPolicyTests()==0);check(runConnectedWindowVisibilityTests()==0);check(runSavedScreenLayoutTests()==0);check(Relay.verifyDeviceLayoutPersistenceForTests());check(runSessionAutoResumeTests()==0);check(runSessionSuspensionOriginTests()==0);check(Relay.verifySessionSuspensionOriginsForTests());check(runAutomaticReconnectBackoffTests()==0);check(runBridgeRecoverySchedulingTests()==0);check(runLockedTransportPolicyTests()==0);check(runAuthenticatedRouteHintTests()==0);check(runFastReconnectPolicyTests()==0);check(Relay.verifyLockedTransportInputBarrierForTests());check(!Relay().receiverWantsCursorHidden);ScreenArrangementDragTests.run();check(Relay.verifyReceiverRecoveryBlocksStartForTests());check(Relay.verifyReceiverPhysicalInputCancelsActivationForTests());try dockProtocolTests();try appGesturePacketTests();print("PASS gesture memory classification and system stream ordering; no posting") } catch {
         fputs("FAIL \(error)\n", stderr)
         exit(1)
       }

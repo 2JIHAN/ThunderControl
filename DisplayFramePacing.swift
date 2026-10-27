@@ -28,6 +28,10 @@ struct DisplayFramePacer<Frame> {
     // One cadence period is the maximum phase debt, not a per-tick waiver.
     private let phaseAllowance: Double
     private let cushion = 1.0 / 60.0
+    /// Actual decoded queue residence above this threshold switches FIFO to
+    /// newest ELIGIBLE catch-up. Exactly 25ms remains FIFO. This is not a hard
+    /// maximum age: an old singleton may still be selected, never expired here.
+    private let fifoCatchUpAgeThreshold: Double = 0.025
     private var queue: [Entry] = []
     private var lastArrival: Double?
     private var lastNow: Double?
@@ -99,7 +103,13 @@ struct DisplayFramePacer<Frame> {
         // A 1ns rounding allowance avoids losing exact 1/60 boundaries to Double
         // subtraction. This is NOT the wider cadence jitter tolerance.
         let cutoff = target - cushion
-        let cushionedIndex = queue.lastIndex(where: { $0.arrival <= now && $0.arrival <= cutoff + 1e-9 })
+        // Ordering alone changes: eligibility, bounded fallback and cadence stay
+        // identical. Measure age against actual callback time, not prediction.
+        let catchingUp = now - queue[0].arrival > fifoCatchUpAgeThreshold
+        let eligible: (Entry) -> Bool = { $0.arrival <= now && $0.arrival <= cutoff + 1e-9 }
+        let cushionedIndex = catchingUp
+            ? queue.lastIndex(where: eligible)
+            : queue.firstIndex(where: eligible)
         // At 120fps arrivals / 60Hz ticks, capacity two can perpetually evict every
         // cushioned frame. Under that pressure consume the OLDER of two instead,
         // preserving one newer decoded frame as a buffer. Never select a future

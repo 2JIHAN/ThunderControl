@@ -1,5 +1,9 @@
 [English](README.md) | [한국어](README.ko.md)
 
+## Current test release: 0.8.30.11 / build71
+
+Cursor-position-only connection stops removed, with receiver renderer quality counters. Includes internal8.33ms capture/FIFO25/decoder-worker candidates. Stable final-receiver60fps is not yet verified. See [release notes](RELEASE-0.8.30.11.md) for scope, validation and installation. Earlier release sections below are historical.
+
 # <img src="docs/assets/app-icon.png" width="32" height="32" alt=""> ThunderControl
 
 Use your MacBook's keyboard, trackpad and screen to work on your Mac mini over a direct Thunderbolt connection.
