@@ -4,11 +4,17 @@ enum DisplayFrameSelectionPolicy {
     /// Build-70 rule: newest frame that arrived at least one 1/60 cushion before the
     /// display target; under a full queue, the older of two. Smoothness over latency.
     case latest70
+    /// Jitter buffer: one frame per panel tick in arrival order, no age cushion and no
+    /// catch-up. A late frame costs one repeated refresh, after which the extra queued
+    /// frame absorbs later jitter; overflow (capacity two) is the only skip.
+    case sequence
     /// Oldest available decoded frame, with neither cushion nor age catchup.
     case buffered
 
     static var buildDefault: Self {
-#if TC_LEGACY70_SELECTION
+#if TC_SEQUENCE_SELECTION
+        .sequence
+#elseif TC_LEGACY70_SELECTION
         .latest70
 #elseif TC_LATEST_DECODED
         .latest
@@ -160,6 +166,9 @@ struct DisplayFramePacer<Frame> {
         case .buffered:
             eligibleIndex = queue.firstIndex { $0.arrival <= now && $0.arrival <= target }
             fallbackIndex = nil
+        case .sequence:
+            eligibleIndex = queue.firstIndex { $0.arrival <= now }
+            fallbackIndex = nil
         case .latest70:
             eligibleIndex = queue.lastIndex { $0.arrival <= now && $0.arrival <= target - cushion + 1e-9 }
             fallbackIndex = queue.count == 2 && queue[0].arrival <= min(target, now) ? 0 : nil
@@ -253,6 +262,8 @@ struct DisplayFramePacer<Frame> {
         switch selectionPolicy {
         case .buffered:
             index = queue.firstIndex { $0.arrival <= now && $0.arrival <= target }
+        case .sequence:
+            index = queue.firstIndex { $0.arrival <= now }
         case .latest70:
             index = queue.lastIndex { $0.arrival <= now && $0.arrival <= target - cushion + 1e-9 }
                 ?? (queue.count == 2 && queue[0].arrival <= min(target, now) ? 0 : nil)

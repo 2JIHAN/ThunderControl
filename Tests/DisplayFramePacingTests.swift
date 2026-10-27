@@ -324,7 +324,37 @@ func runDisplayFramePacingTests() -> Int {
            "future display prediction cannot release frame from future actual clock")
     // Latest is only a decoded-entry selection change. These are synthetic
     // queue/cadence checks, not evidence of physical presentation timing.
-#if TC_LEGACY70_SELECTION
+#if TC_SEQUENCE_SELECTION
+    verify(DisplayFrameSelectionPolicy.buildDefault == .sequence, "sequence jitter-buffer default")
+    do {
+        // 60Hz source whose arrivals straddle the cushion boundary (+-1.5ms jitter, slow drift):
+        // the build-70 rule produces repeat-then-skip pairs; the jitter buffer must not skip.
+        func run(_ policy: DisplayFrameSelectionPolicy) -> (repeats: Int, skips: Int) {
+            var p = DisplayFramePacer<Int>(selectionPolicy: policy)
+            var last: Int? = nil, repeats = 0, skips = 0, next = 0
+            let period = 1.0 / 60.0
+            for k in 0..<7200 {
+                let target = 100 + Double(k + 1) * period, now = target - 0.001
+                while true {
+                    let drift = Double(next) * 0.0000002
+                    let jitter = (next % 3 == 0 ? 0.0015 : -0.0015)
+                    let arrival = 100 + Double(next) * period - period + 0.0005 + drift + jitter
+                    if arrival > now { break }
+                    p.offer(next, at: max(arrival, 0)); next += 1
+                }
+                if let f = p.take(now: now, targetTimestamp: target) {
+                    if let l = last, f - l >= 2 { skips += 1 }
+                    last = f
+                } else if last != nil { repeats += 1 }
+            }
+            return (repeats, skips)
+        }
+        let old = run(.latest70), seq = run(.sequence)
+        print("Jitter trace: latest70 repeats=\(old.repeats) skips=\(old.skips); sequence repeats=\(seq.repeats) skips=\(seq.skips)")
+        verify(seq.skips == 0, "jitter buffer never skips on a straddling 60Hz trace")
+        verify(seq.repeats <= max(1, old.repeats / 10), "jitter buffer repeats far less than the cushion rule")
+    }
+#elseif TC_LEGACY70_SELECTION
     verify(DisplayFrameSelectionPolicy.buildDefault == .latest70, "build-70 smooth default")
     do {
         // Build-70 rule: only frames at least one 1/60 cushion old are eligible; newest wins.
@@ -346,8 +376,8 @@ func runDisplayFramePacingTests() -> Int {
 #endif
     var defaultPolicy = DisplayFramePacer<Int>()
     defaultPolicy.offer(1, at: 0)
-#if TC_LATEST_DECODED
-    verify(defaultPolicy.take(now: 0, targetTimestamp: 0) == 1, "default initializer uses latest build profile")
+#if TC_LATEST_DECODED || TC_SEQUENCE_SELECTION
+    verify(defaultPolicy.take(now: 0, targetTimestamp: 0) == 1, "default initializer takes an arrived frame without a cushion")
 #else
     verify(defaultPolicy.take(now: 0, targetTimestamp: 0) == nil, "default initializer uses FIFO build profile")
 #endif
