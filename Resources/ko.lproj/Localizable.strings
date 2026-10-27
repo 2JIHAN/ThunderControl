@@ -258,3 +258,6 @@
 "Open iCloud Diagnostics" = "iCloud 진단 폴더 열기";
 "Development diagnostics start after the screen connection is authenticated." = "화면 연결이 인증되면 개발 진단 수집이 시작됩니다.";
 "iCloud diagnostics are not available yet. Local diagnostics remain available; cloud copying retries automatically." = "아직 iCloud 진단을 사용할 수 없습니다. 로컬 진단은 유지되며 자동 복사를 재시도합니다.";
+
+"Screen safety sampling is still busy. Reconnect to continue." = "이전 화면 안전 상태 확인이 아직 끝나지 않았습니다. 잠시 후 다시 연결해 주세요.";
+"Quit paused: screen sharing cleanup did not finish. Choose Quit again after it finishes." = "종료 보류: 화면 공유 정리가 끝나지 않았습니다. 정리가 끝난 뒤 다시 종료하세요.";

@@ -518,6 +518,25 @@ private let displayDecodeCallback: VTDecompressionOutputCallback = { reference, 
 /// Creates a reference-backed image sample: no CPU pixel readback, bitmap conversion,
 /// compressed-frame discard or frame clock/preroll wait is introduced here.
 func displayImmediateImageSample(_ pixel: CVPixelBuffer, format expectedFormat: DisplayVideoFormat? = nil) throws -> CMSampleBuffer {
+    try displayImageSample(pixel, format: expectedFormat, timing: nil)
+}
+
+/// Explicit host-clock PTS with unspecified duration: the next PTS determines
+/// replacement. No synthetic nominal duration overlapping measured display slots.
+func displayDeadlineImageSample(_ pixel: CVPixelBuffer, format: DisplayVideoFormat? = nil, target: Double) throws -> CMSampleBuffer {
+    guard target.isFinite, target >= 0, target.ulp <= 0.000001 else { throw DisplayVideoError.decoderFailed }
+    let timing = CMSampleTimingInfo(duration: .invalid,
+        presentationTimeStamp: CMTime(seconds: target, preferredTimescale: 1_000_000_000), decodeTimeStamp: .invalid)
+    return try displayImageSample(pixel, format: format, timing: timing)
+}
+
+func displayScheduledImageSample(_ pixel: CVPixelBuffer, format: DisplayVideoFormat? = nil, timing: CMSampleTimingInfo) throws -> CMSampleBuffer {
+    guard timing.presentationTimeStamp.isNumeric, timing.presentationTimeStamp.seconds >= 0,
+          CMTimeCompare(timing.duration, CMTime(value: 1, timescale: 60)) == 0 else { throw DisplayVideoError.decoderFailed }
+    return try displayImageSample(pixel, format: format, timing: timing)
+}
+
+private func displayImageSample(_ pixel: CVPixelBuffer, format expectedFormat: DisplayVideoFormat?, timing scheduledTiming: CMSampleTimingInfo?) throws -> CMSampleBuffer {
     let width = CVPixelBufferGetWidth(pixel), height = CVPixelBufferGetHeight(pixel)
     // Legacy callers supply physical pixels, not a newly inferred logical format.
     guard width > 0, height > 0, width <= 3840, height <= 2880,
@@ -533,16 +552,57 @@ func displayImmediateImageSample(_ pixel: CVPixelBuffer, format expectedFormat: 
     var format: CMVideoFormatDescription?
     guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pixel,
         formatDescriptionOut: &format) == noErr, let format else { throw DisplayVideoError.decoderFailed }
-    var timing = CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
+    var timing = scheduledTiming ?? CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
     var sample: CMSampleBuffer?
     guard CMSampleBufferCreateReadyWithImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pixel,
         formatDescription: format, sampleTiming: &timing, sampleBufferOut: &sample) == noErr,
         let sample, let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true),
         CFArrayGetCount(attachments) == 1 else { throw DisplayVideoError.decoderFailed }
     let dictionary = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
-    CFDictionarySetValue(dictionary, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
-        Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+    if scheduledTiming == nil {
+        CFDictionarySetValue(dictionary, Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+            Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+    }
     return sample
+}
+
+/// Receiver-local mapping only. SDK CADisplayLink.h defines CA timestamps as
+/// Mach host time in seconds; AVSampleBufferDisplayLayer.h explicitly equates
+/// CACurrentMediaTime with its host clock. Bracket a CM host-clock observation
+/// with CA observations, accepting <=1 ms read skew, rather than assuming epochs.
+/// The renderer timebase is zero at hostAnchor and runs at rate 1. No source-host
+/// timestamp, wall clock, or network offset participates in this mapping.
+struct DisplayScheduledTimeline {
+    private(set) var generation: UInt64 = 0
+    private(set) var hostAnchor: CMTime = .invalid
+    private(set) var caAnchor: Double = .nan
+    private(set) var lastPTS: CMTime = .invalid
+    mutating func reset() { generation &+= 1; hostAnchor = .invalid; caAnchor = .nan; lastPTS = .invalid }
+    mutating func calibrate(caBefore: Double, host: CMTime, caAfter: Double) -> Bool {
+        reset()
+        guard caBefore.isFinite, caAfter.isFinite, caBefore >= 0, caAfter >= caBefore,
+              caAfter-caBefore <= 0.001, host.isNumeric, host.seconds >= 0 else { return false }
+        caAnchor = caBefore + (caAfter-caBefore)/2; hostAnchor = host
+        return true
+    }
+    /// Reject late/equal, nonfinite or >one nominal frame ahead targets. Also
+    /// reject a changed clock relation (>2 ms). Never bump a stale target forward:
+    /// strictly increasing PTS comes only from a fresh upcoming display target.
+    /// A selected frame rejected here is discarded, not requeued. At most one
+    /// future sample is admitted; this adds no queue to the existing bounded pacer.
+    func timing(target: Double, caNow: Double, hostNow: CMTime, generation token: UInt64) -> CMSampleTimingInfo? {
+        guard token == generation, hostAnchor.isNumeric, hostNow.isNumeric,
+              target.isFinite, caNow.isFinite, caNow >= caAnchor,
+              target > caNow, target-caNow <= 1.0/60.0 + 0.001 else { return nil }
+        let elapsed = CMTimeSubtract(hostNow, hostAnchor)
+        guard elapsed.isNumeric, elapsed.seconds >= 0,
+              abs(elapsed.seconds-(caNow-caAnchor)) <= 0.002 else { return nil }
+        let pts = CMTime(seconds: target-caAnchor, preferredTimescale: 1_000_000_000)
+        guard pts.isNumeric, CMTimeCompare(pts, elapsed) > 0,
+              !lastPTS.isNumeric || (CMTimeCompare(pts, lastPTS) > 0 && CMTimeCompare(lastPTS, elapsed) <= 0) else { return nil }
+        return CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 60), presentationTimeStamp: pts, decodeTimeStamp: .invalid)
+    }
+    mutating func commit(_ timing: CMSampleTimingInfo) { lastPTS = timing.presentationTimeStamp }
 }
 
 /// Aggregate local counters only. 'submitted' is renderer enqueue, NOT proof that
@@ -610,7 +670,7 @@ struct DisplayViewerStartup {
     private(set) var phase: Phase = .idle
     var mayPresentVideo: Bool { phase != .idle && phase != .closed }
     var isPending: Bool { phase == .waitingForWindow || phase == .enteringFullScreen }
-    mutating func begin(fullScreen: Bool) { phase = fullScreen ? .waitingForWindow : .windowed }
+    mutating func begin(fullScreen: Bool) { phase = fullScreen ? .waitingForWindow : .windowed; rejectedAttempts = 0 }
     mutating func requestIfReady(windowReady: Bool) -> Bool {
         guard phase == .waitingForWindow, windowReady else { return false }
         phase = .enteringFullScreen; return true
@@ -618,6 +678,13 @@ struct DisplayViewerStartup {
     mutating func didEnterFullScreen() {
         guard phase != .closed, phase != .idle else { return }
         phase = .fullScreen
+    }
+    /// AppKit can reject a toggle while another Space transition settles. Return to
+    /// waiting (never issues a toggle itself); the owner bounds attempts and timing.
+    private(set) var rejectedAttempts = 0
+    mutating func retryAfterRejection(maximumRetries: Int) -> Bool {
+        guard phase == .enteringFullScreen, rejectedAttempts < maximumRetries else { return false }
+        rejectedAttempts += 1; phase = .waitingForWindow; return true
     }
     @discardableResult mutating func useWindowedFallback() -> Bool {
         guard isPending else { return false }
@@ -633,7 +700,7 @@ struct DisplayViewerStartup {
     init(owner: DisplayViewer, generation: UInt64) { self.owner=owner; self.generation=generation }
     @objc func tick(_ sender: AnyObject) {
         guard #available(macOS 14.0, *), let link=sender as? CADisplayLink else { return }
-        owner?.displayPacingTick(generation:generation, targetTimestamp:link.targetTimestamp)
+        owner?.displayPacingTick(generation:generation, targetTimestamp:link.targetTimestamp, period:link.targetTimestamp-link.timestamp)
     }
 }
 
@@ -650,6 +717,7 @@ struct DisplayViewerStartup {
     private var startupTimer: Timer?
     private var startupDeadline: TimeInterval = 0
     private var entryDeadline: TimeInterval?
+    private var fullScreenRetryNotBefore: TimeInterval = 0
     var isVideoPresentationReadyForTests: Bool { startup.mayPresentVideo }
     var acceptsViewerInput=true
     var onClose: (() -> Void)?
@@ -669,17 +737,74 @@ struct DisplayViewerStartup {
     private var focusArmed = false
     private var viewerWindow: DisplayViewerWindow?
     private var surface: DisplayVideoSurface?
+#if TC_NATIVE_VSYNC
+    private lazy var pacedFrames = DisplayFramePacer<DisplayTracedFrame>(selectionPolicy: .buffered, cadencePolicy: .displayTargets, onDiscard: { [frameTrace] frame, reason in
+        frameTrace.record("pacer_discard", identity: frame.identity, fields: ["reason": Double(reason.rawValue)])
+    })
+#else
     private lazy var pacedFrames = DisplayFramePacer<DisplayTracedFrame>(onDiscard: { [frameTrace] frame, reason in
         frameTrace.record("pacer_discard", identity: frame.identity, fields: ["reason": Double(reason.rawValue)])
     })
+#endif
+#if TC_TIMED_PRESENTATION
+    private var presentationTimebase: CMTimebase?
+    private var scheduledTimeline = DisplayScheduledTimeline()
+    private(set) var scheduledSampleCountForTests: UInt64 = 0
+    private(set) var lastScheduledPTSForTests: CMTime = .invalid
+    private(set) var lastScheduledEnqueueForTests: [String: Double]?
+    /// Only promised PTS + nominal duration has elapsed on the attached control
+    /// timebase. This is NOT a displayed-frame or physical-scanout observation.
+    var targetElapsed: Bool {
+        guard let base = surface?.videoLayer?.controlTimebase, lastScheduledPTSForTests.isNumeric else { return false }
+        let now = CMTimebaseGetTime(base)
+        let end = CMTimeAdd(lastScheduledPTSForTests, CMTime(value: 1, timescale: 60))
+        return now.isNumeric && end.isNumeric && CMTimeCompare(now, end) >= 0
+    }
+    var presentationGenerationForTests: UInt64 { scheduledTimeline.generation }
+    var hasPresentationTimebaseForTests: Bool { presentationTimebase != nil && surface?.videoLayer?.controlTimebase != nil }
+#endif
     private var pacingLink: AnyObject?
     private var pacingTarget: DisplayPacingLinkTarget?
     private var pacingGeneration: UInt64 = 0
     // Keep an in-flight request occupied across clear/reopen until its callback
     // returns. pacingGeneration retires its result without overlapping requests.
     private var rendererMetricsPending = false
+#if TC_DEADLINE_PRESENTATION
+    // Two waiting decoded buffers plus at most two future renderer commitments.
+    // These are separate explicit bounds, not proof of renderer/panel consumption.
+    private var deadlineFrames: [DisplayTracedFrame] = []
+    private var deadlinePlan = DisplayDeadlinePlan()
+    private var deadlineWake: DispatchWorkItem?
+    private var deadlineWakeAt: Double?
+    private var deadlineWakeEpoch: UInt64 = 0
+    private var deadlineOffered: UInt64 = 0
+    private var deadlineOverflow: UInt64 = 0
+    private var deadlineLateSkips: UInt64 = 0
+    private var deadlineMinimumLeadMs: Double = .infinity
+    var maySubmitPresentation: (() -> Bool)?
+    private var deadlineMaximumFutureCount = 0
+    private var deadlineLastEnqueue: [String: Double]?
+    var deadlineFutureCountForTests: Int { deadlinePlan.futureCount }
+    var deadlineMaximumFutureForTests: Int { deadlineMaximumFutureCount }
+    var deadlineEndLeadForTests: Double { deadlineMinimumLeadMs }
+    var deadlineLastEnqueueForTests: [String: Double]? { deadlineLastEnqueue }
+#endif
+#if TC_IMMEDIATE_PRESENTATION
+    // One newest decoded frame only. No app FPS cap, no future PTS wait:
+    // macOS composites the latest submitted image at the panel's own refresh.
+    private var immediatePending: DisplayTracedFrame?
+    private var immediateOffered: UInt64 = 0
+    private var immediateReplaced: UInt64 = 0
+#endif
     private var rendererMetricsRequestedAt: Double?
     private var rendererMetricsSample: [String: Double]?
+#if TC_RENDERER_HEALTH
+    // Valid-generation native callbacks, not diagnostic rows or panel scanout.
+    private var nativeDisplayLinkTicks: UInt64 = 0
+    private var nativeTargetGaps: UInt64 = 0
+    private var nativePreviousTarget: Double?
+    private var nativeTargetGeneration: UInt64?
+#endif
     private var displayLinkCadence = DisplayCadenceStats()
     private var readinessRequested = false
     private var readinessEpoch: UInt64 = 0
@@ -778,6 +903,7 @@ struct DisplayViewerStartup {
         if entryDeadline==nil,now>=startupDeadline {
             finishFullScreenFallback(window,reason:"window-readiness-timeout");return
         }
+        guard now >= fullScreenRetryNotBefore else { return }
         if startup.requestIfReady(windowReady: window.isVisible && window.isKeyWindow && NSApp.isActive) {
             entryDeadline=now+8
             startupDiagnostic("native-request",window)
@@ -803,6 +929,24 @@ struct DisplayViewerStartup {
     }
     func windowDidFailToEnterFullScreen(_ window: NSWindow) {
         guard window === viewerWindow, !closing else { return }
+        if startup.retryAfterRejection(maximumRetries: 2) {
+            let now = ProcessInfo.processInfo.systemUptime
+            fullScreenRetryNotBefore = now + 0.75
+            entryDeadline = nil; startupDeadline = now + 5
+            startupDiagnostic("appkit-rejected-retry-\(startup.rejectedAttempts)", window)
+            if startupTimer == nil {
+                let epoch = windowEpoch
+                let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self, weak window] _ in
+                    MainActor.assumeIsolated {
+                        guard let self, let window, !self.closing, self.windowEpoch == epoch,
+                              self.viewerWindow === window else { return }
+                        self.advanceFullScreenStartup(window)
+                    }
+                }
+                startupTimer = timer; RunLoop.main.add(timer, forMode: .common)
+            }
+            return
+        }
         finishFullScreenFallback(window,reason:"appkit-rejected")
     }
     func accept(_ payload: Data, guardMilliseconds: Double? = nil) throws {
@@ -840,11 +984,31 @@ struct DisplayViewerStartup {
         // Record the exact receiver-local clock passed to the pacing policy.
         let pacingArrival = CACurrentMediaTime()
         frameTrace.record("pacer_offer", identity: identity, fields: ["time": lastDecodedAt, "offerTime": pacingArrival, "pending": Double(pacedFrames.pendingCount)])
+#if TC_DEADLINE_PRESENTATION
+        deadlineOffered &+= 1
+        if deadlineFrames.count == 2 {
+            let old = deadlineFrames.removeFirst(); deadlineOverflow &+= 1
+            presentationStats.replacedDecoded &+= 1
+            frameTrace.record("pacer_discard", identity: old.identity, fields: ["reason": 2])
+        }
+        deadlineFrames.append(DisplayTracedFrame(pixel: pixel, identity: identity, decodedMainAt: lastDecodedAt))
+#elseif TC_IMMEDIATE_PRESENTATION
+        immediateOffered &+= 1
+        if let old = immediatePending {
+            immediateReplaced &+= 1; presentationStats.replacedDecoded &+= 1
+            frameTrace.record("pacer_discard", identity: old.identity, fields: ["reason": 2])
+        }
+        immediatePending = DisplayTracedFrame(pixel: pixel, identity: identity, decodedMainAt: lastDecodedAt)
+#else
         if pacedFrames.offer(DisplayTracedFrame(pixel: pixel, identity: identity, decodedMainAt: lastDecodedAt), at:pacingArrival) { presentationStats.replacedDecoded &+= 1 }
+#endif
         drainPresentation()
     }
     private func ensurePacingLink() {
         guard pacingLink == nil, !closing, let surface, #available(macOS 14.0, *) else { return }
+#if TC_TIMED_PRESENTATION
+        guard configurePresentationTimebase() else { close(); return }
+#endif
         pacingGeneration &+= 1
         let target=DisplayPacingLinkTarget(owner:self,generation:pacingGeneration)
         let link=surface.displayLink(target:target,selector:#selector(DisplayPacingLinkTarget.tick(_:)))
@@ -852,15 +1016,57 @@ struct DisplayViewerStartup {
         pacingTarget=target; pacingLink=link
         link.add(to:.main,forMode:.common)
     }
+#if TC_TIMED_PRESENTATION
+    private func configurePresentationTimebase() -> Bool {
+        guard let layer = surface?.videoLayer else { return false }
+        let clock = CMClockGetHostTimeClock()
+        let before = CACurrentMediaTime(), host = CMClockGetTime(clock), after = CACurrentMediaTime()
+        guard scheduledTimeline.calibrate(caBefore: before, host: host, caAfter: after) else { return false }
+        var base: CMTimebase?
+        guard CMTimebaseCreateWithSourceClock(allocator: kCFAllocatorDefault, sourceClock: clock, timebaseOut: &base) == noErr,
+              let base, CMTimebaseSetRateAndAnchorTime(base, rate: 1, anchorTime: .zero, immediateSourceTime: host) == noErr else { return false }
+        presentationTimebase = base; layer.controlTimebase = base
+        return true
+    }
+#endif
     private func stopPacingLink() {
         pacingGeneration &+= 1
         if #available(macOS 14.0, *) { (pacingLink as? CADisplayLink)?.invalidate() }
         pacingLink=nil; pacingTarget=nil
+#if TC_TIMED_PRESENTATION
+        // Flush relative-PTS samples before removing their interpreting timebase.
+        if #available(macOS 14.0, *) {
+            surface?.videoLayer?.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
+        }
+        surface?.videoLayer?.controlTimebase = nil
+        presentationTimebase = nil; scheduledTimeline.reset()
+        scheduledSampleCountForTests = 0; lastScheduledPTSForTests = .invalid; lastScheduledEnqueueForTests = nil
+#endif
     }
-    fileprivate func displayPacingTick(generation:UInt64,targetTimestamp:Double) {
+    fileprivate func displayPacingTick(generation:UInt64,targetTimestamp:Double,period:Double = 1.0/60.0) {
         frameTrace.record("displaylink_tick", fields: ["time": CACurrentMediaTime(), "target": targetTimestamp, "generation": Double(generation), "currentGeneration": Double(pacingGeneration), "closing": closing ? 1 : 0, "active": pacingLink != nil ? 1 : 0, "pending": Double(pacedFrames.pendingCount)])
         guard !closing, generation == pacingGeneration, pacingLink != nil else { return }
+#if TC_RENDERER_HEALTH
+        nativeDisplayLinkTicks &+= 1
+        // Diagnostic only: delivered callbacks can omit/coalesce nominal slots.
+        // Never use this observation to gate enqueue or claim panel scanout.
+        if nativeTargetGeneration != generation {
+            nativeTargetGeneration = generation; nativePreviousTarget = nil
+        }
+        if targetTimestamp.isFinite, targetTimestamp >= 0 {
+            if let previous = nativePreviousTarget, targetTimestamp - previous > 1.5 / 60 {
+                nativeTargetGaps &+= 1
+            }
+            nativePreviousTarget = targetTimestamp
+        }
+#endif
         displayLinkCadence.observe(ProcessInfo.processInfo.systemUptime)
+#if TC_DEADLINE_PRESENTATION
+        guard deadlinePlan.observe(now: CACurrentMediaTime(), target: targetTimestamp, period: period) else {
+            if deadlinePlan.needsReset { close() }
+            return
+        }
+#endif
         drainPresentation(targetTimestamp:targetTimestamp)
     }
     var rendererMetricsForTests: [String: Double]? { rendererMetricsSample }
@@ -868,10 +1074,26 @@ struct DisplayViewerStartup {
     @discardableResult func requestRendererMetricsForTests() -> Bool { requestRendererMetrics() }
     var pacingActiveForTests: Bool { pacingLink != nil }
     var pacingTicksForTests: UInt64 { displayLinkCadence.count }
-    var pacingPendingForTests: Int { pacedFrames.pendingCount }
+    var pacingPendingForTests: Int {
+#if TC_DEADLINE_PRESENTATION
+        deadlineFrames.count
+#elseif TC_IMMEDIATE_PRESENTATION
+        immediatePending == nil ? 0 : 1
+#else
+        pacedFrames.pendingCount
+#endif
+    }
     private func drainPresentation(targetTimestamp:Double? = nil) {
         guard !closing, startup.mayPresentVideo, let layer = surface?.videoLayer else { return }
         ensurePacingLink()
+#if TC_DEADLINE_PRESENTATION
+        drainDeadlinePresentation()
+        return
+#endif
+#if TC_IMMEDIATE_PRESENTATION
+        drainImmediatePresentation(layer)
+        return
+#endif
         // Decode and renderer-readiness callbacks only queue/wake. Enqueue happens
         // exclusively on the display-link callback, never on packet arrival.
         guard let targetTimestamp else { return }
@@ -894,9 +1116,43 @@ struct DisplayViewerStartup {
         frameTrace.record("pacer_select", identity: frame.identity, fields: ["target": targetTimestamp, "time": CACurrentMediaTime(), "pacingNow": pacingNow, "pending": Double(pacedFrames.pendingCount)])
         let started = ProcessInfo.processInfo.systemUptime
         do {
+#if TC_TIMED_PRESENTATION
+            // Re-read clocks after sample selection: a delayed tick must not enqueue
+            // an old target. No immediate fallback in the timed experiment.
+            let caNow = CACurrentMediaTime(), hostNow = CMClockGetTime(CMClockGetHostTimeClock())
+            guard presentationTimebase != nil,
+                  let timing = scheduledTimeline.timing(target: targetTimestamp, caNow: caNow, hostNow: hostNow, generation: scheduledTimeline.generation) else {
+                frameTrace.record("renderer_control", identity: frame.identity, fields: ["target": targetTimestamp, "time": caNow, "scheduledSkipped": 1, "targetLeadMs": (targetTimestamp-caNow)*1000]); return
+            }
+            let sample = try displayScheduledImageSample(frame.pixel, format: self.format, timing: timing)
+            guard targetTimestamp > CACurrentMediaTime(),
+                  CMTimeCompare(timing.presentationTimeStamp, CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()), scheduledTimeline.hostAnchor)) > 0 else {
+                frameTrace.record("renderer_control", identity: frame.identity, fields: ["target": targetTimestamp, "time": CACurrentMediaTime(), "scheduledSkipped": 1, "targetLeadMs": (targetTimestamp-CACurrentMediaTime())*1000]); return
+            }
+            scheduledTimeline.commit(timing)
+            scheduledSampleCountForTests &+= 1; lastScheduledPTSForTests = timing.presentationTimeStamp
+#else
             let sample = try displayImmediateImageSample(frame.pixel, format: self.format)
+#endif
+#if TC_TIMED_PRESENTATION
+            let enqueueCA = CACurrentMediaTime(), enqueueHost = CMClockGetTime(CMClockGetHostTimeClock())
+#endif
             renderer.enqueue(sample)
-            frameTrace.record("renderer_enqueue", identity: frame.identity, fields: ["time": ProcessInfo.processInfo.systemUptime, "decodedMainToEnqueueMs": (ProcessInfo.processInfo.systemUptime-frame.decodedMainAt)*1000])
+            var enqueueFields = ["time": ProcessInfo.processInfo.systemUptime, "decodedMainToEnqueueMs": (ProcessInfo.processInfo.systemUptime-frame.decodedMainAt)*1000]
+#if TC_TIMED_PRESENTATION
+            enqueueFields["scheduled"] = 1
+            enqueueFields["scheduledPTS"] = timing.presentationTimeStamp.seconds
+            enqueueFields["scheduledDuration"] = timing.duration.seconds
+            enqueueFields["target"] = targetTimestamp
+            enqueueFields["targetHostTime"] = CMTimeAdd(scheduledTimeline.hostAnchor, timing.presentationTimeStamp).seconds
+            enqueueFields["enqueueHostTime"] = enqueueHost.seconds
+            enqueueFields["enqueueCA"] = enqueueCA
+            enqueueFields["enqueueEndCA"] = CACurrentMediaTime()
+            enqueueFields["targetLeadMs"] = (targetTimestamp-enqueueCA)*1000
+            enqueueFields["presentationGeneration"] = Double(scheduledTimeline.generation)
+            lastScheduledEnqueueForTests = enqueueFields
+#endif
+            frameTrace.record("renderer_enqueue", identity: frame.identity, fields: enqueueFields)
             rendererCadence.observe(ProcessInfo.processInfo.systemUptime)
             presentationStats.submitted &+= 1
             updateCursorOverlay()
@@ -909,6 +1165,116 @@ struct DisplayViewerStartup {
             logCadence()
         } catch { close() }
     }
+#if TC_DEADLINE_PRESENTATION
+    /// Uses receiver-local host PTS directly, per AVSampleBufferDisplayLayer's nil
+    /// controlTimebase contract. AppKit ownership stays on main. Already queued
+    /// samples can survive a short main stall; main itself is not made realtime.
+    private func drainDeadlinePresentation() {
+        guard !closing, startup.mayPresentVideo, let layer = surface?.videoLayer,
+              #available(macOS 14.0, *) else { return }
+        guard maySubmitPresentation?() ?? true else { close(); return }
+        let renderer = layer.sampleBufferRenderer
+        guard renderer.status != .failed else { close(); return }
+        // Retirement is clock accounting, not a readiness or scanout result.
+        // Do it even when the renderer is backpressured to avoid stale wakes.
+        _ = deadlinePlan.nextTarget(now: CACurrentMediaTime())
+        for _ in 0..<2 {
+            guard !deadlineFrames.isEmpty else { break }
+            guard renderer.isReadyForMoreMediaData else {
+                presentationStats.readinessDeferrals &+= 1
+                deadlineWake?.cancel(); deadlineWake = nil; deadlineWakeAt = nil
+                deadlineWakeEpoch &+= 1
+                requestRendererReadiness(renderer); return
+            }
+            let now = CACurrentMediaTime()
+            guard let target = deadlinePlan.nextTarget(now: now) else { break }
+            // Validate the slot before removing a frame. Never backdate, duplicate
+            // an image, or feed unbounded future PTS to a ready renderer.
+            guard maySubmitPresentation?() ?? true else { close(); return }
+            let frame = deadlineFrames[0]
+            do {
+                let sample = try displayDeadlineImageSample(frame.pixel, format: format, target: target)
+                let enqueueCA = CACurrentMediaTime()
+                guard let period = deadlinePlan.period, target-enqueueCA >= period else {
+                    deadlineLateSkips &+= 1; break
+                }
+                guard deadlinePlan.commit(target: target, now: enqueueCA) else { break }
+                deadlineFrames.removeFirst()
+                renderer.enqueue(sample)
+                let end = CACurrentMediaTime()
+                deadlineMaximumFutureCount = max(deadlineMaximumFutureCount, deadlinePlan.futureCount)
+                deadlineLastEnqueue = ["target": target, "enqueueCA": enqueueCA, "enqueueEndCA": end,
+                    "targetEndLeadMs": (target-end)*1000, "future": Double(deadlinePlan.futureCount)]
+                deadlineMinimumLeadMs = min(deadlineMinimumLeadMs, (target-end)*1000)
+                presentationStats.submitted &+= 1
+                rendererCadence.observe(ProcessInfo.processInfo.systemUptime)
+                frameTrace.record("renderer_enqueue", identity: frame.identity, fields: [
+                    "time": ProcessInfo.processInfo.systemUptime,
+                    "decodedMainToEnqueueMs": (ProcessInfo.processInfo.systemUptime-frame.decodedMainAt)*1000,
+                    "scheduled": 1, "scheduledPTS": target, "target": target,
+                    "enqueueCA": enqueueCA, "enqueueEndCA": end,
+                    "targetLeadMs": (target-enqueueCA)*1000,
+                    "targetEndLeadMs": (target-end)*1000,
+                    "future": Double(deadlinePlan.futureCount), "waiting": Double(deadlineFrames.count)])
+                updateCursorOverlay(); logCadence()
+            } catch { close(); return }
+        }
+        armDeadlineWake()
+    }
+    private func armDeadlineWake() {
+        let now = CACurrentMediaTime()
+        guard !closing, let at = deadlinePlan.nextRetirement,
+              let delay = DisplayDeadlinePlan.wakeDelay(now: now, retirement: at,
+                hasWaiting: !deadlineFrames.isEmpty, waitingForReadiness: readinessRequested) else { return }
+        if let previous = deadlineWakeAt, previous <= at { return }
+        deadlineWake?.cancel()
+        let token = pacingGeneration
+        deadlineWakeEpoch &+= 1
+        let wakeEpoch = deadlineWakeEpoch
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self, !self.closing, self.pacingGeneration == token, self.deadlineWakeEpoch == wakeEpoch else { return }
+                self.deadlineWake = nil; self.deadlineWakeAt = nil
+                self.drainDeadlinePresentation()
+            }
+        }
+        deadlineWake = work; deadlineWakeAt = at
+        DispatchQueue.main.asyncAfter(deadline: .now()+delay, execute: work)
+    }
+#endif
+#if TC_IMMEDIATE_PRESENTATION
+    /// Decode arrival and renderer readiness submit immediately. The display
+    /// link remains only as a diagnostic clock; it never gates submission.
+    private func drainImmediatePresentation(_ layer: AVSampleBufferDisplayLayer) {
+        guard #available(macOS 14.0, *), let frame = immediatePending else { return }
+        let renderer = layer.sampleBufferRenderer
+        guard renderer.status != .failed else {
+            frameTrace.record("renderer_failure", fields: ["status": Double(renderer.status.rawValue)])
+            close(); return
+        }
+        guard renderer.isReadyForMoreMediaData else {
+            presentationStats.readinessDeferrals &+= 1
+            requestRendererReadiness(renderer); return
+        }
+        stopReadiness(ready: true)
+        immediatePending = nil
+        let started = ProcessInfo.processInfo.systemUptime
+        do {
+            let sample = try displayImmediateImageSample(frame.pixel, format: self.format)
+            renderer.enqueue(sample)
+            let now = ProcessInfo.processInfo.systemUptime
+            frameTrace.record("renderer_enqueue", identity: frame.identity, fields: [
+                "time": now, "decodedMainToEnqueueMs": (now-frame.decodedMainAt)*1000, "immediate": 1])
+            rendererCadence.observe(now)
+            presentationStats.submitted &+= 1
+            updateCursorOverlay()
+            let elapsed = (ProcessInfo.processInfo.systemUptime - started) * 1000
+            presentationStats.totalEnqueueMilliseconds += elapsed
+            presentationStats.maximumEnqueueMilliseconds = max(presentationStats.maximumEnqueueMilliseconds, elapsed)
+            logCadence()
+        } catch { close() }
+    }
+#endif
     @available(macOS 14.0, *) private func requestRendererReadiness(_ renderer: AVSampleBufferVideoRenderer) {
         guard !readinessRequested, !closing else { return }
         readinessRequested = true; readinessStartedAt = ProcessInfo.processInfo.systemUptime; readinessRegistrations &+= 1
@@ -959,8 +1325,50 @@ struct DisplayViewerStartup {
                     guard let self else { return }
                     self.rendererMetricsPending = false
                     guard !self.closing, self.pacingGeneration == generation else { return }
-                    self.rendererMetricsSample = sample
-                    self.frameTrace.record("renderer_metrics", fields: sample)
+                    var snapshot = sample
+#if TC_RENDERER_HEALTH
+                    // Native counters are sampled on their owner (main). Preserve
+                    // AV callback sampleTime separately; never conflate rates
+                    // across different observation times, even on the same host.
+                    snapshot["counterSampleTime"] = ProcessInfo.processInfo.systemUptime
+                    snapshot["generation"] = Double(self.pacingGeneration)
+                    snapshot["displayLinkTicks"] = Double(self.nativeDisplayLinkTicks)
+                    snapshot["submitted"] = Double(self.presentationStats.submitted)
+                    let pacing = self.pacedFrames.stats
+                    snapshot["pacerOffered"] = Double(pacing.offered)
+                    snapshot["pacerSelected"] = Double(pacing.selected)
+                    snapshot["pacerOverflow"] = Double(pacing.overflowReplaced)
+                    snapshot["pacerSuperseded"] = Double(pacing.superseded)
+                    snapshot["pacerEmpty"] = Double(pacing.emptyTicks)
+                    snapshot["pacerWaiting"] = Double(pacing.waitingTicks)
+                    snapshot["pacerInvalid"] = Double(pacing.invalidInputs)
+#if TC_IMMEDIATE_PRESENTATION
+                    snapshot["pacerOffered"] = Double(self.immediateOffered)
+                    snapshot["pacerSelected"] = Double(self.presentationStats.submitted)
+                    snapshot["pacerOverflow"] = Double(self.immediateReplaced)
+#endif
+#if TC_DEADLINE_PRESENTATION
+                    snapshot["pacerOffered"] = Double(self.deadlineOffered)
+                    snapshot["pacerSelected"] = Double(self.presentationStats.submitted)
+                    snapshot["pacerOverflow"] = Double(self.deadlineOverflow)
+                    snapshot["scheduledMode"] = 1
+                    snapshot["scheduledFuture"] = Double(self.deadlinePlan.futureCount)
+                    snapshot["scheduledLateSkips"] = Double(self.deadlineLateSkips)
+                    snapshot["scheduledMinLeadMs"] = self.deadlineMinimumLeadMs.isFinite ? self.deadlineMinimumLeadMs : 0
+#else
+                    snapshot["targetDuplicate"] = Double(pacing.duplicateTargetTicks)
+                    snapshot["targetExpired"] = Double(pacing.expiredTargetTicks)
+                    snapshot["targetLimited"] = Double(pacing.targetLimitedTicks)
+                    snapshot["pacerRateLimited"] = Double(pacing.rateLimitedTicks)
+#endif
+                    snapshot["targetGaps"] = Double(self.nativeTargetGaps)
+                    snapshot["readinessDeferrals"] = Double(self.presentationStats.readinessDeferrals)
+                    if let sequence = self.lastStreamSequence { snapshot["lastSourceSequence"] = Double(sequence) }
+#endif
+                    // Platform metrics must not poison a finite JSON record.
+                    snapshot = snapshot.filter { $0.value.isFinite }
+                    self.rendererMetricsSample = snapshot
+                    self.frameTrace.record("renderer_metrics", fields: snapshot)
                     if let total = sample["totalNumberOfFrames"], let dropped = sample["numberOfDroppedFrames"],
                        let corrupted = sample["numberOfCorruptedFrames"], let delay = sample["totalAccumulatedFrameDelay"] {
                         displayStageLog("Display renderer metrics: available=true total=\(total) dropped=\(dropped) corrupted=\(corrupted) accumulatedFrameDelaySeconds=\(delay) receiverSampleTime=\(sampledAt); rendererCountersNotPanel=true stable60Unproven=true")
@@ -973,11 +1381,18 @@ struct DisplayViewerStartup {
         return true
     }
     private func logCadence(force: Bool = false) {
+#if TC_NATIVE_VSYNC
+        let pacingPolicyDescription = "buffered display-target-slots no-wall-budget hardAgeCap=false pacingHoldNominalMs=0"
+#elseif TC_LATEST_DECODED
+        let pacingPolicyDescription = "latest-decoded hardAgeCap=false pacingHoldNominalMs=0"
+#else
+        let pacingPolicyDescription = "fifo25 catchUpAgeMs=25 hardAgeCap=false pacingHoldNominalMs=16.667"
+#endif
         let now = ProcessInfo.processInfo.systemUptime
         guard mainVideoCadence.count > 0, force || now-cadenceLoggedAt >= 2 else { return }
         cadenceLoggedAt = now
         if !force { requestRendererMetrics() }
-        displayStageLog("Display cadence viewer: encodedMain[\(mainVideoCadence.summary)] decodedMain[\(decodedMainCadence.summary)] rendererEnqueue[\(rendererCadence.summary)] sourceAdmission[\(sourceAdmissionTiming.summary)] sourceEncode[\(sourceEncodeTiming.summary)] sourceEncodeSequenceSkips=\(sourceSequenceSkips) latestDecodedReplaced=\(presentationStats.replacedDecoded) readinessDeferrals=\(presentationStats.readinessDeferrals) registrations=\(readinessRegistrations) callbacks=\(readinessCallbacks) cancelled=\(readinessCancelled) readinessWait[\(readinessWait.summary)] displayLink[\(displayLinkCadence.summary)] pacedPending=\(pacedFrames.pendingCount) pacing=\(pacedFrames.stats); pacingPolicy=fifo25 catchUpAgeMs=25 hardAgeCap=false pacingHoldNominalMs=16.667 contentMayBeIdle=true enqueueNotPanel=true final=\(force)")
+        displayStageLog("Display cadence viewer: encodedMain[\(mainVideoCadence.summary)] decodedMain[\(decodedMainCadence.summary)] rendererEnqueue[\(rendererCadence.summary)] sourceAdmission[\(sourceAdmissionTiming.summary)] sourceEncode[\(sourceEncodeTiming.summary)] sourceEncodeSequenceSkips=\(sourceSequenceSkips) latestDecodedReplaced=\(presentationStats.replacedDecoded) readinessDeferrals=\(presentationStats.readinessDeferrals) registrations=\(readinessRegistrations) callbacks=\(readinessCallbacks) cancelled=\(readinessCancelled) readinessWait[\(readinessWait.summary)] displayLink[\(displayLinkCadence.summary)] pacedPending=\(pacedFrames.pendingCount) pacing=\(pacedFrames.stats); pacingPolicy=\(pacingPolicyDescription) contentMayBeIdle=true enqueueNotPanel=true final=\(force)")
     }
     func acceptCursor(_ payload: Data) throws {
         let next = try DisplayCursorMetadata(payload)
@@ -996,9 +1411,10 @@ struct DisplayViewerStartup {
         let bounds = surface.bounds
         let scale = min(bounds.width / CGFloat(format.width), bounds.height / CGFloat(format.height))
         let width = CGFloat(format.width)*scale, height = CGFloat(format.height)*scale
-        let cursor: NSCursor
-        switch m.shape { case 1: cursor = .iBeam; case 2: cursor = .crosshair; case 3: cursor = .pointingHand; case 4: cursor = .closedHand; default: cursor = .arrow }
         if cursorGlyphs[m.shape] == nil {
+            // Cache hit avoids AppKit cursor lookup; image and hotspot unchanged.
+            let cursor: NSCursor
+            switch m.shape { case 1: cursor = .iBeam; case 2: cursor = .crosshair; case 3: cursor = .pointingHand; case 4: cursor = .closedHand; default: cursor = .arrow }
             var rect = CGRect(origin: .zero, size: cursor.image.size)
             guard let image = cursor.image.cgImage(forProposedRect: &rect, context: nil, hints: nil) else { cursorOverlay.isHidden = true; return }
             cursorGlyphs[m.shape] = (image, cursor.image.size, cursor.hotSpot)
@@ -1018,6 +1434,21 @@ struct DisplayViewerStartup {
         rendererMetricsSample = nil
         logCadence(force: true)
         pacedFrames.clear(); displayLinkCadence=DisplayCadenceStats()
+#if TC_IMMEDIATE_PRESENTATION
+        immediatePending = nil; immediateOffered = 0; immediateReplaced = 0
+#endif
+#if TC_DEADLINE_PRESENTATION
+        deadlineWake?.cancel(); deadlineWake = nil; deadlineWakeAt = nil
+        deadlineWakeEpoch &+= 1
+        deadlineFrames.removeAll(); deadlinePlan.reset()
+        deadlineOffered = 0; deadlineOverflow = 0; deadlineLateSkips = 0
+        deadlineMinimumLeadMs = .infinity
+        deadlineMaximumFutureCount = 0; deadlineLastEnqueue = nil
+#endif
+#if TC_RENDERER_HEALTH
+        nativeDisplayLinkTicks = 0; nativeTargetGaps = 0
+        nativePreviousTarget = nil; nativeTargetGeneration = nil
+#endif
         cursorExpiry?.cancel(); cursorExpiry = nil; cursorMetadata = nil; cursorOverlay.removeFromSuperlayer(); cursorGlyphs.removeAll()
         lastCursorSequence = nil; lastStreamSequence = nil; lastDecodedAt = 0
         mainVideoCadence = DisplayCadenceStats(); decodedMainCadence = DisplayCadenceStats(); rendererCadence = DisplayCadenceStats()
@@ -1025,9 +1456,11 @@ struct DisplayViewerStartup {
         cadenceLoggedAt = ProcessInfo.processInfo.systemUptime
         decoder?.clear(); decoder = nil; receivedFrameCount = 0
         presentationStats = DisplayPresentationStats()
+#if !TC_TIMED_PRESENTATION
         if #available(macOS 14.0, *), let layer = surface?.videoLayer {
             layer.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
         }
+#endif
     }
     func close() {
         guard !closing else { return }; onWillClose?(); closing = true

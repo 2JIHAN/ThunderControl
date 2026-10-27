@@ -345,7 +345,7 @@ static void Diag(const char *stage,uint64_t seq,uint64_t capture,const char *for
 static void DiagPeriodic(void){
   static uint64_t previous=0;uint64_t now=DiagUS();if(now-previous<2000000)return;previous=now;
   Diag("capture_aggregate",DiagNoSequence,0,"us=%llu callbacks=%llu complete=%llu idle=%llu blank=%llu other=%llu",DU(now),DU(atomic_load(&diagCallbacks)),DU(atomic_load(&diagComplete)),DU(atomic_load(&diagIdle)),DU(atomic_load(&diagBlank)),DU(atomic_load(&diagOther)));
-  Diag("capture_drop_aggregate",DiagNoSequence,0,"us=%llu status_drop=%llu replaced=%llu busy=%llu suspended=%llu no_pixel=%llu",DU(now),DU(atomic_load(&diagStatusDrops)),DU(atomic_load(&diagReplaced)),DU(atomic_load(&diagBusy)),DU(atomic_load(&diagSuspended)),DU(atomic_load(&diagNoPixel)));
+  Diag("capture_drop_aggregate",DiagNoSequence,0,"us=%llu status_drop=%llu replaced=%llu busy=%llu suspended=%llu no_pixel=%llu emitted=%u codec_dropped=%u in_flight=%u",DU(now),DU(atomic_load(&diagStatusDrops)),DU(atomic_load(&diagReplaced)),DU(atomic_load(&diagBusy)),DU(atomic_load(&diagSuspended)),DU(atomic_load(&diagNoPixel)),atomic_load(&emitted),atomic_load(&encoderDropped),atomic_load(&inFlight));
   Diag("capture_gap_aggregate",DiagNoSequence,0,"us=%llu gap_count=%llu gap_sum_us=%llu gap_max_us=%llu",DU(now),DU(atomic_exchange(&diagGapCount,0)),DU(atomic_exchange(&diagGapSumUS,0)),DU(atomic_exchange(&diagGapMaxUS,0)));
   Diag("diagnostics_aggregate",DiagNoSequence,0,"us=%llu eagain=%llu truncated=%llu partial=%llu failed=%llu",DU(now),DU(atomic_load(&diagEagain)),DU(atomic_load(&diagTruncated)),DU(atomic_load(&diagPartial)),DU(atomic_load(&diagFailed)));
 }
@@ -780,7 +780,7 @@ static void InitEncoder(void){
   fprintf(stderr,"Encoder: hardwareRequired=yes lowLatencyRateControl=%s maxFrameDelayZero=%s speedPriority=%s targetFPS=%d legacyConfiguration=%s\n",lowLatencyRateControl?"accepted":"fallback/not-requested",maxDelayZero?"verified":legacyEncoder?"not-requested":"unsupported",speedPriority?"verified":"unsupported/not-requested",targetFPS,legacyEncoder?"yes":"no");
 }
 static void SubmitAt(CVPixelBufferRef pixel,CMTime pts,double capturedAt){
-  Guard();
+  uint64_t diagGuardStartUS=DiagUS();Guard();uint64_t diagGuardUS=DiagUS()-diagGuardStartUS; // observation only
   // Bounded transient: drop BEFORE encode when owned proof is not fresh. Does
   // not touch encoded reference frames already queued; never leaks a physical
   // display frame because the SCStream filter is identity-bound to ownedID.
@@ -792,7 +792,7 @@ static void SubmitAt(CVPixelBufferRef pixel,CMTime pts,double capturedAt){
   *ticket=(EncodeTicket){.started=Now(),.capturedAt=capturedAt,.sequence=submittedSequence++,.captureSequence=(uint64_t)pts.value,.diagOrdinal=diagSourceOrdinal,.diagCapturedUS=diagSourceUS,.diagAdmissionUS=DiagUS()};VTEncodeInfoFlags flags=0;
   // Callback may synchronously free ticket: keep only a value copy for tracing.
   EncodeTicket diagnostic=*ticket;
-  Diag("encoder_admission",diagnostic.sequence,diagnostic.diagOrdinal,"us=%llu capture_us=%llu in_flight=%u slots=%u",DU(diagnostic.diagAdmissionUS),DU(diagnostic.diagCapturedUS),atomic_load(&inFlight),encodingSlots);
+  Diag("encoder_admission",diagnostic.sequence,diagnostic.diagOrdinal,"us=%llu capture_us=%llu in_flight=%u slots=%u guard_us=%llu submit_entry_us=%llu",DU(diagnostic.diagAdmissionUS),DU(diagnostic.diagCapturedUS),atomic_load(&inFlight),encodingSlots,DU(diagGuardUS),DU(diagGuardStartUS));
   Diag("encode_call_start",diagnostic.sequence,diagnostic.diagOrdinal,"us=%llu",DU(DiagUS()));
   OSStatus diagnosticStatus=VTCompressionSessionEncodeFrame(encoder,pixel,pts,CMTimeMake(1,targetFPS),NULL,ticket,&flags);
   Diag("encode_call_end",diagnostic.sequence,diagnostic.diagOrdinal,"us=%llu status=%u flags=%u",DU(DiagUS()),(unsigned)diagnosticStatus,(unsigned)flags);
@@ -816,6 +816,12 @@ static void OfferCaptureAt(CVPixelBufferRef pixel,CMTime pts,double capturedAt){
   latestCapture=CVPixelBufferRetain(pixel);latestCapturePTS=pts;latestCaptureAt=capturedAt;DrainCapture();
 }
 static void OfferCapture(CVPixelBufferRef pixel,CMTime pts){OfferCaptureAt(pixel,pts,Now());}
+// Observation-only SCStream frame metadata helpers (pure; no capture/pixel access).
+// display_avail=0 means DisplayTime absent/not NSNumber (ticks reported as 0).
+// dirty_count=-1 means DirtyRects absent/not NSArray. raw_status=-1 means absent.
+static BOOL DiagDisplayTicks(NSDictionary *info,uint64_t *ticks){id v=info[SCStreamFrameInfoDisplayTime];if(![v isKindOfClass:[NSNumber class]]){*ticks=0;return NO;}*ticks=[(NSNumber*)v unsignedLongLongValue];return YES;}
+static long long DiagDirtyCount(NSDictionary *info){id v=info[SCStreamFrameInfoDirtyRects];return [v isKindOfClass:[NSArray class]]?(long long)[(NSArray*)v count]:-1;}
+static long long DiagRawStatus(NSDictionary *info){id v=info[SCStreamFrameInfoStatus];return [v isKindOfClass:[NSNumber class]]?[(NSNumber*)v longLongValue]:-1;}
 @interface FrameSink:NSObject<SCStreamOutput,SCStreamDelegate>
 @property int64_t sequence;
 @end
@@ -823,16 +829,18 @@ static void OfferCapture(CVPixelBufferRef pixel,CMTime pts){OfferCaptureAt(pixel
 -(void)stream:(SCStream*)stream didStopWithError:(NSError*)error{(void)stream;(void)error;Fail("capture stopped");}
 -(void)stream:(SCStream*)stream didOutputSampleBuffer:(CMSampleBufferRef)sample ofType:(SCStreamOutputType)type{
   (void)stream;@autoreleasepool {
+    uint64_t diagEntryUS=DiagUS();
     FastGuard();
-    uint64_t ordinal=atomic_fetch_add(&diagCallbacks,1)+1,callbackUS=DiagUS();
+    uint64_t ordinal=atomic_fetch_add(&diagCallbacks,1)+1,callbackUS=DiagUS();uint64_t diagFastGuardUS=callbackUS-diagEntryUS;
     static uint64_t previousUS=0;uint64_t gap=previousUS?callbackUS-previousUS:0;previousUS=callbackUS;
     if(gap){atomic_fetch_add(&diagGapCount,1);atomic_fetch_add(&diagGapSumUS,gap);uint64_t maximum=atomic_load(&diagGapMaxUS);if(gap>maximum)(void)atomic_compare_exchange_strong(&diagGapMaxUS,&maximum,gap); }
-    if(type!=SCStreamOutputTypeScreen||!CMSampleBufferIsValid(sample)){atomic_fetch_add(&diagOther,1);atomic_fetch_add(&diagStatusDrops,1);Diag("capture_callback",DiagNoSequence,ordinal,"us=%llu gap_us=%llu status_class=3",DU(callbackUS),DU(gap));return;}
+    if(type!=SCStreamOutputTypeScreen||!CMSampleBufferIsValid(sample)){atomic_fetch_add(&diagOther,1);atomic_fetch_add(&diagStatusDrops,1);Diag("capture_callback",DiagNoSequence,ordinal,"us=%llu gap_us=%llu status_class=3 entry_us=%llu fastguard_us=%llu",DU(callbackUS),DU(gap),DU(diagEntryUS),DU(diagFastGuardUS));return;}
     CFArrayRef a=CMSampleBufferGetSampleAttachmentsArray(sample,false);
     NSDictionary *info=[(__bridge NSArray*)a firstObject];NSNumber *status=info[SCStreamFrameInfoStatus];
     unsigned statusClass=!status?3:status.integerValue==SCFrameStatusComplete?0:status.integerValue==SCFrameStatusIdle?1:status.integerValue==SCFrameStatusBlank?2:3;
     atomic_fetch_add(statusClass==0?&diagComplete:statusClass==1?&diagIdle:statusClass==2?&diagBlank:&diagOther,1);
-    Diag("capture_callback",DiagNoSequence,ordinal,"us=%llu gap_us=%llu status_class=%u",DU(callbackUS),DU(gap),statusClass);
+    {CMTime diagPTS=CMSampleBufferGetPresentationTimeStamp(sample);BOOL ptsOK=CMTIME_IS_VALID(diagPTS);uint64_t ticks=0;BOOL ticksOK=DiagDisplayTicks(info,&ticks);
+    Diag("capture_callback",DiagNoSequence,ordinal,"us=%llu gap_us=%llu status_class=%u raw_status=%lld pts_ok=%u pts_value=%lld pts_scale=%d display_avail=%u display_ticks=%llu dirty_count=%lld entry_us=%llu fastguard_us=%llu",DU(callbackUS),DU(gap),statusClass,DiagRawStatus(info),ptsOK?1u:0u,ptsOK?(long long)diagPTS.value:0LL,ptsOK?(int)diagPTS.timescale:0,ticksOK?1u:0u,DU(ticks),DiagDirtyCount(info),DU(diagEntryUS),DU(diagFastGuardUS));}
     if(!status||status.integerValue!=SCFrameStatusComplete){atomic_fetch_add(&diagStatusDrops,1);return;}
     diagSourceOrdinal=ordinal;diagSourceUS=callbackUS;
     CVPixelBufferRef pixel=CMSampleBufferGetImageBuffer(sample);if(pixel)OfferCapture(pixel,CMTimeMake(self.sequence++,targetFPS));
@@ -980,7 +988,7 @@ static int Synthetic(void){
   for(int n=0;n<8;n++){@autoreleasepool {
     CVPixelBufferRef pixel=PatternPixel((unsigned)n);
     double deadline=Now()+3;while(atomic_load(&inFlight)>=encodingSlots){if(Now()>deadline)Fail("encoder timeout");usleep(200);}
-    Submit(pixel,CMTimeMake(n,60));CVPixelBufferRelease(pixel);
+    Submit(pixel,CMTimeMake(n,targetFPS));CVPixelBufferRelease(pixel);
   }}
   double finalDeadline=Now()+3;while(atomic_load(&inFlight)){if(Now()>finalDeadline)Fail("encoder final timeout");usleep(200);}
   if(atomic_load(&emitted)!=8)Fail("synthetic frame count");VTCompressionSessionInvalidate(encoder);CFRelease(encoder);
@@ -1583,6 +1591,12 @@ static int SelfTest(void){
     CHECK(!ReferenceLimitVerified(noErr,noErr,(__bridge CFTypeRef)@8),"low-latency-ref-eight-falls-back");
     CHECK(!ReferenceLimitVerified(-12900,noErr,(__bridge CFTypeRef)@1),"low-latency-rejected-set-falls-back");
     CHECK(!ReferenceLimitVerified(noErr,-12900,NULL),"low-latency-missing-readback-falls-back");
+    {NSDictionary *d=@{SCStreamFrameInfoStatus:@1,SCStreamFrameInfoDisplayTime:@123456789012ULL,SCStreamFrameInfoDirtyRects:@[@1,@2]},*e=@{};uint64_t t=7;
+     CHECK(DiagRawStatus(d)==1&&DiagRawStatus(e)==-1,"diag-meta-raw-status");
+     CHECK(DiagDisplayTicks(d,&t)&&t==123456789012ULL&&!DiagDisplayTicks(e,&t)&&t==0,"diag-meta-display-ticks");
+     CHECK(DiagDirtyCount(d)==2&&DiagDirtyCount(e)==-1,"diag-meta-dirty-count");
+     char line[_POSIX_PIPE_BUF];int n=snprintf(line,sizeof(line),"TC_DIAG stage=capture_callback capture=%llu us=%llu gap_us=%llu status_class=%u raw_status=%lld pts_ok=%u pts_value=%lld pts_scale=%d display_avail=%u display_ticks=%llu dirty_count=%lld entry_us=%llu fastguard_us=%llu\n",DU(UINT64_MAX),DU(UINT64_MAX),DU(UINT64_MAX),3u,-1LL,1u,-9223372036854775807LL,-1000000000,1u,DU(UINT64_MAX),-1LL,DU(UINT64_MAX),DU(UINT64_MAX));
+     CHECK(n>0&&n<(int)sizeof(line)-1&&n<=512,"diag-meta-worst-case-line-fits");}
   }
   #undef CHECK
   fprintf(stderr,"%s selftest bounded-helper state machine + preservation policy (offline, no display mutation)\n",failures?"FAIL":"PASS");
@@ -1620,7 +1634,7 @@ int main(int argc,const char **argv){@autoreleasepool {
   encodingSlots=negotiatedFormat->pixelScale==2?2:1;
   if(!strcmp(argv[1],"--benchmark-capture-old")||!strcmp(argv[1],"--benchmark-capture-latest"))encodingSlots=1;
   captureBenchmark=nativeYUV||!strcmp(argv[1],"--benchmark-pipeline")||!strcmp(argv[1],"--benchmark-capture-old")||!strcmp(argv[1],"--benchmark-capture-latest");captureLegacy=!strcmp(argv[1],"--benchmark-capture-old");
-  benchmarkSpeed=!strcmp(argv[1],"--benchmark-speed");experimentalRateControl=!strcmp(argv[1],"--benchmark-ratecontrol");benchmark=captureBenchmark||benchmarkSpeed||experimentalRateControl||!strcmp(argv[1],"--benchmark-old")||!strcmp(argv[1],"--benchmark-new");legacyEncoder=!strcmp(argv[1],"--benchmark-old");targetFPS=legacyEncoder?30:60;
+  benchmarkSpeed=!strcmp(argv[1],"--benchmark-speed");experimentalRateControl=!strcmp(argv[1],"--benchmark-ratecontrol");benchmark=captureBenchmark||benchmarkSpeed||experimentalRateControl||!strcmp(argv[1],"--benchmark-old")||!strcmp(argv[1],"--benchmark-new");legacyEncoder=!strcmp(argv[1],"--benchmark-old");targetFPS=legacyEncoder?30:60;if(LiveVideoMode(argv[1])&&StreamWidth==1512&&StreamHeight==950&&negotiatedFormat->pixelScale==2)targetFPS=72; // isolated 1.2x source-supply trial; viewer remains 60Hz
   tuning=!strcmp(argv[1],"--benchmark-tune")||!strcmp(argv[1],"--synthetic-tune");
   if(tuning){
     const char *profile=getenv("TC_TUNE_PROFILE");if(!profile)profile="baseline";
@@ -1674,7 +1688,7 @@ int main(int argc,const char **argv){@autoreleasepool {
   if(!modeCount)Fail("virtual mode plan unavailable");
   NSMutableArray *virtualModes=[NSMutableArray arrayWithCapacity:modeCount];
   for(unsigned i=0;i<modeCount;i++){
-    CGVirtualDisplayMode *mode=[[NSClassFromString(@"CGVirtualDisplayMode") alloc]initWithWidth:plannedModes[i].width height:plannedModes[i].height refreshRate:60];
+    CGVirtualDisplayMode *mode=[[NSClassFromString(@"CGVirtualDisplayMode") alloc]initWithWidth:plannedModes[i].width height:plannedModes[i].height refreshRate:targetFPS];
     if(!mode)Fail("virtual mode unavailable");[virtualModes addObject:mode];
   }
   settings.modes=virtualModes;
@@ -1811,6 +1825,8 @@ int main(int argc,const char **argv){@autoreleasepool {
   if(!postFail && !BaselinePreserved())postFail="physical baseline preservation";
   ownedInitialMode=CGDisplayCopyDisplayMode(ownedID);
   if(!postFail && !ownedInitialMode)postFail="owned mode unavailable";
+  if(!postFail && fabs(CGDisplayModeGetRefreshRate(ownedInitialMode)-targetFPS)>0.01)postFail="owned refresh rate not accepted";
+  if(!postFail)fprintf(stderr,"Source supply trial: ownedRefreshHz=%.3f encoderExpectedFPS=%d captureRequestedFPS=%d receiverTargetUnchanged=60 repeatInsertion=no\n",CGDisplayModeGetRefreshRate(ownedInitialMode),targetFPS,targetFPS*2);
   if(!postFail && !OwnedSafe())postFail="owned display verification";
   if(postFail){
     if(ownedInitialMode){CGDisplayModeRelease(ownedInitialMode);ownedInitialMode=NULL;}

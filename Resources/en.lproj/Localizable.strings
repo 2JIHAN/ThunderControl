@@ -258,3 +258,6 @@
 "Open iCloud Diagnostics" = "Open iCloud Diagnostics";
 "Development diagnostics start after the screen connection is authenticated." = "Development diagnostics start after the screen connection is authenticated.";
 "iCloud diagnostics are not available yet. Local diagnostics remain available; cloud copying retries automatically." = "iCloud diagnostics are not available yet. Local diagnostics remain available; cloud copying retries automatically.";
+
+"Screen safety sampling is still busy. Reconnect to continue." = "Screen safety sampling is still busy. Reconnect to continue.";
+"Quit paused: screen sharing cleanup did not finish. Choose Quit again after it finishes." = "Quit paused: screen sharing cleanup did not finish. Choose Quit again after it finishes.";

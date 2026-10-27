@@ -63,6 +63,56 @@ import Darwin
             }
             throw FixtureError.acceptanceTimedOut("missing stale rejection: " + label)
         }
+        // Manifest summaries use only the existing async renderer_metrics path.
+        check(DevelopmentDiagnostics.receiverPerformanceFields.count == 24 && DevelopmentDiagnostics.receiverPerformanceFields.contains("targetGaps") && !DevelopmentDiagnostics.receiverPerformanceFields.contains("pending") && DevelopmentDiagnostics.receiverPerformanceFields.allSatisfy { $0.utf8.count <= 32 }, "performance numeric schema respects event bounds")
+        let performanceRoot = temp.appendingPathComponent("receiver-performance")
+        let performance = DevelopmentDiagnostics(root: performanceRoot, diskBytes: 0)
+        performance.start(role: "viewer", stream: stream); try performance.flushForTests()
+        let performanceSession = performance.snapshotForTests()["session"] as? String
+        for index in 0..<140 {
+            try accepted(performance, "performance sample") {
+                performance.record(stage: "renderer_metrics", sequence: UInt64(index), fields: ["sampleTime": Double(index), "counterSampleTime": Double(index)+0.001, "displayLinkTicks": Double(index*60), "submitted": Double(index*59), "lastSourceSequence": Double(index), "targetGaps": Double(index/3), "privateHostname": 7], stream: stream)
+            }
+            try performance.flushForTests()
+        }
+        var performanceStatus = performance.snapshotForTests()
+        var ring = performanceStatus["receiverPerformance"] as? [[String: Any]] ?? []
+        check(ring.count == 128, "receiver performance hard bound 128")
+        check((ring.first?["fields"] as? [String: Double])?["sampleTime"] == 12 && (ring.last?["fields"] as? [String: Double])?["sampleTime"] == 139, "receiver performance retains newest ordered samples")
+        check(ring.allSatisfy { $0["stream"] as? String == stream && $0["session"] as? String == performanceSession }, "performance carries exact stream and session")
+        check(ring.allSatisfy { ($0["fields"] as? [String: Double])?["privateHostname"] == nil }, "performance explicit privacy allowlist")
+        check((ring.last?["fields"] as? [String: Double])?["targetGaps"] == 46, "native target gap counter retained in performance schema")
+        performance.start(role: "viewer", stream: stream); try performance.flushForTests()
+        check((performance.snapshotForTests()["receiverPerformance"] as? [Any])?.count == 128, "idempotent start preserves performance history")
+        check(ring.allSatisfy { ($0["fields"] as? [String: Double])?.values.allSatisfy { $0.isFinite } == true }, "performance fields remain finite")
+        check(try chunks(performanceRoot).isEmpty, "performance survives ordinary chunk retention")
+        let performanceManifest = try JSONSerialization.jsonObject(with: Data(contentsOf: own(performanceRoot).appendingPathComponent("manifest.json"))) as! [String: Any]
+        check((performanceManifest["receiverPerformance"] as? [Any])?.count == 128, "performance ring included in existing manifest")
+        performance.record(stage: "renderer_metrics", fields: ["sampleTime": .nan], stream: stream)
+        performance.record(stage: "renderer_metrics", fields: ["sampleTime": 140, "submitted": .infinity], stream: stream)
+        try accepted(performance, "unrelated stage") { performance.record(stage: "capture", fields: ["sampleTime": 141], stream: stream) }
+        try accepted(performance, "missing sample time") { performance.record(stage: "renderer_metrics", fields: ["submitted": 999], stream: stream) }
+        try performance.flushForTests()
+        check((performance.snapshotForTests()["receiverPerformance"] as? [Any])?.count == 128, "invalid/missing-time/nonrenderer rows do not disturb ring")
+        check((performance.snapshotForTests()["nonfinite"] as? Int64 ?? 0) == 2, "performance uses existing nonfinite rejection")
+        performance.start(role: "viewer", stream: second); try performance.flushForTests()
+        check((performance.snapshotForTests()["receiverPerformance"] as? [Any])?.isEmpty == true, "new stream immediately has empty summary")
+        try rejectedAsStale(performance, "old renderer context") { performance.record(stage: "renderer_metrics", fields: ["sampleTime": 142], stream: stream) }
+        try accepted(performance, "new renderer context") { performance.record(stage: "renderer_metrics", fields: ["sampleTime": 143, "submitted": 1], stream: second) }
+        try performance.flushForTests()
+        ring = performance.snapshotForTests()["receiverPerformance"] as? [[String: Any]] ?? []
+        check(ring.count == 1 && ring[0]["stream"] as? String == second && ring[0]["session"] as? String != performanceSession, "new ring never carries previous stream identity")
+        performance.stop(stream: second); try performance.flushForTests()
+        performance.start(role: "viewer", stream: second); try performance.flushForTests()
+        check((performance.snapshotForTests()["receiverPerformance"] as? [Any])?.isEmpty == true, "same stream new session resets ring")
+        performance.start(role: "source", stream: stream)
+        try accepted(performance, "source metrics ignored") { performance.record(stage: "renderer_metrics", fields: ["sampleTime": 145], stream: stream) }
+        try performance.flushForTests()
+        check((performance.snapshotForTests()["receiverPerformance"] as? [Any])?.isEmpty == true, "source cannot populate receiver summary")
+        performanceStatus = performance.snapshotForTests()
+        check(performanceStatus["accepted"] as? Int64 == 144 && performanceStatus["overflow"] as? Int64 == 0, "ring does not alter event acceptance accounting")
+        check(performance.shutdown(), "performance recorder shutdown")
+
         let root = temp.appendingPathComponent("privacy")
         let recorder = DevelopmentDiagnostics(root: root)
         check(!fm.fileExists(atPath: root.path), "init has no disk effects")

@@ -53,7 +53,7 @@ func runDevelopmentFrameTraceTests() -> Int {
     check(events.allSatisfy { $0.stream == "old-session" }, "old callback stream remains captured")
 
     var discards: [(UInt64?, DisplayFrameDiscardReason)] = []
-    var pacer = DisplayFramePacer<DisplayTracedFrame>(onDiscard: { frame, reason in
+    var pacer = DisplayFramePacer<DisplayTracedFrame>(selectionPolicy: .fifo25, onDiscard: { frame, reason in
         discards.append((frame.identity.sourceSequence, reason))
         trace.record("pacer_discard", identity: frame.identity, fields: ["reason": Double(reason.rawValue)])
     })
@@ -79,6 +79,10 @@ func runDevelopmentFrameTraceTests() -> Int {
     check(older?.identity == a && older?.decodedMainAt == 1 && pacer.pendingCount == 1 &&
           pacer.stats.earlySelections == 1, "fallback identity is actual older selection, not latest frame")
     pacer.clear()
+    var latestPacer = DisplayFramePacer<DisplayTracedFrame>(selectionPolicy: .latest)
+    latestPacer.offer(frameA, at: 5); latestPacer.offer(frameB, at: 5.001)
+    let newest = latestPacer.take(now: 5.002, targetTimestamp: 5.002)
+    check(newest?.identity == frameB.identity && newest?.decodedMainAt == frameB.decodedMainAt && latestPacer.pendingCount == 0 && latestPacer.stats.superseded == 1, "latest policy trace identity is newest selected decoded frame")
     let freshIdentity = DisplayFrameIdentity(sourceSequence: 1000, cookie: 0, generation: 8)
     let freshTrace = DisplayFrameTrace(stream: "new-session", hook: { events.append(($0, $1, $2, $3)) })
     let fresh = DisplayDecodeMailbox(format: format, trace: freshTrace, generation: 8,

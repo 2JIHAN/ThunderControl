@@ -162,12 +162,20 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
         try displayLiveRequire(closed == 0, "viewer unexpectedly closed")
         try viewer.accept(packet)
         try await pump(until: { viewer.receivedFrameCount == index + 1 && viewer.presentationStats.submitted == UInt64(index + 1) }, maximum: 1,stage:"decode and submit frame \(index+1)")
+#if TC_TIMED_PRESENTATION
+        print("Scheduled fixture enqueue receipt frame=\(index+1) evidence=\(viewer.lastScheduledEnqueueForTests ?? [:]); enqueueNotDisplayed=true")
+#endif
     }
     let dummy = NSWindow(contentRect: NSRect(x: 20, y: 20, width: 260, height: 100), styleMask: [.titled, .closable], backing: .buffered, defer: false)
     dummy.title = "ThunderControl focus-only test"
     dummy.isReleasedWhenClosed = false
     defer { dummy.close() }
     let gainsBefore = gained, lossesBefore = lost
+#if TC_TIMED_PRESENTATION
+    // Do not intentionally mutate focus while the previous sample's promised
+    // PTS/duration is still future. Clock elapsed is not display confirmation.
+    try await pump(until: { viewer.targetElapsed }, maximum: 1, stage: "frame seven target plus duration elapsed before focus loss")
+#endif
     dummy.makeKeyAndOrderFront(nil)
     try await pump(until: { dummy.isKeyWindow && lost > lossesBefore }, maximum: 2,stage:"focus loss")
     try displayLiveRequire(closed == 0 && viewer.receivedFrameCount == 7 && viewer.presentationStats.submitted == 7 && window.isVisible, "focus loss must preserve viewer/video")
@@ -175,6 +183,10 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     try viewer.accept(frames[7])
     try await pump(until:{viewer.receivedFrameCount==8 && viewer.presentationStats.submitted==8},maximum:1,stage:"new video while viewer lacks key focus")
     try displayLiveRequire(dummy.isKeyWindow,"video arrival must not steal keyboard focus")
+#if TC_TIMED_PRESENTATION
+    print("Scheduled fixture enqueue receipt frame=8 evidence=\(viewer.lastScheduledEnqueueForTests ?? [:]); enqueueNotDisplayed=true")
+    try await pump(until: { viewer.targetElapsed }, maximum: 1, stage: "frame eight target plus duration elapsed before focus return")
+#endif
     window.makeKeyAndOrderFront(nil)
     try await pump(until: { window.isKeyWindow && gained > gainsBefore }
 , maximum: 2,stage:"focus return")
@@ -182,6 +194,14 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     try displayLiveRequire(closed == 0 && viewer.receivedFrameCount == 8 && viewer.presentationStats.submitted == 8, "focus return must preserve video")
     try displayLiveRequire(viewer.receivedCadenceCountForTests == 8 && viewer.submittedCadenceCountForTests == 8 && viewer.sourceEncodeSamplesForTests == 8, "all frame cadence points counted")
     try displayLiveRequire(viewer.pacingActiveForTests && viewer.pacingTicksForTests > 0 && viewer.pacingPendingForTests == 0, "actual display-link pacing active and decoded queue drained")
+#if TC_TIMED_PRESENTATION
+    try displayLiveRequire(viewer.hasPresentationTimebaseForTests && viewer.scheduledSampleCountForTests == 8 && viewer.lastScheduledPTSForTests.isNumeric && viewer.lastScheduledPTSForTests.seconds > 0, "host-clock timebase and eight scheduled sample PTS")
+#endif
+#if TC_DEADLINE_PRESENTATION
+    try displayLiveRequire(viewer.deadlineMaximumFutureForTests <= 2 && viewer.deadlineMaximumFutureForTests > 0, "bounded future slot commitments")
+    try displayLiveRequire(viewer.deadlineEndLeadForTests.isFinite && viewer.deadlineEndLeadForTests > 0, "every fixture enqueue ends before its host PTS")
+    print("PASS deadline enqueue receipts: maxFuture=\(viewer.deadlineMaximumFutureForTests) minimumEndLeadMs=\(viewer.deadlineEndLeadForTests) last=\(viewer.deadlineLastEnqueueForTests ?? [:]); not scanout")
+#endif
     let readinessBefore = viewer.readinessCallbacksForTests
     try displayLiveRequire(viewer.requestReadinessForTests(), "register actual native renderer readiness callback")
     try await pump(until:{viewer.readinessCallbacksForTests == readinessBefore+1 && !viewer.readinessRequestedForTests}, maximum:2, stage:"one-shot readiness callback with no pending pixel")
@@ -191,8 +211,13 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     if #available(macOS 14.4, *) {
         let metricsStartedAt = ProcessInfo.processInfo.systemUptime
         let metricsEnd = min(deadline, metricsStartedAt + 6)
+#if TC_TIMED_PRESENTATION || TC_DEADLINE_PRESENTATION || TC_IMMEDIATE_PRESENTATION
+        let minimumMetricTotal: Double = 8
+#else
+        let minimumMetricTotal: Double = 1
+#endif
         var lastMetricsRequestAt: Double?
-        while ((viewer.rendererMetricsForTests?["sampleTime"] ?? 0) < metricsStartedAt || (viewer.rendererMetricsForTests?["totalNumberOfFrames"] ?? 0) <= 0) && ProcessInfo.processInfo.systemUptime < metricsEnd {
+        while ((viewer.rendererMetricsForTests?["sampleTime"] ?? 0) < metricsStartedAt || (viewer.rendererMetricsForTests?["totalNumberOfFrames"] ?? 0) < minimumMetricTotal) && ProcessInfo.processInfo.systemUptime < metricsEnd {
             let requested = viewer.requestRendererMetricsForTests()
             if requested {
                 let requestedAt = ProcessInfo.processInfo.systemUptime
@@ -208,6 +233,9 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
             guard let value = sample[name] else { throw DisplayLiveUITestError.failed("renderer metric missing: " + name) }
             try displayLiveRequire(value.isFinite && value >= 0, "finite nonnegative renderer metric: " + name)
         }
+#if TC_TIMED_PRESENTATION || TC_DEADLINE_PRESENTATION || TC_IMMEDIATE_PRESENTATION
+        try displayLiveRequire(sample["totalNumberOfFrames"] == 8 && sample["numberOfDroppedFrames"] == 0, "scheduled fixture renderer total eight, dropped zero; not scanout proof")
+#endif
         // Only test the post-completion throttle while still inside the request
         // interval. A very delayed callback may legitimately finish after it.
         if let requestedAt = lastMetricsRequestAt, ProcessInfo.processInfo.systemUptime - requestedAt < 2 {
@@ -255,8 +283,14 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
         try displayLiveRequire(requested && viewer.rendererMetricsPendingForTests, "pending renderer metrics before close")
     }
     try displayLiveRequire(viewer.requestReadinessForTests(), "pending readiness before close")
+#if TC_TIMED_PRESENTATION
+    let retiredPresentationGeneration = viewer.presentationGenerationForTests
+#endif
     viewer.close()
     try displayLiveRequire(viewer.rendererMetricsForTests == nil, "close clears renderer metrics snapshot")
+#if TC_TIMED_PRESENTATION
+    try displayLiveRequire(!viewer.hasPresentationTimebaseForTests && viewer.scheduledSampleCountForTests == 0 && !viewer.lastScheduledPTSForTests.isValid && viewer.lastScheduledEnqueueForTests == nil && !viewer.targetElapsed, "close retires scheduled epoch and timebase")
+#endif
     try displayLiveRequire(!viewer.cursorVisibleForTests && !viewer.readinessRequestedForTests, "close clears cursor and renderer request")
     try displayLiveRequire(!viewer.pacingActiveForTests && viewer.pacingTicksForTests == 0 && viewer.pacingPendingForTests == 0, "close invalidates display link and clears paced frames")
     try displayLiveRequire(!ownershipFixture.sourceWindowOwnership.hasStableOwnership,"closed viewer cannot leave stale source ownership or activate HUD")
@@ -264,6 +298,16 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     try await pump(until:{ProcessInfo.processInfo.systemUptime >= closedSettle},maximum:0.5,stage:"closed readiness late callback")
     try displayLiveRequire(viewer.rendererMetricsForTests == nil, "late renderer metrics cannot resurrect closed snapshot")
     try displayLiveRequire(!viewer.readinessRequestedForTests && viewer.readinessCallbacksForTests == 0, "no callback resurrects closed viewer readiness counters")
+#if TC_TIMED_PRESENTATION
+    // Reuse the viewer object, not its old layer, decoder callbacks or epoch.
+    viewer.onClose = nil; viewer.onFocusLost = nil; viewer.onFocusGained = nil
+    viewer.startsFullScreen = false; viewer.show()
+    try displayLiveRequire(!viewer.hasPresentationTimebaseForTests && viewer.presentationGenerationForTests > retiredPresentationGeneration, "reopen starts with retired timebase generation")
+    try viewer.accept(frames[0])
+    try await pump(until: { viewer.presentationStats.submitted == 1 }, maximum: 1, stage: "fresh reopened scheduled sample")
+    try displayLiveRequire(viewer.hasPresentationTimebaseForTests && viewer.scheduledSampleCountForTests == 1 && viewer.lastScheduledPTSForTests.isNumeric && viewer.presentationGenerationForTests > retiredPresentationGeneration, "fresh timebase and scheduled PTS after reopen")
+    viewer.close()
+#endif
     print("PASS native viewer: activationPolicy=\(application.activationPolicy().rawValue) coordinator=true fullscreen=\(wasFullscreen) decoded=8 submitted=8 colorfulSamples=\(colorfulSamples) focusLossCallbacks=\(lost) focusGainCallbacks=\(gained) expectedClose=1 newFrameWhileUnfocused=true stampedFrames=true separateCursor=true cursorExpiry=true cadence=true readinessCallbackOneShot=true realDisplayLinkPacing=true; own-window generated-pattern screenshot only; no network, virtual display or input posting")
 }
 
@@ -289,6 +333,16 @@ func displayViewerStartupLifecycleTests() throws {
     try displayLiveRequire(startup.useWindowedFallback() && startup.mayPresentVideo, "native failure/entry timeout releases held video")
     startup.didEnterFullScreen()
     try displayLiveRequire(startup.phase == .fullScreen && startup.mayPresentVideo, "late native entry after fallback remains usable without second toggle")
+    startup.close(); startup.begin(fullScreen: true)
+    _ = startup.requestIfReady(windowReady: true)
+    try displayLiveRequire(startup.retryAfterRejection(maximumRetries: 2) && startup.phase == .waitingForWindow, "first AppKit rejection returns to waiting")
+    try displayLiveRequire(!startup.retryAfterRejection(maximumRetries: 2), "no retry unless a toggle is in flight")
+    _ = startup.requestIfReady(windowReady: true)
+    try displayLiveRequire(startup.retryAfterRejection(maximumRetries: 2), "second rejection retries")
+    _ = startup.requestIfReady(windowReady: true)
+    try displayLiveRequire(!startup.retryAfterRejection(maximumRetries: 2) && startup.useWindowedFallback(), "third rejection falls back to a usable window")
+    startup.begin(fullScreen: true)
+    try displayLiveRequire(startup.rejectedAttempts == 0, "new viewer resets rejection budget")
     startup.close(); startup.begin(fullScreen: false)
     try displayLiveRequire(startup.mayPresentVideo && !startup.isPending && !startup.requestIfReady(windowReady: true), "explicit windowed/reopened viewer needs no native transition")
     print("PASS viewer startup: readiness gate, one native request, confirmation, bounded usable fallback, late callbacks and reopen; no network/input")

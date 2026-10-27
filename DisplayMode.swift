@@ -73,6 +73,15 @@ struct OwnedDisplayMonitor {
   }
   var sharingSending:Bool? {active ? sending:nil}
   var sessionPermitted:(()->Bool)?
+  #if TC_FRESH_RECEIVER_SAFETY
+  var makeSafetyTicket:((UUID)->DisplaySafetyTicket?)?
+  var currentSafetyTicket:((DisplaySafetyTicket)->Bool)?
+  var sampledSessionPermitted:((FreshSessionSafetySample,DisplaySafetyTicket,Double)->Bool)?
+  private var safetyTicket:DisplaySafetyTicket?
+  private let periodicSafetyQueue=DispatchQueue(label:"ThunderControl.display.periodic-safety")
+  private var periodicSafetyPending=DisplaySafetyPending()
+  var periodicSafetySampler=FreshSessionSafetySampler()
+  #endif
   var inputBindingValid:(()->Bool)?
   var inputBindingConflicts:(()->Bool)?
   var prepareInputTransition:((@escaping PauseCompletion)->Void)?
@@ -103,6 +112,13 @@ struct OwnedDisplayMonitor {
     let token=epoch;sourceReady=false;transitionEngaged=false;transitionFailed=false;receivedFirstFrame=false;authenticatedAt=nil;networkRTT=nil;receivedVideo=0;lastReceivedVideo=0;started=ProcessInfo.processInfo.systemUptime;lastStatsAt=started
     let viewerTarget = sending ? nil : DisplayViewerTarget.read()
     let t=DisplayTransport();transport=t
+    #if TC_FRESH_RECEIVER_SAFETY
+    // Fixed immutable ticket is captured before transport start, not per packet.
+    guard let fixedSafetyTicket=makeSafetyTicket?(token),fixedSafetyTicket.displayEpoch==token else {
+      stop(message:TCText("Screen transmission stopped because the session's safety state changed."));throw Failure("Display safety ticket unavailable")
+    }
+    safetyTicket=fixedSafetyTicket
+    #endif
     t.onAuthenticated = {[weak self] format in
       guard let self,self.active,self.epoch==token else{return}
       guard self.inputBindingValid?()==true else{self.stop(message:TCText("Screen startup canceled because the authenticated input peer changed."));return}
@@ -119,6 +135,13 @@ struct OwnedDisplayMonitor {
         }
       } else {
         let v=DisplayViewer(format:format,targetScreen:viewerTarget?.screen,diagnosticStream:self.transport?.diagnosticStreamID);v.acceptsViewerInput=false
+#if TC_DEADLINE_PRESENTATION
+        v.maySubmitPresentation = { [weak owner = self, weak transport = t] in
+          guard let owner, let transport else { return false }
+          return owner.active && owner.epoch == token && owner.transport === transport &&
+            owner.safetyTicket == fixedSafetyTicket && owner.currentSafetyTicket?(fixedSafetyTicket) == true
+        }
+#endif
         v.onUserClose={[weak self] in self?.userStopped?()}
         v.onClose={[weak self] in guard let self,self.epoch==token else{return};self.stop()}
         v.onWillClose={[weak self] in self?.viewerOwnershipLost?()}
@@ -126,6 +149,36 @@ struct OwnedDisplayMonitor {
         self.viewer=v;v.show();self.report(TCText("Screen authentication complete. Using the existing MacBook → Mac mini input connection."))
       }
     }
+    #if TC_FRESH_RECEIVER_SAFETY
+    t.onPayload = {[weak self,weak t] data,sample in
+      guard let self,let t,self.active,self.epoch==token,self.transport === t,
+        self.safetyTicket==fixedSafetyTicket else{return}
+      let guardStartedAt=ProcessInfo.processInfo.systemUptime
+      let payloadSafe=self.sampledSessionPermitted?(sample,fixedSafetyTicket,guardStartedAt)==true
+      let guardFinishedAt=ProcessInfo.processInfo.systemUptime
+      let guardMs=(guardFinishedAt-guardStartedAt)*1000
+      // elapsedMs retains main guard duration meaning, not worker/query time.
+      // sampleToAcceptMs starts before the snapshot read and ends at acceptance gate.
+      if guardMs>=2 || sample.sampleWorkerMs>=2,let stream=t.diagnosticStreamID {
+        let sequence=data.first==6 ? (try? DisplayStreamFrameHeader(data))?.sequence:nil
+        DevelopmentDiagnostics.shared.record(stage:"receiver_guard_slow",sequence:sequence,fields:["kind":Double(data.first ?? 255),"elapsedMs":guardMs,"startedAt":guardStartedAt,"time":guardFinishedAt,"allowed":payloadSafe ? 1:0,"sampleWorkerMs":sample.sampleWorkerMs,"snapshotMs":sample.snapshotMs,"secureMs":sample.secureMs,"mainEvalMs":guardMs,"sampleToAcceptMs":(guardFinishedAt-sample.startedAt)*1000],stream:stream)
+      }
+      // Recheck epoch, transport and current latches immediately before both
+      // acceptance and an unsafe stop, so old completions cannot stop a new run.
+      guard self.active,self.epoch==token,self.transport === t,self.safetyTicket==fixedSafetyTicket else{return}
+      guard payloadSafe,self.currentSafetyTicket?(fixedSafetyTicket)==true,sample.valid(at:guardFinishedAt),guardFinishedAt>=guardStartedAt else {
+        self.stop(message:TCText("Screen transmission stopped because the session's safety state changed."));return
+      }
+      guard !sending else{self.stop(message:TCText("Received data not allowed on the video-only channel."));return}
+      if data.first==7 {
+        do {try self.viewer?.acceptCursor(data)} catch {self.stop(message:TCText("Invalid screen video frame."))};return
+      }
+      if data.first==2 || data.first==6 {
+        do {guard let viewer=self.viewer else{throw DisplayVideoError.decoderFailed};try viewer.accept(data,guardMilliseconds:guardMs);self.receivedFirstFrame=true;self.receivedVideo+=1}
+        catch{self.stop(message:TCText("Could not decode incoming video. This video error is separate from the input connection."))}
+      }
+    }
+    #else
     t.onPayload = {[weak self] data in
       guard let self,self.active,self.epoch==token else{return}
       // Keep the safety query and gate in their original order, once per payload.
@@ -147,6 +200,7 @@ struct OwnedDisplayMonitor {
         catch{self.stop(message:TCText("Could not decode incoming video. This video error is separate from the input connection."))}
       }
     }
+    #endif
     t.onLatency = {[weak self] value in guard let self,self.active,self.epoch==token else{return};self.networkRTT=value.flatMap{$0.isFinite ? $0:nil}}
     t.onFailure = {[weak self] text in guard let self,self.epoch==token else{return};self.stop(message:text)}
     for name in [NSWorkspace.willSleepNotification,NSWorkspace.sessionDidResignActiveNotification,NSWorkspace.screensDidSleepNotification] {
@@ -170,9 +224,103 @@ struct OwnedDisplayMonitor {
       completion()
     }
   }
+  #if TC_FRESH_RECEIVER_SAFETY
+  // Receiver safety queries alone move off main. Raw Relay input timers,
+  // topology/permission queries, startup and sending/helper checks remain unchanged.
+  // This does NOT promise a stall-free main thread or atomic OS/session state.
+  private func periodicSafetyContextCurrent(ticket:DisplaySafetyTicket,token:UUID,expectedTransport:DisplayTransport?)->Bool {
+    active && epoch==token && ticket.displayEpoch==token && transport === expectedTransport && safetyTicket==ticket
+  }
+  private func completePeriodicSafety(_ sample:FreshSessionSafetySample,ticket:DisplaySafetyTicket,token:UUID,expectedTransport:DisplayTransport?,pending:UUID) {
+    guard periodicSafetyPending.finish(pending),periodicSafetyContextCurrent(ticket:ticket,token:token,expectedTransport:expectedTransport) else{return}
+    let now=ProcessInfo.processInfo.systemUptime
+    guard sampledSessionPermitted?(sample,ticket,now)==true else {
+      // Shared production completion fence: retired unsafe samples cannot stop
+      // replacement sessions, even if an injected evaluator reenters/restarts.
+      guard periodicSafetyContextCurrent(ticket:ticket,token:token,expectedTransport:expectedTransport) else{return}
+      stop(message:TCText("Screen transmission stopped due to locking or a safety state change."));return
+    }
+    // Success is discarded, never cached or used to authorize payloads.
+  }
+  static func verifyPeriodicSafetyForTests()->Bool {
+    let controller=DisplayModeController()
+    let entered=DispatchSemaphore(value:0),release=DispatchSemaphore(value:0)
+    let countLock=NSLock();var queries=0,evaluations=0
+    controller.periodicSafetySampler=FreshSessionSafetySampler(snapshot:{
+      countLock.lock();queries+=1;countLock.unlock()
+      entered.signal();_ = release.wait(timeout:.now()+10)
+      return .init(onConsole:nil,loginDone:nil,screenLocked:nil)
+    },secure:{false})
+    func arm()->DisplaySafetyTicket {
+      controller.active=true;controller.epoch=UUID();controller.transport=DisplayTransport()
+      let ticket=DisplaySafetyTicket(relayGeneration:UUID(),safetyRevision:UUID(),displayEpoch:controller.epoch)
+      controller.safetyTicket=ticket;return ticket
+    }
+    controller.sampledSessionPermitted={_,_,_ in evaluations+=1;return false}
+    let old=arm();controller.schedulePeriodicSafety(ticket:old)
+    guard entered.wait(timeout:.now()+2) == .success else{release.signal();return false}
+    defer{release.signal();controller.stop()}
+    controller.stop() // Actual receiver stop, no GUI/helper/native OS hooks.
+    let replacement=arm(),replacementEpoch=controller.epoch
+    for _ in 0..<8 {controller.schedulePeriodicSafety(ticket:replacement)}
+    countLock.lock();let onePending=queries==1;countLock.unlock()
+    var pumped=false;DispatchQueue.main.async{pumped=true}
+    release.signal()
+    let deadline=Date(timeIntervalSinceNow:2)
+    while (!pumped || controller.periodicSafetyPending.token != nil) && Date()<deadline {
+      _ = RunLoop.current.run(mode:.default,before:Date(timeIntervalSinceNow:0.005))
+    }
+    guard onePending,pumped,controller.periodicSafetyPending.token==nil,controller.active,
+      controller.epoch==replacementEpoch,evaluations==0 else{return false}
+    // A new healthy schedule may proceed after the retired query really returns.
+    controller.periodicSafetySampler=FreshSessionSafetySampler(snapshot:{
+      countLock.lock();queries+=1;countLock.unlock()
+      return .init(onConsole:true,loginDone:true,screenLocked:false)
+    },secure:{false})
+    controller.sampledSessionPermitted={_,_,_ in evaluations+=1;return true}
+    controller.schedulePeriodicSafety(ticket:replacement)
+    let healthyDeadline=Date(timeIntervalSinceNow:2)
+    while controller.periodicSafetyPending.token != nil && Date()<healthyDeadline {
+      _ = RunLoop.current.run(mode:.default,before:Date(timeIntervalSinceNow:0.005))
+    }
+    countLock.lock();let twoQueries=queries==2;countLock.unlock()
+    guard controller.active,controller.epoch==replacementEpoch,evaluations==1,twoQueries,controller.periodicSafetyPending.token==nil else{return false}
+    // Exercise the SAME production completion after an evaluator reenters and
+    // replaces the controller epoch before returning an unsafe result.
+    let pending=controller.periodicSafetyPending.begin()!,oldTransport=controller.transport
+    let now=ProcessInfo.processInfo.systemUptime
+    let unsafe=FreshSessionSafetySample(snapshot:.init(onConsole:nil,loginDone:nil,screenLocked:nil),secureInput:false,startedAt:now,snapshotFinishedAt:now,finishedAt:now)
+    var reentrantEpoch:UUID?
+    controller.sampledSessionPermitted={_,_,_ in reentrantEpoch=arm().displayEpoch;return false}
+    controller.completePeriodicSafety(unsafe,ticket:replacement,token:replacementEpoch,expectedTransport:oldTransport,pending:pending)
+    return controller.active && controller.epoch==reentrantEpoch && controller.epoch != replacementEpoch
+  }
+  private func schedulePeriodicSafety(ticket:DisplaySafetyTicket) {
+    guard let pending=periodicSafetyPending.begin() else{return}
+    let token=epoch,sampler=periodicSafetySampler
+    let expectedTransport=transport
+    periodicSafetyQueue.async {[weak self] in
+      let sample=sampler.sample()
+      DispatchQueue.main.async {
+        self?.completePeriodicSafety(sample,ticket:ticket,token:token,expectedTransport:expectedTransport,pending:pending)
+      }
+    }
+  }
+  #endif
   private func tick() {
     guard active else{return}
+    #if TC_FRESH_RECEIVER_SAFETY
+    if sending {
+      guard safe else{stop(message:TCText("Screen transmission stopped due to locking or a safety state change."));return}
+    } else {
+      guard let ticket=safetyTicket,currentSafetyTicket?(ticket)==true else {
+        stop(message:TCText("Screen transmission stopped due to locking or a safety state change."));return
+      }
+      schedulePeriodicSafety(ticket:ticket)
+    }
+    #else
     guard safe else{stop(message:TCText("Screen transmission stopped due to locking or a safety state change."));return}
+    #endif
     if inputBindingConflicts?()==true {stop(message:TCText("The input peer changed. Closing the previous peer's video connection."));return}
     let now=ProcessInfo.processInfo.systemUptime
     if connected,now-lastStatsAt>=2 {
@@ -268,6 +416,9 @@ struct OwnedDisplayMonitor {
     captureVirtualPlacement(now:ProcessInfo.processInfo.systemUptime,force:true)
     finalMessage=message;active=false;cleaning=true;epoch=UUID();timer?.invalidate();timer=nil
     for (center,observer) in observers{center.removeObserver(observer)};observers=[]
+    #if TC_FRESH_RECEIVER_SAFETY
+    safetyTicket=nil // Do not clear outstanding periodic work until it completes.
+    #endif
     transport?.stop();transport=nil;viewer?.onClose=nil;viewer?.close();viewer=nil
     report(TCText("Preparing to end the screen connection. Release all keys and buttons. Cleaning up the existing input connection."))
     if sending,helper != nil {
@@ -319,6 +470,11 @@ struct OwnedDisplayMonitor {
     screenPermissionButton.target=self;screenPermissionButton.action=#selector(displayPermission)
     receiveSection.addArrangedSubview(screenPermissionButton)
     relay.displayPreferenceChanged={[weak self] enabled in self?.sharingReceivedDisplayPreference(enabled)}
+    #if TC_FRESH_RECEIVER_SAFETY
+    displayMode.makeSafetyTicket={[weak self] epoch in self?.relay.displaySafetyTicket(epoch:epoch)}
+    displayMode.currentSafetyTicket={[weak self] ticket in self?.relay.displaySafetyTicketCurrent(ticket)==true}
+    displayMode.sampledSessionPermitted={[weak self] sample,ticket,now in self?.relay.sampledDisplaySessionPermitted(sample,ticket:ticket,now:now)==true}
+    #endif
     displayMode.sessionPermitted={[weak self] in guard let self else{return false};return self.relay.sessionAllowed && !self.relay.screenSleeping && !self.relay.systemSleeping && self.relay.multiDisplayDesktopReady}
     displayMode.prepareInputTransition={[weak self] completion in guard let self else{completion(.failure(Failure("Input owner unavailable")));return};self.relay.beginDisplayTopologyTransition(completion:completion)}
     displayMode.commitInputDisplay={[weak self] original,id in guard let self else{throw Failure("Input owner unavailable")};try self.relay.commitDisplayTopology(original:original,ownedID:id)}
@@ -328,6 +484,8 @@ struct OwnedDisplayMonitor {
     displayMode.status={[weak self] text in guard let self else{return};self.displayStatus.stringValue=text;self.updateConnectionState();self.connectButton.isEnabled = !self.relay.hasSession && !self.displayMode.cleaning;self.mode.isEnabled = !self.displayMode.active && !self.displayMode.cleaning;self.sharingDisplayStatusDidChange()}
   }
   func beginDisplay(sending:Bool) {
+    // Automatic resume must not reopen video while the user is quitting.
+    guard !applicationIsQuitting else{return}
     guard !displayMode.active,!displayMode.cleaning else{return}
     guard relay.displayPreferenceCompatible else{displayStatus.stringValue=TCText("Automatic virtual display requires 0.8.28 or later on both Macs.");return}
     guard let pair=relay.authenticatedDevicePair,relay.authenticated,relay.inputIsSender == !sending else{displayStatus.stringValue=TCText("First complete the input connection: Sender on the MacBook → Receiver on the Mac mini. The existing connection has not been changed.");return}

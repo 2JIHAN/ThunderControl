@@ -20,7 +20,7 @@ func runDisplayFramePacingReplayTests(path: String) throws -> Int {
         from: Data(contentsOf: URL(fileURLWithPath: path)))
     let measured = Set(fixture.measuredSequences)
     var measuredDiscards: [String: Int] = [:]
-    var pacer = DisplayFramePacer<Int>(onDiscard: { frame, reason in
+    var pacer = DisplayFramePacer<Int>(selectionPolicy: .fifo25, onDiscard: { frame, reason in
         if measured.contains(frame) { measuredDiscards[String(reason.rawValue), default: 0] += 1 }
     })
     var arrivals: [Int: Double] = [:]

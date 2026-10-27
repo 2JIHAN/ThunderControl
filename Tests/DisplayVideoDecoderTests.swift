@@ -250,6 +250,68 @@ func runDisplayVideoDecoderTests() -> Int {
         let stats = DisplayPresentationStats()
         check(stats.decoded == 0 && stats.submitted == 0 && stats.replacedDecoded == 0 && stats.readinessDeferrals == 0)
     }
+    check(runDisplayDeadlinePlanTests() == 0)
+    if let pixel {
+        do {
+            let sample = try displayDeadlineImageSample(pixel, target: 500.125)
+            check(CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(sample), CMTime(seconds: 500.125, preferredTimescale: 1_000_000_000)) == 0)
+            check(!CMSampleBufferGetDuration(sample).isValid)
+            check(CMSampleBufferGetImageBuffer(sample) === pixel)
+            let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[String: Any]]
+            check(attachments?.first?[kCMSampleAttachmentKey_DisplayImmediately as String] == nil)
+        } catch { check(false) }
+        for target in [Double.nan, .infinity, -1] {
+            do { _ = try displayDeadlineImageSample(pixel, target: target); check(false) } catch { check(true) }
+        }
+    }
+    // Scheduled timeline uses a synthetic receiver-local CA/host offset, not a
+    // remote sender epoch. Exercise invalid calibration, generation and lateness.
+    var timeline = DisplayScheduledTimeline()
+    func host(_ seconds: Double) -> CMTime { CMTime(seconds: seconds, preferredTimescale: 1_000_000_000) }
+    check(!timeline.calibrate(caBefore: .nan, host: host(500), caAfter: 10))
+    check(!timeline.calibrate(caBefore: 10, host: .invalid, caAfter: 10))
+    check(!timeline.calibrate(caBefore: 10, host: host(500), caAfter: 10.002))
+    check(!timeline.calibrate(caBefore: 10, host: host(500), caAfter: 9))
+    check(timeline.calibrate(caBefore: 10, host: host(500), caAfter: 10))
+    let scheduleGeneration = timeline.generation
+    let timing = timeline.timing(target: 10.016, caNow: 10, hostNow: host(500), generation: scheduleGeneration)
+    check(timing != nil)
+    if let timing {
+        check(abs(timing.presentationTimeStamp.seconds-0.016) < 0.00000001)
+        check(CMTimeCompare(timing.duration, CMTime(value: 1, timescale: 60)) == 0)
+        check(!timing.decodeTimeStamp.isValid)
+        if let pixel {
+            do {
+                let sample = try displayScheduledImageSample(pixel, timing: timing)
+                check(CMSampleBufferGetImageBuffer(sample) === pixel)
+                check(CMSampleBufferDataIsReady(sample))
+                check(CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(sample), timing.presentationTimeStamp) == 0)
+                check(CMTimeCompare(CMSampleBufferGetDuration(sample), timing.duration) == 0)
+                let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [[String: Any]]
+                check(attachments?.first?[kCMSampleAttachmentKey_DisplayImmediately as String] == nil)
+            } catch { check(false) }
+            for invalid in [CMSampleTimingInfo(duration: .invalid, presentationTimeStamp: .zero, decodeTimeStamp: .invalid),
+                            CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 60), presentationTimeStamp: .invalid, decodeTimeStamp: .invalid)] {
+                do { _ = try displayScheduledImageSample(pixel, timing: invalid); check(false) } catch { check(true) }
+            }
+        }
+        timeline.commit(timing)
+        // No second future sample may accumulate even with renderer ready.
+        check(timeline.timing(target: 10.017, caNow: 10.001, hostNow: host(500.001), generation: scheduleGeneration) == nil)
+        check(timeline.timing(target: 10.032, caNow: 10.016, hostNow: host(500.016), generation: scheduleGeneration) != nil)
+        check(timeline.timing(target: 10.016, caNow: 10.016, hostNow: host(500.016), generation: scheduleGeneration) == nil)
+    }
+    for target in [Double.nan, .infinity, 10, 9.99, 10.04] {
+        check(timeline.timing(target: target, caNow: 10, hostNow: host(500), generation: scheduleGeneration) == nil)
+    }
+    check(timeline.timing(target: 10.032, caNow: 10.016, hostNow: .invalid, generation: scheduleGeneration) == nil)
+    check(timeline.timing(target: 10.032, caNow: 10.016, hostNow: host(501), generation: scheduleGeneration) == nil)
+    timeline.reset()
+    check(!timeline.hostAnchor.isValid && !timeline.lastPTS.isValid)
+    check(timeline.timing(target: 10.032, caNow: 10.016, hostNow: host(500.016), generation: scheduleGeneration) == nil)
+    check(timeline.calibrate(caBefore: 20, host: host(510), caAfter: 20))
+    check(timeline.timing(target: 20.016, caNow: 20, hostNow: host(510), generation: scheduleGeneration) == nil)
+    check(timeline.timing(target: 20.016, caNow: 20, hostNow: host(510), generation: timeline.generation) != nil)
     // Main delivery queued before clear, late callbacks and submit-return errors
     // cannot resurrect an old image or open a failed submission gate.
     if let pixel {

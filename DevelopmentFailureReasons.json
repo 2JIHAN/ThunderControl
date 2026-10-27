@@ -75,7 +75,8 @@
     "4003380099": "frame bounds",
     "4011005942": "owned capture display missing",
     "4139610956": "parent heartbeat expired",
-    "4165822034": "owned+baseline configuration"
+    "4165822034": "owned+baseline configuration",
+    "4253932621": "owned refresh rate not accepted"
   },
   "transport": {
     "1": "watchdog timeout",
@@ -83,6 +84,7 @@
     "3": "connect or authentication error",
     "4": "video socket write failed",
     "5": "control socket write failed",
-    "6": "heartbeat write failed"
+    "6": "heartbeat write failed",
+    "7": "prior native safety sampling still in progress"
   }
 }

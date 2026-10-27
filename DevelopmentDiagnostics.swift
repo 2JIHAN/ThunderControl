@@ -30,6 +30,9 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
     private var cachedLocalDirectory: URL?, cachedCloudDirectory: URL?
     private var timer: DispatchSourceTimer?
     private var directory: Int32 = -1
+    // Logger-queue-only summary; no extra writes, timers, or main-thread work.
+    private var receiverPerformance: [[String: Any]] = []
+    private var receiverPerformanceContext: Context?
     private var deviceID: String?, latest: Context?, number: UInt64 = 0
     private var written: Int64 = 0, evictions: Int64 = 0
     private var mirrorDisabled = true, mirrorError = false, localError = false
@@ -77,7 +80,7 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
         if active?.role == role && active?.stream == stream { return }
         let context = Context(session: UUID().uuidString.lowercased(), role: role, stream: stream)
         active = context
-        queue.async { self.drain(); self.latest = context; self.activateTimer(); do { try self.prepare() } catch { self.localError = true }; self.publishStatus() }
+        queue.async { self.latest = context; self.resetReceiverPerformance(for: context); self.drain(); self.activateTimer(); do { try self.prepare() } catch { self.localError = true }; self.publishStatus() }
     }
     func stop(stream: String? = nil) {
         ingress.lock()
@@ -152,6 +155,9 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
         ingress.lock(); let batch = pending; pending.removeAll(keepingCapacity: true); drainScheduled = false; ingress.unlock()
         guard !batch.isEmpty else { return }
         beforeDrain?()
+        // Consume before filesystem work: local/cloud IO failures cannot erase
+        // cumulative renderer snapshots from the bounded manifest summary.
+        for event in batch { consumeReceiverPerformance(event) }
         let writtenBefore = written
         defer { ingress.lock(); outstanding -= batch.count; ingress.unlock() }
         do {
@@ -273,8 +279,39 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
             }
         }
     }
+    // Exact numeric schema only. Unknown extension keys remain in ordinary
+    // structured event logs but never enter the performance manifest summary.
+    static let receiverPerformanceFields: Set<String> = {
+        let common: Set<String> = [
+            "available", "sampleTime", "totalNumberOfFrames", "numberOfDroppedFrames",
+            "numberOfCorruptedFrames", "totalAccumulatedFrameDelay", "generation",
+            "displayLinkTicks", "submitted", "pacerOffered", "pacerSelected",
+            "pacerOverflow", "pacerSuperseded", "pacerEmpty", "pacerWaiting",
+            "pacerInvalid", "targetGaps", "counterSampleTime", "readinessDeferrals", "lastSourceSequence"
+        ]
+#if TC_DEADLINE_PRESENTATION
+        return common.union(["scheduledMode", "scheduledFuture", "scheduledLateSkips", "scheduledMinLeadMs"])
+#else
+        return common.union(["targetDuplicate", "targetExpired", "targetLimited", "pacerRateLimited"])
+#endif
+    }()
+    private func resetReceiverPerformance(for context: Context) {
+        guard receiverPerformanceContext != context else { return }
+        receiverPerformanceContext = context
+        receiverPerformance.removeAll(keepingCapacity: true)
+    }
+    private func consumeReceiverPerformance(_ event: Event) {
+        guard event.stage == "renderer_metrics", event.context.role == "viewer" else { return }
+        let fields = event.fields.filter { Self.receiverPerformanceFields.contains($0.key) && $0.value.isFinite }
+        guard let time = fields["sampleTime"], time >= 0 else { return }
+        resetReceiverPerformance(for: event.context)
+        var sample: [String: Any] = ["session": event.context.session, "stream": event.context.stream, "fields": fields]
+        if let sequence = event.sequence { sample["seq"] = NSNumber(value: sequence) }
+        if receiverPerformance.count == 128 { receiverPerformance.removeFirst() }
+        receiverPerformance.append(sample)
+    }
     private func status() -> [String: Any] {
-        ingress.lock();let sessionActive=active != nil,pendingCount=outstanding;ingress.unlock()
+        ingress.lock();let currentContext=active,sessionActive=active != nil,pendingCount=outstanding;ingress.unlock()
         var result: [String: Any] = ["version": version, "build": build, "accepted": accepted.count, "manifestWrittenAt":clock().timeIntervalSince1970,"sessionActive":sessionActive,"pendingEvents":pendingCount,
             "written": written, "dropped": contention.count + overflow.count + stale.count + nonfinite.count + invalid.count + ioDrops.count,
             "lockContention": contention.count, "overflow": overflow.count, "stale": stale.count,
@@ -283,6 +320,9 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
             "mirroredCount": mirroredCount, "mirrorPendingCount": mirrorPendingCount,
             "mirrorMissCount": mirrorMissCount, "mirrorEvictedBeforeCopy": mirrorEvictedCount]
         if let latest = latest { result["session"] = latest.session; result["role"] = latest.role; result["stream"] = latest.stream }
+        // Never advertise a prior context ring as belonging to a new stream,
+        // including the short interval before its queued start is consumed.
+        result["receiverPerformance"] = receiverPerformanceContext == latest && (currentContext == nil || currentContext == latest) ? receiverPerformance : []
         if let lastCloudCopy = lastCloudCopy { result["cloudLastSuccessfulLocalCopy"] = lastCloudCopy }
         return result
     }

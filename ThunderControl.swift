@@ -1099,7 +1099,11 @@ final class Relay {
   // Only ever true when both peers advertised multiDisplayDesktopCodec=1 in
   // the authenticated hello. Legacy 0.8.19 peers must stay on the single-
   // target coordinate protocol regardless of concurrentDisplayCodec state.
+  #if TC_FRESH_RECEIVER_SAFETY
+  private var multiDisplayDesktopCompatible=false {didSet {if oldValue != multiDisplayDesktopCompatible {displaySafetyRevision=UUID()}}}
+  #else
   private var multiDisplayDesktopCompatible=false
+  #endif
   private var desktopSystemGestureCompatible=false
   private var displayBarrier:ConcurrentDisplayBarrier?
   private var displayBarrierCompletion:((Result<Void,Error>)->Void)?
@@ -1240,13 +1244,33 @@ final class Relay {
   private var sourceAutoCursorMode=false
   private var receiverCursorLocalOverride=false
   private var receiverAvailable = false
+  #if TC_FRESH_RECEIVER_SAFETY
+  var safetyObserversInstalled = false {didSet {if oldValue != safetyObserversInstalled {displaySafetyRevision=UUID()}}}
+  #else
   var safetyObserversInstalled = false
+  #endif
   private(set) var lockedTransportOnly=false
-  var transportScreenLockObserved=false
+  #if TC_FRESH_RECEIVER_SAFETY
+  var transportScreenLockObserved = false {didSet {if oldValue != transportScreenLockObserved {displaySafetyRevision=UUID()}}}
+  #else
+  var transportScreenLockObserved = false
+  #endif
   var lockedTransportEligible:Bool {lockedTransportSessionAllowed(snapshot:readSystemSessionSnapshot(),lockedSignal:transportScreenLockObserved,systemSleeping:systemSleeping,observersInstalled:safetyObserversInstalled)}
+  #if TC_FRESH_RECEIVER_SAFETY
+  var sessionLockedSignal = false {didSet {if oldValue != sessionLockedSignal {displaySafetyRevision=UUID()}}}
+  #else
   var sessionLockedSignal = false
+  #endif
+  #if TC_FRESH_RECEIVER_SAFETY
+  var screenSleeping = false {didSet {if oldValue != screenSleeping {displaySafetyRevision=UUID()}}}
+  #else
   var screenSleeping = false
+  #endif
+  #if TC_FRESH_RECEIVER_SAFETY
+  var systemSleeping = false {didSet {if oldValue != systemSleeping {displaySafetyRevision=UUID()}}}
+  #else
   var systemSleeping = false
+  #endif
   private var sessionSnapshot = SessionSafetySnapshot(
     onConsole: nil, loginDone: nil, screenLocked: nil)
   private var lastSessionPoll = 0.0
@@ -1271,11 +1295,69 @@ final class Relay {
   var isReceivingActiveInput:Bool {!sender && (handoff.phase == .targetActive || receiverActivationPendingToken != nil)}
   var isTransferring: Bool { sender && handoff.phase != .local }
   var awaitingSourceActivation: Bool { pendingForegroundToken != nil }
+  #if TC_FRESH_RECEIVER_SAFETY
+  private var displaySafetyRevision=UUID()
+  func displaySafetyTicket(epoch:UUID)->DisplaySafetyTicket? {
+    dispatchPrecondition(condition:.onQueue(.main))
+    guard displaySafetyCurrent else{return nil}
+    return DisplaySafetyTicket(relayGeneration:generation,safetyRevision:displaySafetyRevision,displayEpoch:epoch)
+  }
+  // Main-only gate. No native queries and no mutation of the input safety cache.
+  private var displaySafetyCurrent:Bool {
+    context != nil && context?.cancelled == false && authenticated && safetyObserversInstalled &&
+      !sessionLockedSignal && !transportScreenLockObserved && !screenSleeping && !systemSleeping && multiDisplayDesktopReady
+  }
+  func displaySafetyTicketCurrent(_ ticket:DisplaySafetyTicket)->Bool {
+    dispatchPrecondition(condition:.onQueue(.main))
+    return displaySafetyCurrent && ticket.relayGeneration==generation && ticket.safetyRevision==displaySafetyRevision
+  }
+  static func verifyFreshDisplaySafetyForTests()->Bool {
+    // Invalid descriptors and metadata only: no GUI, input, lock or sleep APIs.
+    let r=Relay(),socket=OwnedSocket(-1)
+    r.context=SessionContext(socket);r.connection=socket;r.key=SymmetricKey(size:.bits256)
+    r.safetyObserversInstalled=true;r.multiDisplayDesktopCompatible=true
+    let epoch=UUID(),now=ProcessInfo.processInfo.systemUptime
+    let sample=FreshSessionSafetySample(snapshot:.init(onConsole:true,loginDone:true,screenLocked:false),secureInput:false,startedAt:now,snapshotFinishedAt:now,finishedAt:now)
+    guard let ticket=r.displaySafetyTicket(epoch:epoch),r.sampledDisplaySessionPermitted(sample,ticket:ticket,now:now) else{return false}
+    let unknown=FreshSessionSafetySample(snapshot:.init(onConsole:nil,loginDone:nil,screenLocked:nil),secureInput:false,startedAt:now,snapshotFinishedAt:now,finishedAt:now)
+    guard !r.sampledDisplaySessionPermitted(unknown,ticket:ticket,now:now) else{return false}
+    r.transportScreenLockObserved=true;r.transportScreenLockObserved=false
+    guard !r.displaySafetyTicketCurrent(ticket),let transportUnlocked=r.displaySafetyTicket(epoch:epoch) else{return false}
+    r.sessionLockedSignal=true
+    guard !r.displaySafetyTicketCurrent(transportUnlocked) else{return false}
+    r.sessionLockedSignal=false // ABA must not resurrect a fixed ticket.
+    guard !r.sampledDisplaySessionPermitted(sample,ticket:ticket,now:now),let unlocked=r.displaySafetyTicket(epoch:epoch) else{return false}
+    r.safetyObserversInstalled=false;r.safetyObserversInstalled=true
+    guard !r.displaySafetyTicketCurrent(unlocked),let observed=r.displaySafetyTicket(epoch:epoch) else{return false}
+    r.screenSleeping=true;r.screenSleeping=false
+    guard !r.displaySafetyTicketCurrent(observed),let awake=r.displaySafetyTicket(epoch:epoch) else{return false}
+    r.systemSleeping=true;r.systemSleeping=false
+    guard !r.displaySafetyTicketCurrent(awake),let ready=r.displaySafetyTicket(epoch:epoch) else{return false}
+    r.multiDisplayDesktopCompatible=false;r.multiDisplayDesktopCompatible=true
+    guard !r.displaySafetyTicketCurrent(ready),let oldRun=r.displaySafetyTicket(epoch:epoch) else{return false}
+    r.context?.cancel(reason:"fixture cancellation")
+    guard !r.displaySafetyTicketCurrent(oldRun),r.displaySafetyTicket(epoch:epoch)==nil else{return false}
+    r.context=SessionContext(socket)
+    r.generation=UUID() // An old completion must not affect replacement context.
+    guard !r.displaySafetyTicketCurrent(oldRun) else{return false}
+    return true
+  }
+  func sampledDisplaySessionPermitted(_ sample:FreshSessionSafetySample,ticket:DisplaySafetyTicket,now:Double)->Bool {
+    displaySafetyTicketCurrent(ticket) && sample.valid(at:now) &&
+      sessionBlockReason(snapshot:sample.snapshot,lockedSignal:sessionLockedSignal,sleeping:screenSleeping || systemSleeping,secureInput:sample.secureInput)==nil
+  }
+  #endif
   var sessionAllowed: Bool { currentSessionBlockReason() == nil }
   func currentSessionBlockReason(forceRefresh: Bool = false) -> String? {
     let now = ProcessInfo.processInfo.systemUptime
     if forceRefresh || now - lastSessionPoll >= 0.02 {
       sessionSnapshot = readSystemSessionSnapshot()
+#if TC_RENDERER_HEALTH
+      DevelopmentDiagnostics.shared.record(stage: "relay_session_query", fields: [
+        "elapsedMs": (ProcessInfo.processInfo.systemUptime - now) * 1000,
+        "forced": forceRefresh ? 1 : 0
+      ])
+#endif
       lastSessionPoll = now
     }
     guard safetyObserversInstalled else { return "session safety monitor unavailable" }
@@ -3883,6 +3965,8 @@ final class PasteCommandProbe: NSResponder {
   var appearanceTimer:Timer?
   var appearanceInstalled=false
   var applicationIsQuitting=false
+  /// One quit request completes after video cleanup; avoids a second quit racing a resume.
+  var quitAfterDisplayCleanupTimer:Timer?
   let sharingStore:SavedSharingStateStore
   var sharingNewPairVideoPreference:()->Bool? = {UserDefaults.standard.object(forKey:"ThunderControl.virtualDisplayPreferred") as? Bool}
   var sharingExplicitResumePending:(generation:UUID,sender:Bool)?
@@ -4740,8 +4824,11 @@ final class PasteCommandProbe: NSResponder {
   }
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     applicationIsQuitting=true // Preserve sharing intent, but never restart video while quitting.
-    if displayMode.active {displayMode.stop();return .terminateCancel}
-    if displayMode.cleaning {return .terminateCancel}
+    if displayMode.active || displayMode.cleaning {
+      if displayMode.active {displayMode.stop()}
+      finishQuitAfterDisplayCleanup()
+      return .terminateCancel
+    }
     applicationIsQuitting=true
     relay.stop()
     if relay.hasUnresolvedLocalRecovery {
@@ -4758,6 +4845,23 @@ final class PasteCommandProbe: NSResponder {
     if !DevelopmentDiagnostics.shared.shutdown(timeout:2){fputs("Development diagnostics final local flush incomplete; inspect manifest counters.\n",stderr)}
     appUpdateCheck.stop();stopBridgeRecoveryScheduling();appearanceInstalled=false;appearanceTimer?.invalidate();automaticConnectionTimer?.invalidate();discovery.stop(); relay.stop();if !isAutomationTest {appearance.teardown()} }
   func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+  /// Display cleanup (input drain, helper exit, display restoration) is async. Poll
+  /// it, then complete the user's single quit. Give up after 20s and stay running
+  /// with a clear status rather than force-quitting through an unconfirmed cleanup.
+  func finishQuitAfterDisplayCleanup() {
+    guard quitAfterDisplayCleanupTimer == nil else{return}
+    let deadline=ProcessInfo.processInfo.systemUptime+20
+    quitAfterDisplayCleanupTimer=Timer.scheduledTimer(withTimeInterval:0.1,repeats:true){[weak self] timer in MainActor.assumeIsolated{
+      guard let self,self.applicationIsQuitting else{timer.invalidate();self?.quitAfterDisplayCleanupTimer=nil;return}
+      if !self.displayMode.active && !self.displayMode.cleaning {
+        timer.invalidate();self.quitAfterDisplayCleanupTimer=nil;NSApp.terminate(nil);return
+      }
+      if ProcessInfo.processInfo.systemUptime>deadline {
+        timer.invalidate();self.quitAfterDisplayCleanupTimer=nil;self.applicationIsQuitting=false
+        self.displayStatus.stringValue=TCText("Quit paused: screen sharing cleanup did not finish. Choose Quit again after it finishes.")
+      }
+    }}
+  }
 }
 func check(_ condition: Bool, file: String = #fileID, line: Int = #line) {
   if !condition {
@@ -5149,6 +5253,11 @@ func edgeTests() throws {
 func tests() throws {
   check(runScreenLayoutTests() == 0)
   check(runSessionSafetyTests() == 0)
+  #if TC_FRESH_RECEIVER_SAFETY
+  check(Relay.verifyFreshDisplaySafetyForTests())
+  check(DisplayTransport.verifyFreshSafetyWorkerForTests())
+  check(MainActor.assumeIsolated{DisplayModeController.verifyPeriodicSafetyForTests()})
+  #endif
   try displayViewerStartupLifecycleTests()
   check(Relay.verifyUnsafeStopOrderingForTests())
   check(Relay.verifyForegroundPausePreservesConnectionForTests())

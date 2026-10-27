@@ -283,7 +283,13 @@ private final class DisplayTransportRun {
 final class DisplayTransport: @unchecked Sendable {
   // Install callbacks before start, from main. Invocations are serialized on main.
   var onAuthenticated: ((DisplayVideoFormat) -> Void)?
+  #if TC_FRESH_RECEIVER_SAFETY
+  var onPayload: ((Data,FreshSessionSafetySample) -> Void)?
+  private let safetySampler:FreshSessionSafetySampler
+  init(safetySampler:FreshSessionSafetySampler = FreshSessionSafetySampler()) {self.safetySampler=safetySampler}
+  #else
   var onPayload: ((Data) -> Void)?
+  #endif
   var onFailure: ((String) -> Void)?
   var onLatency: ((Double?) -> Void)?
   private let lock = NSLock()
@@ -292,6 +298,77 @@ final class DisplayTransport: @unchecked Sendable {
   private var pendingStart = false
   var diagnosticStreamID:String? {lock.lock();let run=current;lock.unlock();guard let run else{return nil};run.state.lock();defer{run.state.unlock()};return run.diagnosticStream}
   deinit { stop() }
+  #if TC_FRESH_RECEIVER_SAFETY
+  private func sampleCurrentRunSafety(_ run:DisplayTransportRun)throws->FreshSessionSafetySample {
+    guard isCurrent(run) else{throw DisplayTransportError.stopped}
+    let sample:FreshSessionSafetySample
+    do {sample=try DisplayPayloadSafetyAdmission.shared.sample(safetySampler)}
+    catch {
+      // Never drop/resume encoded video. Admission denial retires this affected
+      // run immediately; fail's generation fence cannot terminate a newer run.
+      fail(run,TCText("Screen safety sampling is still busy. Reconnect to continue."),diagnosticReason:7)
+      throw error
+    }
+    guard isCurrent(run) else{throw DisplayTransportError.stopped}
+    return sample
+  }
+  static func verifyFreshSafetyWorkerForTests()->Bool {
+    guard Thread.isMainThread else{return false}
+    let entered=DispatchSemaphore(value:0),release=DispatchSemaphore(value:0),done=DispatchSemaphore(value:0)
+    let countLock=NSLock();var queryCount=0
+    // Synchronization barriers replace BOTH native queries, never live OS reads.
+    let sampler=FreshSessionSafetySampler(snapshot:{
+      guard !Thread.isMainThread else{return .init(onConsole:nil,loginDone:nil,screenLocked:nil)}
+      countLock.lock();queryCount+=1;countLock.unlock()
+      entered.signal();_ = release.wait(timeout:.now()+10)
+      return .init(onConsole:true,loginDone:true,screenLocked:false)
+    },secure:{false})
+    let t=DisplayTransport(safetySampler:sampler)
+    let pair=LayoutDevicePair(localID:UUID().uuidString,peerID:UUID().uuidString)!
+    func fixture()->DisplayTransportRun {DisplayTransportRun(initial:OwnedSocket(-1),bridge:Bridge(name:"fixture",index:0,ip:"169.254.1.1"),sending:false,remote:nil,expectedPair:pair,viewerFormat:.standard)}
+    let old=fixture();t.current=old
+    DispatchQueue(label:"ThunderControl.safety.test").async {
+      defer{done.signal()}
+      do{_ = try t.sampleCurrentRunSafety(old)}catch{return}
+      // A stale query must be rejected before it can rendezvous on main.
+      DispatchQueue.main.sync {preconditionFailure("Retired sample reached main")}
+    }
+    guard entered.wait(timeout:.now()+2) == .success else{release.signal();return false}
+    t.stop() // Must return while native sampling is still blocked.
+    defer{release.signal()}
+    for _ in 0..<5 {
+      let next=DisplayTransport(safetySampler:sampler),run=fixture();next.current=run
+      // Zero-time admission on main must reject BEFORE touching native hooks.
+      do{_ = try next.sampleCurrentRunSafety(run);return false}catch{}
+      guard run.context.cancelled,!next.isCurrent(run) else{return false}
+      next.stop()
+    }
+    countLock.lock();let onlyOne=queryCount==1;countLock.unlock()
+    let replacement=fixture();t.current=replacement
+    var pumped=false
+    DispatchQueue.main.async {pumped=true}
+    let deadline=Date(timeIntervalSinceNow:1)
+    while !pumped && Date()<deadline {_ = RunLoop.current.run(mode:.default,before:Date(timeIntervalSinceNow:0.005))}
+    let cancelled=old.context.cancelled,stillCurrent=t.isCurrent(replacement)
+    release.signal()
+    let finished=done.wait(timeout:.now()+2) == .success
+    var acceptedOnMain=false
+    t.onPayload={data,sample in
+      acceptedOnMain=Thread.isMainThread && data==Data([1]) && sample.valid(at:ProcessInfo.processInfo.systemUptime)
+    }
+    release.signal() // Healthy second query uses the same injected worker seam.
+    DispatchQueue(label:"ThunderControl.safety.test.healthy").async {
+      defer{done.signal()}
+      guard let sample=try? t.sampleCurrentRunSafety(replacement) else{return}
+      DispatchQueue.main.sync {if t.isCurrent(replacement){t.onPayload?(Data([1]),sample)}}
+    }
+    let callbackDeadline=Date(timeIntervalSinceNow:2)
+    while !acceptedOnMain && Date()<callbackDeadline {_ = RunLoop.current.run(mode:.default,before:Date(timeIntervalSinceNow:0.005))}
+    let callbackFinished=done.wait(timeout:.now()+1) == .success
+    t.stop()
+    return onlyOne && pumped && cancelled && stillCurrent && finished && acceptedOnMain && callbackFinished
+  }
+  #endif
   private func isCurrent(_ run: DisplayTransportRun) -> Bool {
     lock.lock(); defer { lock.unlock() }; return current === run && !run.context.cancelled
   }
@@ -509,6 +586,11 @@ final class DisplayTransport: @unchecked Sendable {
           displayStageLog("Display cadence read: \(frameReadCadence.summary); contentMayBeIdle=true panelUnmeasured=true")
         }
       }
+      #if TC_FRESH_RECEIVER_SAFETY
+      // AEAD, direction and display identity order have all passed above.
+      // No Relay/controller rendezvous or lock is held during either OS query.
+      let freshSessionSafetySample=try sampleCurrentRunSafety(run)
+      #endif
       let diagnosticSyncStarted=ProcessInfo.processInfo.systemUptime
       var diagnosticBlockStarted=diagnosticSyncStarted,diagnosticBlockEnded=diagnosticSyncStarted
       DispatchQueue.main.sync {
@@ -518,8 +600,18 @@ final class DisplayTransport: @unchecked Sendable {
           if payload.first == 6, let measured = try? DisplayStreamFrameHeader(payload), measured.sequence % 120 == 0 {
             displayStageLog("Display receiver authenticatedReadToMainMs=\((ProcessInfo.processInfo.systemUptime-receivedAt)*1000); oneWayNetworkMs=unknown")
           }
+          #if TC_FRESH_RECEIVER_SAFETY
+          // queueMs is only main rendezvous wait; readToMainMs includes the
+          // fresh worker sampling interval, reported separately as sampleWorkerMs.
+          if let frame=diagnosticFrame{DevelopmentDiagnostics.shared.record(stage:"rx_main",sequence:frame.sequence,fields:["queueMs":(diagnosticBlockStarted-diagnosticSyncStarted)*1000,"readToMainMs":(diagnosticBlockStarted-receivedAt)*1000,"sampleWorkerMs":freshSessionSafetySample.sampleWorkerMs],stream:diagnosticStream)}
+          #else
           if let frame=diagnosticFrame{DevelopmentDiagnostics.shared.record(stage:"rx_main",sequence:frame.sequence,fields:["queueMs":(ProcessInfo.processInfo.systemUptime-receivedAt)*1000],stream:diagnosticStream)}
+          #endif
+          #if TC_FRESH_RECEIVER_SAFETY
+          self.onPayload?(payload,freshSessionSafetySample)
+          #else
           self.onPayload?(payload)
+          #endif
         }
       }
       let diagnosticSyncReturned=ProcessInfo.processInfo.systemUptime
