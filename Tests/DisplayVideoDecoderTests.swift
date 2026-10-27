@@ -251,6 +251,7 @@ func runDisplayVideoDecoderTests() -> Int {
         check(stats.decoded == 0 && stats.submitted == 0 && stats.replacedDecoded == 0 && stats.readinessDeferrals == 0)
     }
     check(runDisplayDeadlinePlanTests() == 0)
+    check(runDisplayAdaptiveSlotsTests() == 0)
     if let pixel {
         do {
             let sample = try displayDeadlineImageSample(pixel, target: 500.125)

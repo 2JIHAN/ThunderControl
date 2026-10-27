@@ -795,6 +795,10 @@ struct DisplayViewerStartup {
     private var immediatePending: DisplayTracedFrame?
     private var immediateOffered: UInt64 = 0
     private var immediateReplaced: UInt64 = 0
+#if TC_ADAPTIVE_PRESENTATION
+    private var adaptiveSlots = DisplayAdaptiveSlots()
+    private var adaptiveLastDrops: Double?
+#endif
 #endif
     private var rendererMetricsRequestedAt: Double?
     private var rendererMetricsSample: [String: Double]?
@@ -1067,6 +1071,9 @@ struct DisplayViewerStartup {
             return
         }
 #endif
+#if TC_ADAPTIVE_PRESENTATION
+        adaptiveSlots.observe(target: targetTimestamp, period: period, now: CACurrentMediaTime())
+#endif
         drainPresentation(targetTimestamp:targetTimestamp)
     }
     var rendererMetricsForTests: [String: Double]? { rendererMetricsSample }
@@ -1260,11 +1267,27 @@ struct DisplayViewerStartup {
         immediatePending = nil
         let started = ProcessInfo.processInfo.systemUptime
         do {
+#if TC_ADAPTIVE_PRESENTATION
+            // Spread bunched arrivals one per panel slot with the smallest safe lead.
+            let decision = adaptiveSlots.decide(now: CACurrentMediaTime())
+            if decision == .drop {
+                presentationStats.replacedDecoded &+= 1
+                frameTrace.record("pacer_discard", identity: frame.identity, fields: ["reason": 2])
+                return
+            }
+            var slotTarget: Double?
+            if case .slot(let t) = decision { slotTarget = t }
+            let sample = try slotTarget.map { try displayDeadlineImageSample(frame.pixel, format: self.format, target: $0) }
+                ?? displayImmediateImageSample(frame.pixel, format: self.format)
+            let traceTarget = slotTarget ?? 0
+#else
             let sample = try displayImmediateImageSample(frame.pixel, format: self.format)
+            let traceTarget = 0.0
+#endif
             renderer.enqueue(sample)
             let now = ProcessInfo.processInfo.systemUptime
             frameTrace.record("renderer_enqueue", identity: frame.identity, fields: [
-                "time": now, "decodedMainToEnqueueMs": (now-frame.decodedMainAt)*1000, "immediate": 1])
+                "time": now, "decodedMainToEnqueueMs": (now-frame.decodedMainAt)*1000, "immediate": 1, "target": traceTarget])
             rendererCadence.observe(now)
             presentationStats.submitted &+= 1
             updateCursorOverlay()
@@ -1326,6 +1349,12 @@ struct DisplayViewerStartup {
                     self.rendererMetricsPending = false
                     guard !self.closing, self.pacingGeneration == generation else { return }
                     var snapshot = sample
+#if TC_ADAPTIVE_PRESENTATION
+                    if let drops = sample["numberOfDroppedFrames"] {
+                        self.adaptiveSlots.adapt(newRendererDrops: drops - (self.adaptiveLastDrops ?? drops))
+                        self.adaptiveLastDrops = drops
+                    }
+#endif
 #if TC_RENDERER_HEALTH
                     // Native counters are sampled on their owner (main). Preserve
                     // AV callback sampleTime separately; never conflate rates
@@ -1355,6 +1384,11 @@ struct DisplayViewerStartup {
                     snapshot["scheduledFuture"] = Double(self.deadlinePlan.futureCount)
                     snapshot["scheduledLateSkips"] = Double(self.deadlineLateSkips)
                     snapshot["scheduledMinLeadMs"] = self.deadlineMinimumLeadMs.isFinite ? self.deadlineMinimumLeadMs : 0
+#elseif TC_ADAPTIVE_PRESENTATION
+                    snapshot["scheduledMode"] = 2
+                    snapshot["scheduledFuture"] = Double(self.adaptiveSlots.scheduled)
+                    snapshot["scheduledLateSkips"] = Double(self.adaptiveSlots.dropped)
+                    snapshot["scheduledMinLeadMs"] = self.adaptiveSlots.averageAddedDelay * 1000
 #else
                     snapshot["targetDuplicate"] = Double(pacing.duplicateTargetTicks)
                     snapshot["targetExpired"] = Double(pacing.expiredTargetTicks)
@@ -1436,6 +1470,9 @@ struct DisplayViewerStartup {
         pacedFrames.clear(); displayLinkCadence=DisplayCadenceStats()
 #if TC_IMMEDIATE_PRESENTATION
         immediatePending = nil; immediateOffered = 0; immediateReplaced = 0
+#if TC_ADAPTIVE_PRESENTATION
+        adaptiveSlots.reset(); adaptiveLastDrops = nil
+#endif
 #endif
 #if TC_DEADLINE_PRESENTATION
         deadlineWake?.cancel(); deadlineWake = nil; deadlineWakeAt = nil

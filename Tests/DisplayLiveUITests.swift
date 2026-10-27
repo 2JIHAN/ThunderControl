@@ -160,6 +160,10 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     try displayLiveRequire(ownershipFixture.sourceWindowOwnership.restore() && window.isVisible,"local return keeps viewer visible")
     for (index, packet) in frames.prefix(7).enumerated() {
         try displayLiveRequire(closed == 0, "viewer unexpectedly closed")
+#if TC_ADAPTIVE_PRESENTATION
+        // Feed at panel rate: faster bursts are dropped by design to bound added delay.
+        try await Task.sleep(nanoseconds: 17_000_000)
+#endif
         try viewer.accept(packet)
         try await pump(until: { viewer.receivedFrameCount == index + 1 && viewer.presentationStats.submitted == UInt64(index + 1) }, maximum: 1,stage:"decode and submit frame \(index+1)")
 #if TC_TIMED_PRESENTATION

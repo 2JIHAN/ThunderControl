@@ -289,7 +289,7 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
             "pacerOverflow", "pacerSuperseded", "pacerEmpty", "pacerWaiting",
             "pacerInvalid", "targetGaps", "counterSampleTime", "readinessDeferrals", "lastSourceSequence"
         ]
-#if TC_DEADLINE_PRESENTATION
+#if TC_DEADLINE_PRESENTATION || TC_ADAPTIVE_PRESENTATION
         return common.union(["scheduledMode", "scheduledFuture", "scheduledLateSkips", "scheduledMinLeadMs"])
 #else
         return common.union(["targetDuplicate", "targetExpired", "targetLimited", "pacerRateLimited"])
