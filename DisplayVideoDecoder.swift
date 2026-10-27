@@ -795,6 +795,10 @@ struct DisplayViewerStartup {
     private var immediatePending: DisplayTracedFrame?
     private var immediateOffered: UInt64 = 0
     private var immediateReplaced: UInt64 = 0
+#if TC_SLOT_IMMEDIATE
+    private var slotUsed = false
+    private var slotHold: [DisplayTracedFrame] = []
+#endif
 #if TC_ADAPTIVE_PRESENTATION
     private var adaptiveSlots = DisplayAdaptiveSlots()
     private var adaptiveLastDrops: Double?
@@ -998,11 +1002,27 @@ struct DisplayViewerStartup {
         deadlineFrames.append(DisplayTracedFrame(pixel: pixel, identity: identity, decodedMainAt: lastDecodedAt))
 #elseif TC_IMMEDIATE_PRESENTATION
         immediateOffered &+= 1
+#if TC_SLOT_IMMEDIATE
+        // Show at once unless a frame was already handed over in this refresh interval;
+        // then hold it for the next panel tick instead of letting it overwrite the first.
+        let arrived = DisplayTracedFrame(pixel: pixel, identity: identity, decodedMainAt: lastDecodedAt)
+        if immediatePending == nil && !slotUsed && slotHold.isEmpty {
+            immediatePending = arrived
+        } else {
+            slotHold.append(arrived)
+            if slotHold.count > 2 {
+                let old = slotHold.removeFirst()
+                immediateReplaced &+= 1; presentationStats.replacedDecoded &+= 1
+                frameTrace.record("pacer_discard", identity: old.identity, fields: ["reason": 2])
+            }
+        }
+#else
         if let old = immediatePending {
             immediateReplaced &+= 1; presentationStats.replacedDecoded &+= 1
             frameTrace.record("pacer_discard", identity: old.identity, fields: ["reason": 2])
         }
         immediatePending = DisplayTracedFrame(pixel: pixel, identity: identity, decodedMainAt: lastDecodedAt)
+#endif
 #else
         if pacedFrames.offer(DisplayTracedFrame(pixel: pixel, identity: identity, decodedMainAt: lastDecodedAt), at:pacingArrival) { presentationStats.replacedDecoded &+= 1 }
 #endif
@@ -1073,6 +1093,11 @@ struct DisplayViewerStartup {
 #endif
 #if TC_ADAPTIVE_PRESENTATION
         adaptiveSlots.observe(target: targetTimestamp, period: period, now: CACurrentMediaTime())
+#endif
+#if TC_SLOT_IMMEDIATE
+        // A new refresh interval begins: release one held frame, if any.
+        slotUsed = false
+        if immediatePending == nil, !slotHold.isEmpty { immediatePending = slotHold.removeFirst() }
 #endif
         drainPresentation(targetTimestamp:targetTimestamp)
     }
@@ -1290,6 +1315,9 @@ struct DisplayViewerStartup {
                 "time": now, "decodedMainToEnqueueMs": (now-frame.decodedMainAt)*1000, "immediate": 1, "target": traceTarget])
             rendererCadence.observe(now)
             presentationStats.submitted &+= 1
+#if TC_SLOT_IMMEDIATE
+            slotUsed = true
+#endif
             updateCursorOverlay()
             let elapsed = (ProcessInfo.processInfo.systemUptime - started) * 1000
             presentationStats.totalEnqueueMilliseconds += elapsed
@@ -1470,6 +1498,9 @@ struct DisplayViewerStartup {
         pacedFrames.clear(); displayLinkCadence=DisplayCadenceStats()
 #if TC_IMMEDIATE_PRESENTATION
         immediatePending = nil; immediateOffered = 0; immediateReplaced = 0
+#if TC_SLOT_IMMEDIATE
+        slotUsed = false; slotHold.removeAll()
+#endif
 #if TC_ADAPTIVE_PRESENTATION
         adaptiveSlots.reset(); adaptiveLastDrops = nil
 #endif
