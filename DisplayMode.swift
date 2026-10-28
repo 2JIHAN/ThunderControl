@@ -63,7 +63,20 @@ struct OwnedDisplayMonitor {
 
 @MainActor final class DisplayModeController:NSObject {
   typealias PauseCompletion=(Result<Void,Error>)->Void
+#if TC_VIDEO_OFFMAIN
+  private(set) var active=false {didSet{publishDelivery()}}
+  private(set) var cleaning=false
+  // The video reader thread checks "still delivering for this epoch?" once per frame. It used to
+  // ask the main thread synchronously, so any main-thread work stalled the frame (measured as the
+  // remaining 5ms p99 send-side tail). A lock-protected copy of (active, epoch) answers the same
+  // question; stop() still flips it before returning, so no frame is accepted after a stop.
+  private let deliveryLock=NSLock()
+  private var deliverySnapshot:(active:Bool,epoch:UUID?)=(false,nil)
+  private func publishDelivery(){deliveryLock.lock();deliverySnapshot=(active,epoch);deliveryLock.unlock()}
+  fileprivate func deliveryAllowed(_ token:UUID)->Bool{deliveryLock.lock();defer{deliveryLock.unlock()};return deliverySnapshot.active && deliverySnapshot.epoch==token}
+#else
   private(set) var active=false,cleaning=false
+#endif
   var status:((String)->Void)?
   var userStopped:(()->Void)?
   var viewerOwnershipLost:(()->Void)?
@@ -91,7 +104,12 @@ struct OwnedDisplayMonitor {
   private var transport:DisplayTransport?,viewer:DisplayViewer?,helper:Process?,heartbeat:FileHandle?,timer:Timer?
   private var baseline:DisplayBaseline?,virtualID:CGDirectDisplayID?,expectedPair:LayoutDevicePair?
   private var observers:[(NotificationCenter,NSObjectProtocol)]=[]
+#if TC_VIDEO_OFFMAIN
+  private var epoch=UUID() {didSet{publishDelivery()}}
+  private var sending=false,sourceReady=false,transitionEngaged=false,pausing=false,cleanupRunning=false,transitionFailed=false
+#else
   private var epoch=UUID(),sending=false,sourceReady=false,transitionEngaged=false,pausing=false,cleanupRunning=false,transitionFailed=false
+#endif
   private var receivedFirstFrame=false,authenticatedAt:Double?,networkRTT:Double?,lastStatsAt=0.0,started=0.0
   private var receivedVideo=0,lastReceivedVideo=0
   private var ownedMonitor=OwnedDisplayMonitor()
@@ -415,7 +433,11 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
         }
         // Keep draining the helper even after its independent video socket closes.
         // Removing the owned display must wait for the raw-input pause barrier.
+#if TC_VIDEO_OFFMAIN
+        let deliver=self?.deliveryAllowed(token)==true
+#else
         let deliver=DispatchQueue.main.sync {self?.active==true && self?.epoch==token}
+#endif
         if !deliver || deliveryFailed {continue}
         if payload.first==1 {
           guard payload.count==5 else{throw Failure("Invalid owned display identity")}
