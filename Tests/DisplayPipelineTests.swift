@@ -70,8 +70,8 @@ private enum DisplayPipelineTestError: Error { case failed }
         if !identitySeen {
             try require(plain == Data([1, 0, 0, 0, 0]))
             plain = Data([1, 0, 0, 0, 1]); identitySeen = true
-        } else { try require(plain.first == 2 && frames < 8) }
-        if plain.first == 2 { plain = Data([6])+integer(UInt64(frames))+integer(100)+integer(110)+integer(150)+plain }
+        } else { try require([2, 9].contains(plain.first) && frames < 8) }
+        if [2, 9].contains(plain.first) { plain = Data([6])+integer(UInt64(frames))+integer(100)+integer(110)+integer(150)+plain }
         try require(DisplayChannelCipher.allowedPayload(plain, fromSender: true))
         let encrypted = try sender.seal(plain)
         if firstEncrypted == nil { firstEncrypted = encrypted }

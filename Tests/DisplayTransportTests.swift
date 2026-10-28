@@ -3,8 +3,8 @@ import CryptoKit
 
 func runDisplayTransportTests() -> Int {
   var failures = 0
-  func verify(_ value: Bool) { if !value { failures += 1 } }
-  func rejects(_ action: () throws -> Void) { do { try action(); failures += 1 } catch {} }
+  func verify(_ value: Bool, line: Int = #line) { if !value { failures += 1; print("FAIL transport test line \(line)") } }
+  func rejects(line: Int = #line, _ action: () throws -> Void) { do { try action(); failures += 1; print("FAIL transport test line \(line) accepted") } catch {} }
   for sameEpoch in [false, true] {
     for pending in [false, true] {
       for hasRun in [false, true] {
@@ -107,6 +107,9 @@ func runDisplayTransportTests() -> Int {
       envelope(6,200,100,150,video), envelope(6,100,151,150,video),
       envelope(6,1,2,30_000_002,video), envelope(6,100,110,150,Data(repeating: 3,count: 10))
     ]
+    // Kind 9 carries HEVC (VPS, SPS, PPS); framing accepts it like kind 2.
+    verify(DisplayChannelCipher.validPayload(envelope(6,100,110,150,Data(repeating: 9,count: 10))))
+    verify(!DisplayChannelCipher.validPayload(envelope(6,100,110,150,Data(repeating: 8,count: 10))))
     for invalid in invalidEnvelopes {
       rejects { _ = try DisplayStreamFrameHeader(invalid) }
       rejects { _ = try DisplayStreamFrame(invalid) }

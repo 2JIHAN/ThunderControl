@@ -50,7 +50,7 @@ struct DisplayChannelCipher {
     case 1: return data.count == 5 && data.dropFirst().contains(where: { $0 != 0 })
     case 6: return (try? DisplayStreamFrameHeader(data)) != nil
     case 7: return (try? DisplayCursorMetadata(data)) != nil
-    case 2: return data.count >= 10 // Codec parses parameter sets and NAL bounds before decoding.
+    case 2, 9: return data.count >= 10 // Codec parses parameter sets and NAL bounds before decoding.
     default: return false
     }
   }
@@ -252,7 +252,7 @@ private final class DisplayTransportRun {
     let diagnosticLocked=ProcessInfo.processInfo.systemUptime
     state.lock(); let sock = socket; let ready = authenticated; let stream=diagnosticStream;state.unlock()
     guard !context.cancelled, let socket = sock, !requireAuthentication || ready, var cipher = outgoing else { throw DisplayTransportError.stopped }
-    if data.first == 1 || data.first == 2 || data.first == 6 || data.first == 7 {
+    if data.first == 1 || data.first == 2 || data.first == 9 || data.first == 6 || data.first == 7 {
       guard sending, DisplayChannelCipher.validPayload(data),
         data.first == 1 ? !sentDisplayIdentity : sentDisplayIdentity else { throw DisplayTransportError.invalid }
       if data.first == 1 { sentDisplayIdentity = true }

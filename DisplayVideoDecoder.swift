@@ -119,9 +119,13 @@ private func displayValidateSPS(_ sps: Data, pps: Data, format: DisplayVideoForm
 
 struct DisplayH264Packet {
     static let maximumSize = 4 * 1024 * 1024
+    /// Present only for HEVC (packet kind 9).
+    let vps: Data?
     let sps: Data
     let pps: Data
     let avcc: Data
+    /// Changes whenever any parameter set changes, so a new decoder session is configured.
+    var parameterIdentity: Data { (vps ?? Data()) + sps }
     let isKeyFrame: Bool
     let format: DisplayVideoFormat
     init(_ payload: Data, format: DisplayVideoFormat = .standard) throws {
@@ -129,18 +133,26 @@ struct DisplayH264Packet {
         self.format = format
         guard payload.count >= 12, payload.count <= Self.maximumSize else { throw DisplayVideoError.malformed }
         let bytes = [UInt8](payload)
-        guard bytes[0] == 2 else { throw DisplayVideoError.malformed }
+        guard bytes[0] == 2 || bytes[0] == 9 else { throw DisplayVideoError.malformed }
+        let hevc = bytes[0] == 9
         var offset = 1
         func parameter(_ type: UInt8) throws -> Data {
             guard offset + 2 <= bytes.count else { throw DisplayVideoError.malformed }
             let length = Int(bytes[offset]) * 256 + Int(bytes[offset + 1]); offset += 2
             guard length >= 2, length <= 4096, length <= bytes.count - offset,
-                  bytes[offset] & 0x80 == 0, bytes[offset] & 0x1f == type else { throw DisplayVideoError.malformed }
+                  bytes[offset] & 0x80 == 0,
+                  hevc ? (bytes[offset] >> 1) & 0x3f == type : bytes[offset] & 0x1f == type else { throw DisplayVideoError.malformed }
             let result = Data(bytes[offset..<(offset + length)]); offset += length
             return result
         }
-        sps = try parameter(7); pps = try parameter(8)
-        try displayValidateSPS(sps, pps: pps, format: format)
+        if hevc {
+            // No HEVC SPS bit parser here: the decoder bounds rely on the exact-dimension check in
+            // formatDescription() and on the hardware decoder rejecting unsupported streams.
+            vps = try parameter(32); sps = try parameter(33); pps = try parameter(34)
+        } else {
+            vps = nil; sps = try parameter(7); pps = try parameter(8)
+            try displayValidateSPS(sps, pps: pps, format: format)
+        }
         let start = offset
         var count = 0, hasSlice = false, key = false
         while offset < bytes.count {
@@ -148,10 +160,18 @@ struct DisplayH264Packet {
             let length = bytes[offset..<(offset + 4)].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
             offset += 4
             guard length > 0, length <= UInt32(bytes.count - offset), bytes[offset] & 0x80 == 0 else { throw DisplayVideoError.malformed }
-            let kind = bytes[offset] & 0x1f
-            // Embedded parameter sets would bypass the validated description. Refuse them.
-            guard [1, 5, 6, 9, 12].contains(kind) else { throw DisplayVideoError.malformed }
-            if kind == 1 || kind == 5 { hasSlice = true }; if kind == 5 { key = true }
+            if hevc {
+                guard length >= 2 else { throw DisplayVideoError.malformed }
+                let kind = (bytes[offset] >> 1) & 0x3f
+                // VCL 0...21, AUD 35, SEI 39/40. Embedded VPS/SPS/PPS (32...34) are refused.
+                guard kind <= 21 || [35, 39, 40].contains(kind) else { throw DisplayVideoError.malformed }
+                if kind <= 21 { hasSlice = true }; if (16...21).contains(kind) { key = true }
+            } else {
+                let kind = bytes[offset] & 0x1f
+                // Embedded parameter sets would bypass the validated description. Refuse them.
+                guard [1, 5, 6, 9, 12].contains(kind) else { throw DisplayVideoError.malformed }
+                if kind == 1 || kind == 5 { hasSlice = true }; if kind == 5 { key = true }
+            }
             count += 1; guard count <= 256 else { throw DisplayVideoError.malformed }
             offset += Int(length)
         }
@@ -160,6 +180,7 @@ struct DisplayH264Packet {
     }
     func formatDescription() throws -> CMVideoFormatDescription {
         var result: CMFormatDescription?
+        if let vps { return try hevcFormatDescription(vps) }
         let status = sps.withUnsafeBytes { s in pps.withUnsafeBytes { p in
             let pointers = [s.baseAddress!.assumingMemoryBound(to: UInt8.self), p.baseAddress!.assumingMemoryBound(to: UInt8.self)]
             let sizes = [sps.count, pps.count]
@@ -171,6 +192,25 @@ struct DisplayH264Packet {
         }}
         guard status == noErr, let result else {
             displayStageLog("Display decoder failure error=malformed stage=formatDescription status=\(status) expected=\(format.pixelWidth)x\(format.pixelHeight)")
+            throw DisplayVideoError.malformed
+        }
+        let dimensions = CMVideoFormatDescriptionGetDimensions(result)
+        guard dimensions.width == Int32(format.pixelWidth), dimensions.height == Int32(format.pixelHeight) else { throw DisplayVideoError.unsupportedFormat }
+        return result
+    }
+    private func hevcFormatDescription(_ vps: Data) throws -> CMVideoFormatDescription {
+        var result: CMFormatDescription?
+        let status = vps.withUnsafeBytes { v in sps.withUnsafeBytes { s in pps.withUnsafeBytes { p in
+            let pointers = [v, s, p].map { $0.baseAddress!.assumingMemoryBound(to: UInt8.self) }
+            let sizes = [vps.count, sps.count, pps.count]
+            return pointers.withUnsafeBufferPointer { ptr in sizes.withUnsafeBufferPointer { lengths in
+                CMVideoFormatDescriptionCreateFromHEVCParameterSets(allocator: kCFAllocatorDefault,
+                    parameterSetCount: 3, parameterSetPointers: ptr.baseAddress!, parameterSetSizes: lengths.baseAddress!,
+                    nalUnitHeaderLength: 4, extensions: nil, formatDescriptionOut: &result)
+            }}
+        }}}
+        guard status == noErr, let result else {
+            displayStageLog("Display decoder failure error=malformed stage=hevcFormatDescription status=\(status) expected=\(format.pixelWidth)x\(format.pixelHeight)")
             throw DisplayVideoError.malformed
         }
         let dimensions = CMVideoFormatDescriptionGetDimensions(result)
@@ -410,7 +450,7 @@ private let displayDecodeCallback: VTDecompressionOutputCallback = { reference, 
     func accept(_ payload: Data, sourceSequence: UInt64? = nil) throws {
         do {
             let packet = try DisplayH264Packet(payload, format: format)
-            try admission.enqueue(DisplayDecodePacket(video: packet, sourceSequence: sourceSequence), bytes: packet.sps.count + packet.pps.count + packet.avcc.count)
+            try admission.enqueue(DisplayDecodePacket(video: packet, sourceSequence: sourceSequence), bytes: (packet.vps?.count ?? 0) + packet.sps.count + packet.pps.count + packet.avcc.count)
             try drainPending()
         } catch { logFailure(error, stage: "accept"); clear(); throw error }
     }
@@ -424,7 +464,7 @@ private let displayDecodeCallback: VTDecompressionOutputCallback = { reference, 
     }
     private func drainPending() throws {
         while admission.hasSpace, let next = admission.pending.first?.packet {
-            let changed = parameters?.0 != next.video.sps || parameters?.1 != next.video.pps
+            let changed = parameters?.0 != next.video.parameterIdentity || parameters?.1 != next.video.pps
             // Finish every old reference before switching descriptions, without a wait.
             if changed && !admission.active.isEmpty { return }
             guard sequence >= 0, sequence < Int64.max else { throw DisplayVideoError.backlog }
@@ -435,7 +475,7 @@ private let displayDecodeCallback: VTDecompressionOutputCallback = { reference, 
     }
     private func submit(_ submission: DisplayDecodePacket) throws {
         let packet = submission.video
-        if parameters?.0 != packet.sps || parameters?.1 != packet.pps {
+        if parameters?.0 != packet.parameterIdentity || parameters?.1 != packet.pps {
             guard packet.isKeyFrame else { throw DisplayVideoError.malformed }
             let configurationStarted = ProcessInfo.processInfo.systemUptime
             retireSession()
@@ -463,7 +503,7 @@ private let displayDecodeCallback: VTDecompressionOutputCallback = { reference, 
                 VTDecompressionSessionWaitForAsynchronousFrames(created)
                 withExtendedLifetime(box) {}
             }
-            session = created; self.description = description; parameters = (packet.sps, packet.pps); mailbox = box
+            session = created; self.description = description; parameters = (packet.parameterIdentity, packet.pps); mailbox = box
             _ = VTSessionSetProperty(created, key: kVTDecompressionPropertyKey_RealTime, value: kCFBooleanTrue)
             displayStageLog("Display decoder configuration setupMs=\((ProcessInfo.processInfo.systemUptime-configurationStarted)*1000); reconfigurationNotSteadyState=true")
         }

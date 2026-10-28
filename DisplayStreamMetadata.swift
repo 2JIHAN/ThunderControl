@@ -11,7 +11,7 @@ struct DisplayStreamFrameHeader {
     let encodeEnd: UInt64
     init(_ data: Data) throws {
         guard data.count >= 43, data.count <= DisplayChannelCipher.maximumPayload,
-              data.first == 6, data[data.startIndex + Self.videoOffset] == 2 else { throw DisplayTransportError.invalid }
+              data.first == 6, [2, 9].contains(data[data.startIndex + Self.videoOffset]) else { throw DisplayTransportError.invalid }
         sequence = Self.number(data, 1, 8); capture = Self.number(data, 9, 8)
         encodeStart = Self.number(data, 17, 8); encodeEnd = Self.number(data, 25, 8)
         guard capture > 0, capture <= encodeStart, encodeStart <= encodeEnd,

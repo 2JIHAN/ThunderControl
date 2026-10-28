@@ -45,7 +45,7 @@ private func displayLiveSyntheticFrames(_ path: String, format: DisplayVideoForm
             try displayLiveRequire(packet == Data([1, 0, 0, 0, 0]), "synthetic-only identity")
             sawIdentity = true
         } else {
-            try displayLiveRequire(packet.first == 2 && frames.count < 8, "fixture video count")
+            try displayLiveRequire([2, 9].contains(packet.first) && frames.count < 8, "fixture video count")
             _ = try DisplayH264Packet(packet, format: format)
             frames.append(packet)
         }
