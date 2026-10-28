@@ -324,7 +324,41 @@ func runDisplayFramePacingTests() -> Int {
            "future display prediction cannot release frame from future actual clock")
     // Latest is only a decoded-entry selection change. These are synthetic
     // queue/cadence checks, not evidence of physical presentation timing.
-#if TC_SEQUENCE_SELECTION
+#if TC_LEGACY70_HYSTERESIS
+    verify(DisplayFrameSelectionPolicy.buildDefault == .latest70h, "build-70 hysteresis default")
+    do {
+        // Same straddling 60Hz traces through the build-70 rule and the hysteresis rule.
+        func run(_ policy: DisplayFrameSelectionPolicy, jitterMs: Double, offsetMs: Double) -> (repeats: Int, skips: Int, waitMs: Double) {
+            var p = DisplayFramePacer<Int>(selectionPolicy: policy)
+            var last: Int? = nil, repeats = 0, skips = 0, next = 0, waitSum = 0.0, picks = 0
+            var arrivals: [Int: Double] = [:]
+            let period = 1.0 / 60.0
+            for k in 0..<7200 {
+                let target = 100 + Double(k + 1) * period, now = target - 0.001
+                while true {
+                    let jitter = (next % 3 == 0 ? jitterMs : -jitterMs) / 1000
+                    let arrival = 100 + Double(next) * period - period + offsetMs / 1000 + Double(next) * 0.0000002 + jitter
+                    if arrival > now { break }
+                    arrivals[next] = arrival; p.offer(next, at: max(arrival, 0)); next += 1
+                }
+                if let f = p.take(now: now, targetTimestamp: target) {
+                    if let l = last, f - l >= 2 { skips += 1 }
+                    last = f; waitSum += (target - arrivals[f]!) * 1000; picks += 1
+                } else if last != nil { repeats += 1 }
+            }
+            return (repeats, skips, waitSum / Double(max(picks, 1)))
+        }
+        for (j, o) in [(1.5, 0.5), (3.0, 0.5), (1.0, 2.5)] {
+            let old = run(.latest70, jitterMs: j, offsetMs: o), new = run(.latest70h, jitterMs: j, offsetMs: o)
+            print("Hysteresis trace jitter=\(j)ms: latest70 repeats=\(old.repeats) skips=\(old.skips) wait=\(String(format: "%.1f", old.waitMs))ms; latest70h repeats=\(new.repeats) skips=\(new.skips) wait=\(String(format: "%.1f", new.waitMs))ms")
+            verify(new.repeats + new.skips <= max(2, (old.repeats + old.skips) / 10), "hysteresis removes repeat-skip pairs (jitter \(j)ms)")
+            verify(new.waitMs <= old.waitMs + 0.5, "hysteresis never waits longer than build 70 (jitter \(j)ms)")
+        }
+        var lone = DisplayFramePacer<Int>(selectionPolicy: .latest70h)
+        lone.offer(1, at: 10.000)
+        verify(lone.take(now: 10.005, targetTimestamp: 10.010) == nil, "a frame far inside the cushion still waits")
+    }
+#elseif TC_SEQUENCE_SELECTION
     verify(DisplayFrameSelectionPolicy.buildDefault == .sequence, "sequence jitter-buffer default")
     do {
         // 60Hz source whose arrivals straddle the cushion boundary (+-1.5ms jitter, slow drift):

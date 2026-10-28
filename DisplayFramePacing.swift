@@ -4,6 +4,11 @@ enum DisplayFrameSelectionPolicy {
     /// Build-70 rule: newest frame that arrived at least one 1/60 cushion before the
     /// display target; under a full queue, the older of two. Smoothness over latency.
     case latest70
+    /// Build-70 rule with hysteresis: when a frame misses the 1/60 cushion by less than
+    /// `relaxMargin`, take it anyway and keep the lowered cushion while such arrivals
+    /// continue. Arrivals straddling the nominal boundary then stop flipping between
+    /// "repeat one refresh" and "two eligible, newest wins, skip one".
+    case latest70h
     /// Jitter buffer: one frame per panel tick in arrival order, no age cushion and no
     /// catch-up. A late frame costs one repeated refresh, after which the extra queued
     /// frame absorbs later jitter; overflow (capacity two) is the only skip.
@@ -12,7 +17,9 @@ enum DisplayFrameSelectionPolicy {
     case buffered
 
     static var buildDefault: Self {
-#if TC_SEQUENCE_SELECTION
+#if TC_LEGACY70_HYSTERESIS
+        .latest70h
+#elseif TC_SEQUENCE_SELECTION
         .sequence
 #elseif TC_LEGACY70_SELECTION
         .latest70
@@ -67,6 +74,12 @@ struct DisplayFramePacer<Frame> {
     // One cadence period is the maximum phase debt, not a per-tick waiver.
     private let phaseAllowance: Double
     private let cushion = 1.0 / 60.0
+    // 4ms covers the measured near-boundary arrivals (5.5% within 2ms in the worst run)
+    // while keeping at least 12.7ms of cushion, so latency can only drop versus build 70.
+    private let relaxMargin = 0.004
+    // Return to the nominal cushion only after 2s without a near-boundary arrival.
+    private let relaxHold = 2.0
+    private var relaxedUntil = -Double.infinity
     /// Actual decoded queue residence above this threshold switches FIFO to
     /// newest ELIGIBLE catch-up. Exactly 25ms remains FIFO. This is not a hard
     /// maximum age: an old singleton may still be selected, never expired here.
@@ -169,6 +182,9 @@ struct DisplayFramePacer<Frame> {
         case .sequence:
             eligibleIndex = queue.firstIndex { $0.arrival <= now }
             fallbackIndex = nil
+        case .latest70h:
+            eligibleIndex = latest70HysteresisIndex(now: now, target: target)
+            fallbackIndex = queue.count == 2 && queue[0].arrival <= min(target, now) ? 0 : nil
         case .latest70:
             eligibleIndex = queue.lastIndex { $0.arrival <= now && $0.arrival <= target - cushion + 1e-9 }
             fallbackIndex = queue.count == 2 && queue[0].arrival <= min(target, now) ? 0 : nil
@@ -264,6 +280,9 @@ struct DisplayFramePacer<Frame> {
             index = queue.firstIndex { $0.arrival <= now && $0.arrival <= target }
         case .sequence:
             index = queue.firstIndex { $0.arrival <= now }
+        case .latest70h:
+            index = latest70HysteresisIndex(now: now, target: target)
+                ?? (queue.count == 2 && queue[0].arrival <= min(target, now) ? 0 : nil)
         case .latest70:
             index = queue.lastIndex { $0.arrival <= now && $0.arrival <= target - cushion + 1e-9 }
                 ?? (queue.count == 2 && queue[0].arrival <= min(target, now) ? 0 : nil)
@@ -305,7 +324,23 @@ struct DisplayFramePacer<Frame> {
         nextDeadline = nil
         lastSelectedNow = nil
         lastSelectedTarget = nil
+        relaxedUntil = -.infinity
         stats = DisplayFramePacingStats()
+    }
+
+    private mutating func latest70HysteresisIndex(now: Double, target: Double) -> Int? {
+        let relaxedCutoff = target - (cushion - relaxMargin) + 1e-9
+        let cutoff = target < relaxedUntil ? relaxedCutoff : target - cushion + 1e-9
+        if let index = queue.lastIndex(where: { $0.arrival <= now && $0.arrival <= cutoff }) {
+            // Still landing inside the nominal cushion: extend the lowered threshold.
+            if queue[index].arrival > target - cushion + 1e-9 { relaxedUntil = target + relaxHold }
+            return index
+        }
+        // A near miss: take it now instead of repeating, and lower the cushion so the
+        // next frames at this phase do not pile up into a two-eligible skip.
+        guard let index = queue.lastIndex(where: { $0.arrival <= now && $0.arrival <= relaxedCutoff }) else { return nil }
+        relaxedUntil = target + relaxHold
+        return index
     }
 
     private func validTime(_ value: Double) -> Bool {
