@@ -354,8 +354,28 @@ struct OwnedDisplayMonitor {
       let requested=origin ?? physical?.defaultOwnedVirtualOrigin(size:videoFormat.size)
       if let requested {arguments += ["--origin",String(Int(requested.x)),String(Int(requested.y))]}
     }
+#if TC_VIDEO_SOCKETPAIR
+    // Video leaves the helper through a socket pair with multi-MB buffers instead of a 64KB pipe:
+    // a ~1MB ProRes frame then goes over in one write rather than ~16 writer/reader handoffs,
+    // which measured as a 6-8ms p99 tail between encode completion and the network send.
+    // Cursor messages (23 bytes) stay whole: Darwin stream sockets refuse rather than split a
+    // write when less than the 2KB low-water mark is free.
+    var videoFDs:[Int32]=[-1,-1]
+    guard socketpair(AF_UNIX,SOCK_STREAM,0,&videoFDs)==0 else{throw Failure("Video channel setup failed")}
+    var channelBuffer:Int32=4*1024*1024
+    for fd in videoFDs {
+      _=setsockopt(fd,SOL_SOCKET,SO_SNDBUF,&channelBuffer,socklen_t(MemoryLayout<Int32>.size))
+      _=setsockopt(fd,SOL_SOCKET,SO_RCVBUF,&channelBuffer,socklen_t(MemoryLayout<Int32>.size))
+    }
+    let process=Process(),input=Pipe(),output=FileHandle(fileDescriptor:videoFDs[0],closeOnDealloc:true),errors=Pipe();process.executableURL=url;process.arguments=arguments;process.standardInput=input;process.standardOutput=FileHandle(fileDescriptor:videoFDs[1],closeOnDealloc:false);process.standardError=errors
+    do {try process.run()} catch {close(videoFDs[1]);throw error}
+    close(videoFDs[1]) // The helper holds its own copy; EOF must follow the helper's exit.
+    helper=process;
+#else
     let process=Process(),input=Pipe(),output=Pipe(),errors=Pipe();process.executableURL=url;process.arguments=arguments;process.standardInput=input;process.standardOutput=output;process.standardError=errors
-    try process.run();helper=process;heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
+    try process.run();helper=process;
+#endif
+heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
     let diagnosticStream=transport?.diagnosticStreamID
     DispatchQueue.global(qos:.utility).async {
       let handle=errors.fileHandleForReading;defer{try? handle.close()};var lines=DisplayDiagnosticLines()
@@ -369,8 +389,22 @@ struct OwnedDisplayMonitor {
     }
     let t=transport
     DispatchQueue.global(qos:.userInitiated).async {[weak self] in
+#if TC_VIDEO_SOCKETPAIR
+      let handle=output;defer{try? handle.close()}
+      // One reusable buffer and large reads: a frame costs one copy into Data, not repeated appends.
+      let fd=handle.fileDescriptor;var buffer=[UInt8](repeating:0,count:4194304)
+      func exact(_ size:Int)throws->Data {
+        var got=0
+        while got<size {
+          let n=buffer.withUnsafeMutableBytes{Darwin.read(fd,$0.baseAddress!+got,size-got)}
+          if n>0 {got+=n} else if n<0 && errno==EINTR {continue} else {throw Failure("Video pipe ended")}
+        }
+        return Data(buffer[0..<size])
+      }
+#else
       let handle=output.fileHandleForReading;defer{try? handle.close()}
       func exact(_ size:Int)throws->Data {var data=Data();while data.count<size {guard let part=try handle.read(upToCount:size-data.count),!part.isEmpty else{throw Failure("Video pipe ended")};data.append(part)};return data}
+#endif
       var deliveryFailed=false
       do {while true {
         let header=try exact(4),size=header.reduce(UInt32(0)){($0<<8)|UInt32($1)}
