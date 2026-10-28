@@ -160,6 +160,7 @@ struct Wire: Codable {
   var desktopGlobalY:Double?
   // Separately negotiated: old map peers intentionally discard system gestures.
   var desktopGestureCodec:Int? = nil
+  var systemControlKeyCodec:Int? = nil
   var videoQualityCodec:Int? = nil
   var displayPreferenceCodec:Int? = nil
   var displayPreference:Bool? = nil
@@ -524,6 +525,7 @@ struct PeerValidator {
   var multiDisplayDesktopSupported=false
   var desktopGesturesSupported=false
   var displayPreferenceSupported=false
+  var systemControlKeysSupported=false
   mutating func accept(_ w: Wire) throws {
     guard w.session == session, w.sequence == next, next < UInt64.max else {
       throw Failure("Replay or sequence mismatch")
@@ -538,6 +540,7 @@ struct PeerValidator {
       ? (concurrentDisplaySupported ? ["displayPaused"]:[]) + ["event", "dock", "appGesture", "begin", "commit", "cancel", "returnAck", "ping"] + (cursorVisibilitySupported ? ["cursorMode"]:[])
       : (concurrentDisplaySupported ? ["displayPause","displayResume"]:[]) + ["ready", "active", "return", "cancel", "available"]
     guard permitted.contains(w.kind) else { throw Failure("Invalid packet role") }
+    guard w.systemControlKeyCodec == nil else{throw Failure("Unexpected system key capability")}
     guard w.videoQualityCodec == nil else{throw Failure("Unexpected video quality capability")}
     guard w.concurrentDisplayCodec == nil else{throw Failure("Unexpected display capability")}
     guard w.multiDisplayDesktopCodec == nil,w.desktopGestureCodec==nil else{throw Failure("Unexpected desktop coordinate capability")}
@@ -614,6 +617,9 @@ struct PeerValidator {
       guard w.raw != nil, let d = w.data, !d.isEmpty,
         w.token == nil || UUID(uuidString: w.token!)?.uuidString == w.token
       else { throw Failure("Malformed input") }
+      if w.raw==14 {
+        guard systemControlKeysSupported,d.count<=4096,let event=CGEvent(withDataAllocator:nil,data:d as CFData),SystemControlKey.decode(event) != nil else{throw Failure("Unsupported system control key")}
+      }
       guard validMouseCoordinates(w) else {
         throw Failure("Missing or invalid destination mouse coordinates")
       }
@@ -960,6 +966,7 @@ struct RemoteInputOwnership {
     case key(UInt16)
     case button(Int64)
     case modifier(UInt16)
+    case systemKey(UInt16)
   }
   var owned = Set<Input>()
   var orphans = Set<Input>()
@@ -1058,6 +1065,9 @@ final class Relay {
   var selectedEdge: Edge = .right
   private var handoff = EdgeHandoff()
   private var ownership = RemoteInputOwnership()
+  private(set) var systemControlKeysCompatible=false
+  private var sourceSystemKeys=SystemControlKeyState()
+  private var receiverSystemKeys=SystemControlKeyState()
   private var streamFlags: CGEventFlags = []
   var authenticatedLocalIsSender:Bool {sender}
   var inputIsSender:Bool {sender}
@@ -1128,10 +1138,14 @@ final class Relay {
   private var desktopFocusSafety:Bool {desktopFocusSafetyForTests?() ?? (inputPermissionsReady() && NSApp.isActive && currentSessionBlockReason(forceRefresh:true)==nil && sourceOwnershipConfirmed?()==true)}
   /// Unmarked follow-through while the peer is rearranging is still remote
   /// intent. Quarantine it without posting locally or forwarding stale geometry.
-  @discardableResult func drainDesktopPauseInput(type:CGEventType,code:CGKeyCode=0,button:Int64=0,flags:CGEventFlags=[])->Bool {
+  @discardableResult func drainDesktopPauseInput(type:CGEventType,code:CGKeyCode=0,button:Int64=0,flags:CGEventFlags=[],systemKey:SystemControlKey?=nil)->Bool {
     guard sender,desktopFocusIntent != nil,displayBarrier != nil else{return false}
     let input:RemoteInputOwnership.Input?,down:Bool
-    if type == .keyDown || type == .keyUp {
+    if let systemKey {
+      input = .systemKey(systemKey.code);down=systemKey.down
+      let ledger=CGKeyCode(256+systemKey.code)
+      if down {localKeys.insert(ledger)} else{localKeys.remove(ledger)}
+    } else if type == .keyDown || type == .keyUp {
       input = .key(code);down = type == .keyDown
       if down {localKeys.insert(code)} else{localKeys.remove(code)}
     } else if [1,2,3,4,25,26].contains(type.rawValue) {
@@ -2068,7 +2082,7 @@ final class Relay {
       displayBarrierTokens.insert(token)
       displayBarrier=ConcurrentDisplayBarrier(token:token,phase:.draining,now:desktopNow,auto:savedAuto,forward:savedForward)
       auto=false;forward=false
-      ownership.force();sourceGesture.forceLocal();_ = restoreLocal(deferActivation:desktopFocusIntent != nil)
+      ownership.force();sourceSystemKeys=SystemControlKeyState();sourceGesture.forceLocal();_ = restoreLocal(deferActivation:desktopFocusIntent != nil)
       status(TCText("Input connection maintained: waiting for the other Mac's display transition."))
       tickDisplayTopologyTransition()
     case "displayPaused":
@@ -2254,6 +2268,7 @@ final class Relay {
   func forceLocal() {
     cancelDesktopFocusRestore()
     ownership.force()
+    sourceSystemKeys=SystemControlKeyState()
     sourceGesture.forceLocal()
     restoreLocal()
   }
@@ -2623,7 +2638,7 @@ final class Relay {
     desktopValidatedEpoch=nil
     let barrierCompletion=displayBarrierCompletion;displayBarrierCompletion=nil;displayBarrier=nil
     receiverOwnsMapTransition=false;receiverMapPublicationCandidate=nil
-    authenticatedDevicePair=nil;authenticatedSharingPeerHost=nil;peerVideoQualityCompatible=false;displayPreferenceCompatible=false;peerDisplayPreference=nil;concurrentDisplayCompatible=false;multiDisplayDesktopCompatible=false;desktopSystemGestureCompatible=false;displayBarrierTokens.removeAll();displayRemoteGeometryTemporary=false;displayRemoteOriginalLayout=nil
+    authenticatedDevicePair=nil;authenticatedSharingPeerHost=nil;peerVideoQualityCompatible=false;systemControlKeysCompatible=false;displayPreferenceCompatible=false;peerDisplayPreference=nil;concurrentDisplayCompatible=false;multiDisplayDesktopCompatible=false;desktopSystemGestureCompatible=false;displayBarrierTokens.removeAll();displayRemoteGeometryTemporary=false;displayRemoteOriginalLayout=nil
     receiverDesktop=nil;sourceOrigin=nil;receiverDesktopAdoptedRevision=0;receiverDesktopAdoptedFingerprint=nil;receiverDesktopPublishRevision=0;receiverDesktopPublishedFingerprint=nil;pendingInitialSourceOriginRestore=false
     // Preserve portal projection until forceLocal consumes it.
     onReceiverDesktopChanged?()
@@ -2673,6 +2688,14 @@ final class Relay {
         : "Stopped. Input forwarding and receiving disabled. Reason: " + lastStopReason)
   }
   func releaseInputs() {
+    // Only release function keys this receiver actually injected. Construct fresh
+    // whitelisted system events; never replay arbitrary systemDefined payloads.
+    for key in receiverSystemKeys.releaseAll() {
+      if let event=key.makeEvent() {
+        event.setIntegerValueField(.eventSourceUserData,value:marker)
+        if let post=desktopInputPostForTests {post(event)} else{event.post(tap:.cghidEventTap)}
+      }
+    }
     streamFlags = []
     keys.formUnion(modifiers)
     modifiers.removeAll()
@@ -2694,6 +2717,47 @@ final class Relay {
       }
     }
     buttons.removeAll()
+  }
+  static func verifySystemControlKeyReceiveForTests()->Bool {
+    final class Mock:CursorRecoveryAPI {
+      func associate(_ associated:Bool)->CGError{.success}
+      func hide(display:CGDirectDisplayID)->CGError{.success}
+      func show(display:CGDirectDisplayID)->CGError{.success}
+      func warp(to point:CGPoint)->CGError{.success}
+    }
+    let map=ReceiverDesktop(revision:7,mainID:11,displays:[ReceiverDisplay(id:11,bounds:CGRect(x:0,y:0,width:1920,height:1080))])
+    let r=Relay(cursorResources:CursorRecoveryController(api:Mock()))
+    let ctx=SessionContext(OwnedSocket(-1));defer{ctx.cancel(reason:"system key fixture end")}
+    r.connection=OwnedSocket(-1);r.context=ctx;r.key=SymmetricKey(size:.bits256)
+    r.safetyObserversInstalled=true;r.gestureTrace.setEnabled(false)
+    r.desktopMapReadForTests={_,_ in map};r.desktopEpochForTests={0};r.desktopInputPermissionForTests={true}
+    let token=UUID().uuidString,point=CGPoint(x:500,y:200)
+    r.prepareDesktopSystemGestureForTests(map:map,point:point,token:token)
+    r.systemControlKeysCompatible=true
+    var posted:[SystemControlKey]=[]
+    r.desktopInputPostForTests={if let key=SystemControlKey.decode($0){posted.append(key)}}
+    // Control held in the ordinary keyboard stream must not be released by
+    // function-key flags (which intentionally retain only safe fine-step flags).
+    r.modifiers=[59];r.streamFlags=[.maskControl]
+    func deliver(_ event:SystemControlKey,token:String,capable:Bool=true)->Bool {
+      guard let native=event.makeEvent(),let bytes=native.data else{return false}
+      r.systemControlKeysCompatible=capable
+      r.sessionSnapshot = .init(onConsole:true,loginDone:true,screenLocked:false);r.lastSessionPoll=ProcessInfo.processInfo.systemUptime
+      r.receive(Wire(kind:"event",session:r.session,sequence:1,raw:14,data:bytes as Data,token:token,desktopMapRevision:7,desktopGlobalX:point.x,desktopGlobalY:point.y))
+      return true
+    }
+    guard deliver(.init(code:0,down:true),token:token),deliver(.init(code:0,down:true,isRepeat:true),token:token),deliver(.init(code:0,down:false),token:token) else{return false}
+    guard posted.count==3,r.receiverSystemKeys.pressed.isEmpty,r.modifiers==Set([CGKeyCode(59)]),r.streamFlags==[.maskControl] else{return false}
+    guard deliver(.init(code:2,down:true),token:UUID().uuidString),deliver(.init(code:2,down:true),token:token,capable:false),posted.count==3 else{return false}
+    r.modifiers.removeAll();r.streamFlags=[]
+    return true
+  }
+  static func verifySystemControlKeyCleanupForTests()->Bool {
+    let relay=Relay();var posted:[SystemControlKey]=[]
+    relay.desktopInputPostForTests={if let key=SystemControlKey.decode($0){posted.append(key)}}
+    guard relay.receiverSystemKeys.accept(.init(code:0,down:true)),relay.receiverSystemKeys.accept(.init(code:2,down:true)) else{return false}
+    relay.releaseInputs();relay.releaseInputs()
+    return posted.count==2 && Set(posted.map{$0.code})==Set([UInt16(0),2]) && posted.allSatisfy{!$0.down && !$0.isRepeat} && relay.receiverSystemKeys.pressed.isEmpty
   }
   static func verifyReceiverPhysicalInputCancelsActivationForTests()->Bool {
     let relay=Relay();let token=UUID().uuidString
@@ -2914,7 +2978,7 @@ final class Relay {
           seal(
             Wire(
               concurrentDisplayCodec:1,kind: sendMode ? "sender-hello-v5" : "receiver-hello-v5", session: localSession,
-              sequence: 0, os: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,osBuild:systemBuildIdentifier(),gestureCodec:DockGestureCodec.supported ? 1 : 0,appGestureCodec:AppGestureCodec.supported ? 1 : 0,cursorVisibilityCodec:1,peerDisplayName:ConnectionNotificationTracker.displayName(Host.current().localizedName ?? "ThunderControl Mac"),multiDisplayDesktopCodec:1,desktopGestureCodec:DockGestureCodec.supported ? 1:0,videoQualityCodec:localVideoQualityCodec,displayPreferenceCodec:1), k))
+              sequence: 0, os: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,osBuild:systemBuildIdentifier(),gestureCodec:DockGestureCodec.supported ? 1 : 0,appGestureCodec:AppGestureCodec.supported ? 1 : 0,cursorVisibilityCodec:1,peerDisplayName:ConnectionNotificationTracker.displayName(Host.current().localizedName ?? "ThunderControl Mac"),multiDisplayDesktopCodec:1,desktopGestureCodec:DockGestureCodec.supported ? 1:0,systemControlKeyCodec:1,videoQualityCodec:localVideoQualityCodec,displayPreferenceCodec:1), k))
         var remoteHello = try unseal(readFrame(c), k)
         guard (sendMode || remoteHello.session==pairingScope),remoteHello.kind == (sendMode ? "receiver-hello-v5" : "sender-hello-v5") else {
           throw Failure("Handshake role mismatch")
@@ -2926,6 +2990,7 @@ final class Relay {
         let desktopSystemGestureNegotiated=multiDisplayDesktopCompatibleNegotiated && compatible && remoteHello.desktopGestureCodec==1
         let displayPreferenceNegotiated=multiDisplayDesktopCompatibleNegotiated && remoteHello.displayPreferenceCodec==1
         let videoQualityNegotiated=localVideoQualityCodec==1 && displayPreferenceNegotiated && remoteHello.videoQualityCodec==1
+        let systemControlKeysNegotiated=remoteHello.systemControlKeyCodec==1
         let visibilityCompatible=remoteHello.cursorVisibilityCodec==1
         let appCompatible=AppGestureCodec.compatible(build:remoteHello.osBuild,codec:remoteHello.appGestureCodec)
         remoteHello.kind = "hello"
@@ -2939,7 +3004,7 @@ final class Relay {
           k, sender: senderNonce, receiver: receiverNonce, reverse: !sendMode)
         let incomingKey = connectionKey(
           k, sender: senderNonce, receiver: receiverNonce, reverse: sendMode)
-        var peerValidator = PeerValidator(senderPeer: !sendMode, session: remoteHello.session,cursorVisibilitySupported:visibilityCompatible,concurrentDisplaySupported:displayCompatible,multiDisplayDesktopSupported:multiDisplayDesktopCompatibleNegotiated,desktopGesturesSupported:desktopSystemGestureNegotiated,displayPreferenceSupported:displayPreferenceNegotiated)
+        var peerValidator = PeerValidator(senderPeer: !sendMode, session: remoteHello.session,cursorVisibilitySupported:visibilityCompatible,concurrentDisplaySupported:displayCompatible,multiDisplayDesktopSupported:multiDisplayDesktopCompatibleNegotiated,desktopGesturesSupported:desktopSystemGestureNegotiated,displayPreferenceSupported:displayPreferenceNegotiated,systemControlKeysSupported:systemControlKeysNegotiated)
         timeout.tv_sec = 0
         setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         DispatchQueue.main.async {
@@ -2951,6 +3016,7 @@ final class Relay {
           DisplayPeerRoute.rememberAuthenticatedSocket(c)
           self.authenticatedDevicePair=confirmedLayoutPair;self.authenticatedSharingPeerHost=DisplayPeerRoute.authenticatedSocketHost(c);self.concurrentDisplayCompatible=displayCompatible
           self.multiDisplayDesktopCompatible=multiDisplayDesktopCompatibleNegotiated;self.desktopSystemGestureCompatible=desktopSystemGestureNegotiated
+          self.systemControlKeysCompatible=systemControlKeysNegotiated
           self.peerVideoQualityCompatible=videoQualityNegotiated
           self.displayPreferenceCompatible=displayPreferenceNegotiated;self.peerDisplayPreference=nil
           self.layoutDevicePair=sendMode ? confirmedLayoutPair:nil
@@ -3186,13 +3252,14 @@ final class Relay {
     guard e.getIntegerValueField(.eventSourceUserData) != marker,
       e.getIntegerValueField(.eventSourceUnixProcessID) != Int64(getpid())
     else { return false }
-    if drainDesktopPauseInput(type:type,code:CGKeyCode(truncatingIfNeeded:e.getIntegerValueField(.keyboardEventKeycode)),button:e.getIntegerValueField(.mouseEventButtonNumber),flags:e.flags) {return true}
+    let systemKey=SystemControlKey.decode(e)
+    if drainDesktopPauseInput(type:type,code:CGKeyCode(truncatingIfNeeded:e.getIntegerValueField(.keyboardEventKeycode)),button:e.getIntegerValueField(.mouseEventButtonNumber),flags:e.flags,systemKey:systemKey) {return true}
     if sender,handoff.phase == .local,type == .mouseMoved,let started=sourceReturnRestoredAt {
       sourceReturnRestoredAt=nil
       let elapsed=ProcessInfo.processInfo.systemUptime-started
       if elapsed>=0 && elapsed<2 {connectionLog("Source return first unmarked move ms=\(elapsed*1000)")}
     }
-    if !sender,cursorVisibilityCompatible,sourceAutoCursorMode,standard.contains(type.rawValue) {
+    if !sender,cursorVisibilityCompatible,sourceAutoCursorMode,(standard.contains(type.rawValue) || systemKey != nil) {
       let wasHidden=receiverCursor.isHidden
       receiverLocalCursorOverride(reason:"physical-input")
       guard !receiverCursor.needsRecovery else{safetyStop("Receiver local input cursor recovery failed");return false}
@@ -3239,7 +3306,9 @@ final class Relay {
     }
     let input: RemoteInputOwnership.Input?
     let down: Bool
-    if type == .keyDown || type == .keyUp {
+    if let systemKey {
+      input = .systemKey(systemKey.code);down=systemKey.down
+    } else if type == .keyDown || type == .keyUp {
       input = .key(code)
       down = type == .keyDown
     } else if [1, 2, 3, 4, 25, 26].contains(type.rawValue) {
@@ -3259,7 +3328,7 @@ final class Relay {
     }
     let quarantined = ownership.filter(
       input, down: down,
-      repeatKey: type == .keyDown && e.getIntegerValueField(.keyboardEventAutorepeat) != 0)
+      repeatKey: systemKey?.isRepeat ?? (type == .keyDown && e.getIntegerValueField(.keyboardEventAutorepeat) != 0))
     // Missing release events can be reconciled from current physical stream flags.
     for orphan in Array(ownership.orphans) {
       if case .modifier(let key) = orphan, let flag = modifierFlags[key], !e.flags.contains(flag) {
@@ -3272,6 +3341,7 @@ final class Relay {
         return nil
       })
     if quarantined {
+      if let systemKey,!systemKey.down {localKeys.remove(CGKeyCode(256+systemKey.code))}
       if type == .keyUp { localKeys.remove(code) }
       if !down, case .button(let button) = input { localButtons.remove(button) }
       if !ownership.blocked && context == nil { removeCaptureIfClean() }
@@ -3280,6 +3350,11 @@ final class Relay {
     e.flags = filteredModifierFlags(
       e.flags, orphanCodes: orphanCodes, ambiguous: ownership.ambiguousModifiers)
     if !ownership.blocked && context == nil { removeCaptureIfClean() }
+    if let systemKey {
+      // Separate namespace in the local-only held ledger. Never sent as a keyboard code.
+      let ledger=CGKeyCode(256+systemKey.code)
+      if systemKey.down {localKeys.insert(ledger)} else{localKeys.remove(ledger)}
+    }
     if type == .keyDown { localKeys.insert(code) }
     if type == .keyUp { localKeys.remove(code) }
     if [1, 3, 25].contains(type.rawValue) {
@@ -3379,7 +3454,7 @@ final class Relay {
     // New-mode peers never interpret manual normalized coordinates as a desktop.
     if multiDisplayDesktopCompatible && !remote {return false}
     guard remote || (!auto && forward),
-      allowed(type.rawValue, !auto && experimental && gestureCompatible),
+      (allowed(type.rawValue, !auto && experimental && gestureCompatible) || (systemControlKeysCompatible && systemKey != nil)),
       validFields(e, type.rawValue), let d = e.data as Data?
     else { return false }
     if remote && multiDisplayDesktopCompatible {
@@ -3394,6 +3469,8 @@ final class Relay {
       handoff.relative(
         e.getDoubleValueField(.mouseEventDeltaX), e.getDoubleValueField(.mouseEventDeltaY))
     }
+    var nextSystemKeys=sourceSystemKeys
+    if let systemKey,!nextSystemKeys.accept(systemKey) {return remote}
     var w = Wire(
       kind: "event", session: session, sequence: 0, raw: type.rawValue, data: d,
       x: remote ? handoff.x / (handoff.width - 1) : (e.location.x - b.minX) / b.width,
@@ -3407,6 +3484,7 @@ final class Relay {
       return ownership.filter(
         input, down: down, repeatKey: e.getIntegerValueField(.keyboardEventAutorepeat) != 0)
     }
+    if systemKey != nil {sourceSystemKeys=nextSystemKeys}
     ownership.accepted(input, down: down, suppressed: remote)
     if remote { finishReturnIfDrained() }
     return remote
@@ -3824,7 +3902,7 @@ final class Relay {
       guard handoff.phase == .local else { return }
     }
     guard receiverActivationPendingToken == nil,inject, (desktopInputPermissionForTests?() ?? AXIsProcessTrusted()), let t = w.raw,
-      allowed(t, experimental && gestureCompatible), let d = w.data,
+      (allowed(t, experimental && gestureCompatible) || (t==14 && systemControlKeysCompatible)), let d = w.data,
       let decoded = CGEvent(withDataAllocator: nil, data: d as CFData),
       decoded.type.rawValue == t
         || ([29, 30].contains(t)
@@ -3832,6 +3910,11 @@ final class Relay {
             == t)
     else { return }
     var e = decoded
+    let systemKey=t==14 ? SystemControlKey.decode(decoded):nil
+    if t==14 {
+      guard systemControlKeysCompatible,let systemKey,let fresh=systemKey.makeEvent() else{return}
+      e=fresh
+    }
     let eventDesktop:ReceiverDesktop?
     if multiDisplayDesktopCompatible {
       prepareInputTiming()
@@ -3872,10 +3955,12 @@ final class Relay {
       if handoff.phase == .targetActive,t==5 {
         desktopReverse=DesktopHandoffRouting.reverse(desktop:desktop,sourceRect:portal.sourceRect,previous:previous,
           delta:CGVector(dx:e.getDoubleValueField(.mouseEventDeltaX),dy:e.getDoubleValueField(.mouseEventDeltaY)),
-          held:!keys.isEmpty || !buttons.isEmpty || !modifiers.isEmpty || !localKeys.isEmpty || !localButtons.isEmpty || !localFlags.isEmpty || !e.flags.intersection(heldModifierMask).isEmpty || dockReceiver.active || receiverAppGesture.active)
+          held:!receiverSystemKeys.pressed.isEmpty || !keys.isEmpty || !buttons.isEmpty || !modifiers.isEmpty || !localKeys.isEmpty || !localButtons.isEmpty || !localFlags.isEmpty || !e.flags.intersection(heldModifierMask).isEmpty || dockReceiver.active || receiverAppGesture.active)
       }
     }
     guard finalDesktopInjectionGate() else{return}
+    // System keys carry only safe fine-step flags, not a complete keyboard state.
+    if t != 14 {
     streamFlags = e.flags.intersection(heldModifierMask)
     // Only reconcile modifiers previously injected; never synthesize hardware releases.
     for code in Array(modifiers) {
@@ -3889,6 +3974,7 @@ final class Relay {
         release?.post(tap: .cghidEventTap)
         modifiers.remove(code)
       }
+    }
     }
     e.timestamp = DispatchTime.now().uptimeNanoseconds
     if [29, 30].contains(t) {  // Experimental injection extension point: raw CGEvent replay only, not private HID dispatch.
@@ -3924,6 +4010,7 @@ final class Relay {
     }
     e.setIntegerValueField(.eventSourceUserData, value: marker)
     guard finalDesktopInjectionGate() else{return}
+    if let systemKey,!receiverSystemKeys.accept(systemKey) {return}
     if let destination=desktopDestination {desktopReceiverPreviousPointer=destination;desktopGlobalPointer=destination}
     if t == 12 {
       let code = CGKeyCode(e.getIntegerValueField(.keyboardEventKeycode))
@@ -3957,7 +4044,7 @@ final class Relay {
         x: e.location.x - b.minX, y: e.location.y - b.minY,
         dx: decoded.getDoubleValueField(.mouseEventDeltaX),
         now: ProcessInfo.processInfo.systemUptime,
-        held: !keys.isEmpty || !buttons.isEmpty || !modifiers.isEmpty || !streamFlags.isEmpty || dockReceiver.active || receiverAppGesture.active,
+        held: !receiverSystemKeys.pressed.isEmpty || !keys.isEmpty || !buttons.isEmpty || !modifiers.isEmpty || !streamFlags.isEmpty || dockReceiver.active || receiverAppGesture.active,
         w: b.width, h: b.height)
       if action == .requestReturn {receiverReturnRequestAt=ProcessInfo.processInfo.systemUptime;connectionLog("Return boundary reached; request queued");_ = control("return", token: handoff.token)}
     }
@@ -4938,6 +5025,7 @@ func destinationMouseEvent(
   return fresh
 }
 func validFields(_ e: CGEvent, _ t: UInt32) -> Bool {
+  if t==14 {return SystemControlKey.decode(e) != nil}
   if [10, 11, 12].contains(t) {
     guard (0...255).contains(e.getIntegerValueField(.keyboardEventKeycode)) else { return false }
   }
@@ -5509,6 +5597,8 @@ struct ThunderControlMain {
     } else if CommandLine.arguments.contains("--desktop-map-self-test") {
       exit(runDesktopMapTransitionTests()==0 ? 0:1)
     } else if CommandLine.arguments.contains("--self-test") {
+      check(runSystemControlKeyTests()==0)
+      check(runSystemControlRelayTests()==0)
       #if TC_QUALITY_TIERS
       check(runDisplayQualityPolicySelfTests()==0)
       check(runDisplayQualityNegotiationTests()==0)
