@@ -324,7 +324,55 @@ func runDisplayFramePacingTests() -> Int {
            "future display prediction cannot release frame from future actual clock")
     // Latest is only a decoded-entry selection change. These are synthetic
     // queue/cadence checks, not evidence of physical presentation timing.
-#if TC_LEGACY70_HYSTERESIS
+#if TC_SEQUENCE_CATCHUP
+    verify(DisplayFrameSelectionPolicy.buildDefault == .sequenceCatchUp, "catch-up jitter-buffer default")
+    do {
+        // lateAt: frame indices delayed by lateMs; jitterMs: alternating arrival jitter.
+        func run(_ policy: DisplayFrameSelectionPolicy, phaseMs: Double, jitterMs: Double, late: Set<Int>, lateMs: Double) -> (repeats: Int, skips: Int, waitMs: Double, tailWaitMs: Double) {
+            var p = DisplayFramePacer<Int>(selectionPolicy: policy)
+            var last: Int? = nil, repeats = 0, skips = 0, next = 0, waits: [Double] = []
+            var arrivals: [Int: Double] = [:]
+            let period = 1.0 / 60.0
+            for k in 0..<7200 {
+                let target = 100 + Double(k + 1) * period, now = target - 0.001
+                while true {
+                    var arrival = 100 + Double(next) * period - period + phaseMs / 1000 + (next % 3 == 0 ? jitterMs : -jitterMs) / 1000
+                    if late.contains(next) { arrival += lateMs / 1000 }
+                    if arrival > now { break }
+                    arrivals[next] = arrival; p.offer(next, at: max(arrival, 0)); next += 1
+                }
+                if let f = p.take(now: now, targetTimestamp: target) {
+                    if let l = last, f - l >= 2 { skips += 1 }
+                    last = f; waits.append((target - arrivals[f]!) * 1000)
+                } else if last != nil { repeats += 1 }
+            }
+            let tail = waits.suffix(600)
+            return (repeats, skips, waits.reduce(0, +) / Double(max(waits.count, 1)), tail.reduce(0, +) / Double(max(tail.count, 1)))
+        }
+        let f = { (x: Double) in String(format: "%.1f", x) }
+        // One late frame, then a perfectly steady source.
+        let s1 = run(.sequence, phaseMs: 8, jitterMs: 0, late: [600], lateMs: 12)
+        let c1 = run(.sequenceCatchUp, phaseMs: 8, jitterMs: 0, late: [600], lateMs: 12)
+        print("Catch-up trace single-late: sequence repeats=\(s1.repeats) skips=\(s1.skips) tailWait=\(f(s1.tailWaitMs))ms; catchUp repeats=\(c1.repeats) skips=\(c1.skips) tailWait=\(f(c1.tailWaitMs))ms")
+        // This phase leaves a second frame already queued at every tick, so the plain jitter buffer
+        // runs one refresh behind for the whole trace; catch-up drops that once at startup and,
+        // after the late frame re-creates it, once more.
+        verify(c1.skips <= 2 && c1.repeats <= 1, "one late frame costs at most one repeat and one catch-up skip")
+        verify(c1.tailWaitMs <= s1.tailWaitMs - 12, "catch-up returns the spare refresh of latency")
+        // Late frames every 0.5s: the spare frame keeps absorbing them, so no extra skips.
+        let lates = Set(stride(from: 300, to: 7200, by: 30))
+        let s2 = run(.sequence, phaseMs: 8, jitterMs: 0, late: lates, lateMs: 12)
+        let c2 = run(.sequenceCatchUp, phaseMs: 8, jitterMs: 0, late: lates, lateMs: 12)
+        print("Catch-up trace frequent-late: sequence repeats=\(s2.repeats) skips=\(s2.skips) wait=\(f(s2.waitMs))ms; catchUp repeats=\(c2.repeats) skips=\(c2.skips) wait=\(f(c2.waitMs))ms")
+        verify(c2.repeats + c2.skips <= 2, "frequent late frames keep the spare frame instead of repeating")
+        // Arrivals straddling the build-70 cushion boundary.
+        let o3 = run(.latest70, phaseMs: 0.5, jitterMs: 1.5, late: [], lateMs: 0)
+        let c3 = run(.sequenceCatchUp, phaseMs: 0.5, jitterMs: 1.5, late: [], lateMs: 0)
+        print("Catch-up trace straddling: latest70 repeats=\(o3.repeats) skips=\(o3.skips) wait=\(f(o3.waitMs))ms; catchUp repeats=\(c3.repeats) skips=\(c3.skips) wait=\(f(c3.waitMs))ms")
+        verify(c3.repeats + c3.skips <= max(2, (o3.repeats + o3.skips) / 10), "no repeat-skip pairs at the cushion boundary")
+        verify(c3.waitMs <= o3.waitMs, "catch-up waits no longer than build 70")
+    }
+#elseif TC_LEGACY70_HYSTERESIS
     verify(DisplayFrameSelectionPolicy.buildDefault == .latest70h, "build-70 hysteresis default")
     do {
         // Same straddling 60Hz traces through the build-70 rule and the hysteresis rule.
@@ -410,7 +458,7 @@ func runDisplayFramePacingTests() -> Int {
 #endif
     var defaultPolicy = DisplayFramePacer<Int>()
     defaultPolicy.offer(1, at: 0)
-#if TC_LATEST_DECODED || TC_SEQUENCE_SELECTION
+#if TC_LATEST_DECODED || TC_SEQUENCE_SELECTION || TC_SEQUENCE_CATCHUP
     verify(defaultPolicy.take(now: 0, targetTimestamp: 0) == 1, "default initializer takes an arrived frame without a cushion")
 #else
     verify(defaultPolicy.take(now: 0, targetTimestamp: 0) == nil, "default initializer uses FIFO build profile")

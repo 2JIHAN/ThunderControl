@@ -13,11 +13,17 @@ enum DisplayFrameSelectionPolicy {
     /// catch-up. A late frame costs one repeated refresh, after which the extra queued
     /// frame absorbs later jitter; overflow (capacity two) is the only skip.
     case sequence
+    /// Jitter buffer that gives its spare frame back: when a second arrived frame has been
+    /// waiting behind the shown one for `catchUpHold`, skip one frame once to drop the
+    /// extra refresh of latency. A late frame inside that window is still absorbed.
+    case sequenceCatchUp
     /// Oldest available decoded frame, with neither cushion nor age catchup.
     case buffered
 
     static var buildDefault: Self {
-#if TC_LEGACY70_HYSTERESIS
+#if TC_SEQUENCE_CATCHUP
+        .sequenceCatchUp
+#elseif TC_LEGACY70_HYSTERESIS
         .latest70h
 #elseif TC_SEQUENCE_SELECTION
         .sequence
@@ -80,6 +86,10 @@ struct DisplayFramePacer<Frame> {
     // Return to the nominal cushion only after 2s without a near-boundary arrival.
     private let relaxHold = 2.0
     private var relaxedUntil = -Double.infinity
+    // Long enough that ordinary jitter bursts are absorbed, short enough that a single
+    // late frame does not leave a whole refresh of latency in place for long.
+    private let catchUpHold = 1.0
+    private var backlogSince: Double?
     /// Actual decoded queue residence above this threshold switches FIFO to
     /// newest ELIGIBLE catch-up. Exactly 25ms remains FIFO. This is not a hard
     /// maximum age: an old singleton may still be selected, never expired here.
@@ -182,6 +192,9 @@ struct DisplayFramePacer<Frame> {
         case .sequence:
             eligibleIndex = queue.firstIndex { $0.arrival <= now }
             fallbackIndex = nil
+        case .sequenceCatchUp:
+            eligibleIndex = sequenceCatchUpIndex(now: now, target: target)
+            fallbackIndex = nil
         case .latest70h:
             eligibleIndex = latest70HysteresisIndex(now: now, target: target)
             fallbackIndex = queue.count == 2 && queue[0].arrival <= min(target, now) ? 0 : nil
@@ -280,6 +293,8 @@ struct DisplayFramePacer<Frame> {
             index = queue.firstIndex { $0.arrival <= now && $0.arrival <= target }
         case .sequence:
             index = queue.firstIndex { $0.arrival <= now }
+        case .sequenceCatchUp:
+            index = sequenceCatchUpIndex(now: now, target: target)
         case .latest70h:
             index = latest70HysteresisIndex(now: now, target: target)
                 ?? (queue.count == 2 && queue[0].arrival <= min(target, now) ? 0 : nil)
@@ -325,7 +340,19 @@ struct DisplayFramePacer<Frame> {
         lastSelectedNow = nil
         lastSelectedTarget = nil
         relaxedUntil = -.infinity
+        backlogSince = nil
         stats = DisplayFramePacingStats()
+    }
+
+    private mutating func sequenceCatchUpIndex(now: Double, target: Double) -> Int? {
+        let arrived = queue.prefix { $0.arrival <= now }.count
+        guard arrived > 0 else { backlogSince = nil; return nil }
+        guard arrived >= 2 else { backlogSince = nil; return 0 }
+        // Two arrived frames means we are one refresh behind the source.
+        guard let since = backlogSince else { backlogSince = target; return 0 }
+        guard target - since >= catchUpHold else { return 0 }
+        backlogSince = nil
+        return 1
     }
 
     private mutating func latest70HysteresisIndex(now: Double, target: Double) -> Int? {
