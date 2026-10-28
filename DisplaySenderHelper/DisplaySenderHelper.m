@@ -1720,7 +1720,9 @@ int main(int argc,const char **argv){@autoreleasepool {
   signal(SIGPIPE,SIG_IGN);signal(SIGTERM,SignalStop);signal(SIGINT,SignalStop);signal(SIGALRM,SignalStop);
   int flags=fcntl(STDOUT_FILENO,F_GETFL);if(flags<0||fcntl(STDOUT_FILENO,F_SETFL,flags|O_NONBLOCK)<0)Fail("output flags");
   if(synthetic){alarm(20);return benchmark?Benchmark():Synthetic();}
-  struct stat input,output;if(fstat(STDIN_FILENO,&input)||fstat(STDOUT_FILENO,&output)||!S_ISFIFO(input.st_mode)||!S_ISFIFO(output.st_mode))Fail("parent pipes required");
+  struct stat input,output;if(fstat(STDIN_FILENO,&input)||fstat(STDOUT_FILENO,&output)||!S_ISFIFO(input.st_mode)||!(S_ISFIFO(output.st_mode)||S_ISSOCK(output.st_mode)))Fail("parent pipes required");
+  // Video output may be the parent's large-buffer socket pair (TC_VIDEO_SOCKETPAIR) instead of a pipe;
+  // stdin stays a pipe so parent exit is still seen as EOF on the heartbeat channel.
   if(!API()||!CGPreflightScreenCaptureAccess()||!SessionSafe())Fail("capture prerequisites unavailable");
   const unsigned displaySerial=StableDisplaySerial(getuid());if(!displaySerial)Fail("invalid display identity user");
   identityLockFD=AcquireUserDisplayIdentityLock();if(identityLockFD<0)Fail("display identity in use or lock unavailable");
