@@ -633,7 +633,10 @@ static uint64_t submittedSequence=0;
 // Codec preference, first available wins. ProRes 422 Proxy encoded a retina frame in ~3.8ms
 // on the M4 ProRes engine versus 16-18ms for HEVC/H.264, at ~210Mbps (fine for Thunderbolt).
 // ProRes frames use kind 10 (codec FourCC + frame bytes; every frame is self-contained).
-#if defined(TC_PRORES)
+#if defined(TC_PRORES_LT)
+// One quality step above Proxy (user found Proxy text slightly soft); ~4.2ms, ~354Mbps in the bench.
+static const CMVideoCodecType CodecPreference[]={kCMVideoCodecType_AppleProRes422LT,kCMVideoCodecType_AppleProRes422Proxy,kCMVideoCodecType_HEVC,kCMVideoCodecType_H264};
+#elif defined(TC_PRORES)
 static const CMVideoCodecType CodecPreference[]={kCMVideoCodecType_AppleProRes422Proxy,kCMVideoCodecType_HEVC,kCMVideoCodecType_H264};
 #elif defined(TC_HEVC)
 static const CMVideoCodecType CodecPreference[]={kCMVideoCodecType_HEVC,kCMVideoCodecType_H264};
@@ -643,7 +646,7 @@ static const CMVideoCodecType CodecPreference[]={kCMVideoCodecType_H264};
 static unsigned codecIndex=0;
 #define TC_CODEC_TYPE (CodecPreference[codecIndex])
 #define TC_IS_HEVC (TC_CODEC_TYPE==kCMVideoCodecType_HEVC)
-#define TC_IS_PRORES (TC_CODEC_TYPE==kCMVideoCodecType_AppleProRes422Proxy)
+#define TC_IS_PRORES (TC_CODEC_TYPE==kCMVideoCodecType_AppleProRes422Proxy||TC_CODEC_TYPE==kCMVideoCodecType_AppleProRes422LT)
 typedef struct {double started,capturedAt;uint64_t sequence,captureSequence;uint64_t diagOrdinal,diagCapturedUS,diagAdmissionUS;} EncodeTicket;
 static EncodeTicket diagPendingTickets[2];
 static BOOL OrderAccept(EncodedOrderWindow *order,uint64_t sequence,unsigned slots){
