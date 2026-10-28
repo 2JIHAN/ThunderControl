@@ -119,6 +119,41 @@ struct OwnedDisplayMonitor {
   private var finalMessage=TCText("Screen connection ended. The existing input connection remains active.")
   var connected:Bool {active && authenticatedAt != nil && (sending ? sourceReady:receivedFirstFrame)}
   private var safe:Bool {sessionPermitted?() == true && sessionBlockReason(snapshot:readSystemSessionSnapshot(),lockedSignal:false,sleeping:false,secureInput:isSystemSecureInputEnabled()) == nil}
+#if TC_QUALITY_TIERS
+  var qualityExtensionEnabled=false
+  private(set) var currentDisplayCodecName:String?
+  private var qualityCommandPending=false,qualityCommandDirty=false
+  private var lastRequestedCeiling:Int?
+  private let helperQualityQueue=DispatchQueue(label:"ThunderControl.helper.quality")
+  func requestQualitySettingsUpdate() {
+    viewer?.setPresentationMode(DisplayQualityPreferences.presentation)
+    let ceiling=DisplayQualityPreferences.maximumTier.rawValue
+    if lastRequestedCeiling != ceiling {lastRequestedCeiling=ceiling;transport?.updateQualityCeiling(ceiling)}
+    if active && !qualityExtensionEnabled {report("표시 방식은 적용했습니다. 품질 등급 변경은 양쪽 Mac에 새 버전이 필요합니다.")}
+  }
+  private func sendQualityCommand(_ ceiling:Int,token:UUID) {
+    guard active,sending,epoch==token,(0...3).contains(ceiling),let pipe=heartbeat else{return}
+    // Commands are rare, serialized and never make the frame reader wait for main.
+    if qualityCommandPending {qualityCommandDirty=true;return}
+    qualityCommandPending=true;qualityCommandDirty=false
+    let heldTransport=transport
+    helperQualityQueue.async {[weak self] in
+      defer {DispatchQueue.main.async {
+        guard let self,self.epoch==token else{return}
+        self.qualityCommandPending=false
+        if self.qualityCommandDirty {self.sendQualityCommand(ceiling,token:token)}
+      }}
+      guard self?.deliveryAllowed(token)==true,let latest=heldTransport?.agreedQuality else{return}
+      do{try pipe.write(contentsOf:Data([UInt8(0x20+latest.ceiling)]))}
+      catch{DispatchQueue.main.async {guard let self,self.active,self.epoch==token else{return};self.report("영상 품질 변경을 적용하지 못했습니다.")}}
+    }
+  }
+  private func observeQuality(_ data:Data) {
+    guard let tier=DisplayQualityCapabilities.tier(in:data),let value=DisplayQualityTier(rawValue:tier),currentDisplayCodecName != value.wireCodecName else{return}
+    currentDisplayCodecName=value.wireCodecName
+    report("현재 영상: \(value.codecDisplayName)")
+  }
+#endif
   private func report(_ text:String){status?(text);connectionLog("Display: "+text)}
   func start(sending:Bool,peer:String,expectedPair:LayoutDevicePair)throws {
     guard #available(macOS 14.0,*) else{throw Failure(TCText("Extended display requires macOS 14 or later."))}
@@ -130,6 +165,10 @@ struct OwnedDisplayMonitor {
     let token=epoch;sourceReady=false;transitionEngaged=false;transitionFailed=false;receivedFirstFrame=false;authenticatedAt=nil;networkRTT=nil;receivedVideo=0;lastReceivedVideo=0;started=ProcessInfo.processInfo.systemUptime;lastStatsAt=started
     let viewerTarget = sending ? nil : DisplayViewerTarget.read()
     let t=DisplayTransport();transport=t
+#if TC_QUALITY_TIERS
+    currentDisplayCodecName=nil;qualityCommandPending=false;qualityCommandDirty=false;lastRequestedCeiling=DisplayQualityPreferences.maximumTier.rawValue;t.qualityExtensionEnabled=qualityExtensionEnabled
+    t.onQualityLimitChange={[weak self] ceiling in self?.sendQualityCommand(ceiling,token:token)}
+#endif
     #if TC_FRESH_RECEIVER_SAFETY
     // Fixed immutable ticket is captured before transport start, not per packet.
     guard let fixedSafetyTicket=makeSafetyTicket?(token),fixedSafetyTicket.displayEpoch==token else {
@@ -191,6 +230,9 @@ struct OwnedDisplayMonitor {
       if data.first==7 {
         do {try self.viewer?.acceptCursor(data)} catch {self.stop(message:TCText("Invalid screen video frame."))};return
       }
+#if TC_QUALITY_TIERS
+      self.observeQuality(data)
+#endif
       if data.first==2 || data.first==6 {
         do {guard let viewer=self.viewer else{throw DisplayVideoError.decoderFailed};try viewer.accept(data,guardMilliseconds:guardMs);self.receivedFirstFrame=true;self.receivedVideo+=1}
         catch{self.stop(message:TCText("Could not decode incoming video. This video error is separate from the input connection."))}
@@ -213,6 +255,9 @@ struct OwnedDisplayMonitor {
       if data.first==7 {
         do {try self.viewer?.acceptCursor(data)} catch {self.stop(message:TCText("Invalid screen video frame."))};return
       }
+#if TC_QUALITY_TIERS
+      self.observeQuality(data)
+#endif
       if data.first==2 || data.first==6 {
         do {guard let viewer=self.viewer else{throw DisplayVideoError.decoderFailed};try viewer.accept(data,guardMilliseconds:guardMs);self.receivedFirstFrame=true;self.receivedVideo+=1}
         catch{self.stop(message:TCText("Could not decode incoming video. This video error is separate from the input connection."))}
@@ -386,6 +431,14 @@ struct OwnedDisplayMonitor {
       _=setsockopt(fd,SOL_SOCKET,SO_RCVBUF,&channelBuffer,socklen_t(MemoryLayout<Int32>.size))
     }
     let process=Process(),input=Pipe(),output=FileHandle(fileDescriptor:videoFDs[0],closeOnDealloc:true),errors=Pipe();process.executableURL=url;process.arguments=arguments;process.standardInput=input;process.standardOutput=FileHandle(fileDescriptor:videoFDs[1],closeOnDealloc:false);process.standardError=errors
+
+#if TC_QUALITY_TIERS
+    var environment=ProcessInfo.processInfo.environment
+    let quality=transport?.agreedQuality
+    environment["TC_VIDEO_CODECS"]=quality?.codecNames.joined(separator:",") ?? "h264"
+    environment["TC_VIDEO_INITIAL_TIER"]=String(quality?.ceiling ?? 0)
+    process.environment=environment
+#endif
     do {try process.run()} catch {close(videoFDs[1]);throw error}
     close(videoFDs[1]) // The helper holds its own copy; EOF must follow the helper's exit.
     helper=process;
@@ -394,6 +447,9 @@ struct OwnedDisplayMonitor {
     try process.run();helper=process;
 #endif
 heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
+#if TC_QUALITY_TIERS
+    // Session-start ceiling was passed via environment before process.run().
+#endif
     let diagnosticStream=transport?.diagnosticStreamID
     DispatchQueue.global(qos:.utility).async {
       let handle=errors.fileHandleForReading;defer{try? handle.close()};var lines=DisplayDiagnosticLines()
@@ -424,6 +480,9 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
       func exact(_ size:Int)throws->Data {var data=Data();while data.count<size {guard let part=try handle.read(upToCount:size-data.count),!part.isEmpty else{throw Failure("Video pipe ended")};data.append(part)};return data}
 #endif
       var deliveryFailed=false
+#if TC_QUALITY_TIERS
+      var lastTier:Int?
+#endif
       do {while true {
         let header=try exact(4),size=header.reduce(UInt32(0)){($0<<8)|UInt32($1)}
         guard size>0,size<=4194304 else{throw Failure("Invalid video framing")}
@@ -439,6 +498,12 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
         let deliver=DispatchQueue.main.sync {self?.active==true && self?.epoch==token}
 #endif
         if !deliver || deliveryFailed {continue}
+#if TC_QUALITY_TIERS
+        if let tier=DisplayQualityCapabilities.tier(in:payload),tier != lastTier {
+          lastTier=tier
+          DispatchQueue.main.async {guard let self,self.active,self.epoch==token else{return};self.observeQuality(payload)}
+        }
+#endif
         if payload.first==1 {
           guard payload.count==5 else{throw Failure("Invalid owned display identity")}
           let id=payload.dropFirst().reduce(UInt32(0)){($0<<8)|UInt32($1)}
@@ -470,6 +535,9 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
     guard active || cleaning else{return}
     if cleaning {if !pausing && !cleanupRunning{cleanUpHelper()};return}
     captureVirtualPlacement(now:ProcessInfo.processInfo.systemUptime,force:true)
+#if TC_QUALITY_TIERS
+    currentDisplayCodecName=nil
+#endif
     finalMessage=message;active=false;cleaning=true;epoch=UUID();timer?.invalidate();timer=nil
     for (center,observer) in observers{center.removeObserver(observer)};observers=[]
     #if TC_FRESH_RECEIVER_SAFETY
@@ -537,7 +605,11 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
     displayMode.finishInputDisplay={[weak self] original in guard let self else{throw Failure("Input owner unavailable")};try self.relay.finishDisplayTopologyRemoval(original:original)}
     displayMode.abortInputTransition={[weak self] in self?.relay.abortDisplayTopologyTransition()}
     displayMode.userStopped={[weak self] in self?.sharingUserStoppedVideo()}
-    displayMode.status={[weak self] text in guard let self else{return};self.displayStatus.stringValue=text;self.updateConnectionState();self.connectButton.isEnabled = !self.relay.hasSession && !self.displayMode.cleaning;self.mode.isEnabled = !self.displayMode.active && !self.displayMode.cleaning;self.sharingDisplayStatusDidChange()}
+    displayMode.status={[weak self] text in guard let self else{return};self.displayStatus.stringValue=text;self.updateConnectionState();self.connectButton.isEnabled = !self.relay.hasSession && !self.displayMode.cleaning;self.mode.isEnabled = !self.displayMode.active && !self.displayMode.cleaning;self.sharingDisplayStatusDidChange()
+#if TC_QUALITY_TIERS
+      self.refreshDisplayQualityUI()
+#endif
+    }
   }
   func beginDisplay(sending:Bool) {
     // Automatic resume must not reopen video while the user is quitting.
@@ -549,6 +621,9 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
     guard let destination=relay.authenticatedSharingPeerHost,DisplayPeerRoute.valid(destination) else{displayStatus.stringValue=TCText("Waiting for the authenticated peer route.");return}
     displayMode.inputBindingConflicts={[weak self] in guard let self,let current=self.relay.authenticatedDevicePair else{return false};return current != pair || self.relay.inputIsSender != !sending}
     displayMode.inputBindingValid={[weak self] in guard let self else{return false};return self.relay.authenticated && self.relay.authenticatedDevicePair==pair && self.relay.inputIsSender == !sending}
+#if TC_QUALITY_TIERS
+    displayMode.qualityExtensionEnabled=relay.peerVideoQualityCompatible
+#endif
     do{try displayMode.start(sending:sending,peer:destination,expectedPair:pair)}catch{displayStatus.stringValue=safeConnectionError(error)}
   }
   @objc func sendDisplay(){sharingUserRequestedVideo(sending:true);beginDisplay(sending:true)}

@@ -160,6 +160,7 @@ struct Wire: Codable {
   var desktopGlobalY:Double?
   // Separately negotiated: old map peers intentionally discard system gestures.
   var desktopGestureCodec:Int? = nil
+  var videoQualityCodec:Int? = nil
   var displayPreferenceCodec:Int? = nil
   var displayPreference:Bool? = nil
   var desktopGestureTargetID:UInt32? = nil
@@ -537,6 +538,7 @@ struct PeerValidator {
       ? (concurrentDisplaySupported ? ["displayPaused"]:[]) + ["event", "dock", "appGesture", "begin", "commit", "cancel", "returnAck", "ping"] + (cursorVisibilitySupported ? ["cursorMode"]:[])
       : (concurrentDisplaySupported ? ["displayPause","displayResume"]:[]) + ["ready", "active", "return", "cancel", "available"]
     guard permitted.contains(w.kind) else { throw Failure("Invalid packet role") }
+    guard w.videoQualityCodec == nil else{throw Failure("Unexpected video quality capability")}
     guard w.concurrentDisplayCodec == nil else{throw Failure("Unexpected display capability")}
     guard w.multiDisplayDesktopCodec == nil,w.desktopGestureCodec==nil else{throw Failure("Unexpected desktop coordinate capability")}
     if w.desktopGestureTargetID != nil {guard w.kind=="dock",senderPeer,multiDisplayDesktopSupported,desktopGesturesSupported,w.desktopGestureTargetID != 0 else{throw Failure("Unexpected system gesture target")}}
@@ -1063,6 +1065,7 @@ final class Relay {
   private(set) var authenticatedSharingPeerHost:String?
   var automaticInputSharingPermitted:((LayoutDevicePair,Bool)->Bool)?
   var sharingEmergencyStopped:(()->Void)?
+  private(set) var peerVideoQualityCompatible=false
   private(set) var displayPreferenceCompatible=false
   private(set) var peerDisplayPreference:Bool?
   var displayPreferenceChanged:((Bool)->Void)?
@@ -2620,7 +2623,7 @@ final class Relay {
     desktopValidatedEpoch=nil
     let barrierCompletion=displayBarrierCompletion;displayBarrierCompletion=nil;displayBarrier=nil
     receiverOwnsMapTransition=false;receiverMapPublicationCandidate=nil
-    authenticatedDevicePair=nil;authenticatedSharingPeerHost=nil;displayPreferenceCompatible=false;peerDisplayPreference=nil;concurrentDisplayCompatible=false;multiDisplayDesktopCompatible=false;desktopSystemGestureCompatible=false;displayBarrierTokens.removeAll();displayRemoteGeometryTemporary=false;displayRemoteOriginalLayout=nil
+    authenticatedDevicePair=nil;authenticatedSharingPeerHost=nil;peerVideoQualityCompatible=false;displayPreferenceCompatible=false;peerDisplayPreference=nil;concurrentDisplayCompatible=false;multiDisplayDesktopCompatible=false;desktopSystemGestureCompatible=false;displayBarrierTokens.removeAll();displayRemoteGeometryTemporary=false;displayRemoteOriginalLayout=nil
     receiverDesktop=nil;sourceOrigin=nil;receiverDesktopAdoptedRevision=0;receiverDesktopAdoptedFingerprint=nil;receiverDesktopPublishRevision=0;receiverDesktopPublishedFingerprint=nil;pendingInitialSourceOriginRestore=false
     // Preserve portal projection until forceLocal consumes it.
     onReceiverDesktopChanged?()
@@ -2901,12 +2904,17 @@ final class Relay {
         }
         let proofFinishedAt=ProcessInfo.processInfo.systemUptime
         stage="Encrypted role confirmation"
+        #if TC_QUALITY_TIERS
+        let localVideoQualityCodec:Int? = 1
+        #else
+        let localVideoQualityCodec:Int? = nil
+        #endif
         try sendFrame(
           c,
           seal(
             Wire(
               concurrentDisplayCodec:1,kind: sendMode ? "sender-hello-v5" : "receiver-hello-v5", session: localSession,
-              sequence: 0, os: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,osBuild:systemBuildIdentifier(),gestureCodec:DockGestureCodec.supported ? 1 : 0,appGestureCodec:AppGestureCodec.supported ? 1 : 0,cursorVisibilityCodec:1,peerDisplayName:ConnectionNotificationTracker.displayName(Host.current().localizedName ?? "ThunderControl Mac"),multiDisplayDesktopCodec:1,desktopGestureCodec:DockGestureCodec.supported ? 1:0,displayPreferenceCodec:1), k))
+              sequence: 0, os: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,osBuild:systemBuildIdentifier(),gestureCodec:DockGestureCodec.supported ? 1 : 0,appGestureCodec:AppGestureCodec.supported ? 1 : 0,cursorVisibilityCodec:1,peerDisplayName:ConnectionNotificationTracker.displayName(Host.current().localizedName ?? "ThunderControl Mac"),multiDisplayDesktopCodec:1,desktopGestureCodec:DockGestureCodec.supported ? 1:0,videoQualityCodec:localVideoQualityCodec,displayPreferenceCodec:1), k))
         var remoteHello = try unseal(readFrame(c), k)
         guard (sendMode || remoteHello.session==pairingScope),remoteHello.kind == (sendMode ? "receiver-hello-v5" : "sender-hello-v5") else {
           throw Failure("Handshake role mismatch")
@@ -2917,6 +2925,7 @@ final class Relay {
         let multiDisplayDesktopCompatibleNegotiated=remoteHello.multiDisplayDesktopCodec==1
         let desktopSystemGestureNegotiated=multiDisplayDesktopCompatibleNegotiated && compatible && remoteHello.desktopGestureCodec==1
         let displayPreferenceNegotiated=multiDisplayDesktopCompatibleNegotiated && remoteHello.displayPreferenceCodec==1
+        let videoQualityNegotiated=localVideoQualityCodec==1 && displayPreferenceNegotiated && remoteHello.videoQualityCodec==1
         let visibilityCompatible=remoteHello.cursorVisibilityCodec==1
         let appCompatible=AppGestureCodec.compatible(build:remoteHello.osBuild,codec:remoteHello.appGestureCodec)
         remoteHello.kind = "hello"
@@ -2942,6 +2951,7 @@ final class Relay {
           DisplayPeerRoute.rememberAuthenticatedSocket(c)
           self.authenticatedDevicePair=confirmedLayoutPair;self.authenticatedSharingPeerHost=DisplayPeerRoute.authenticatedSocketHost(c);self.concurrentDisplayCompatible=displayCompatible
           self.multiDisplayDesktopCompatible=multiDisplayDesktopCompatibleNegotiated;self.desktopSystemGestureCompatible=desktopSystemGestureNegotiated
+          self.peerVideoQualityCompatible=videoQualityNegotiated
           self.displayPreferenceCompatible=displayPreferenceNegotiated;self.peerDisplayPreference=nil
           self.layoutDevicePair=sendMode ? confirmedLayoutPair:nil
           self.pendingInitialLayoutRestore=sendMode
@@ -3980,6 +3990,11 @@ final class PasteCommandProbe: NSResponder {
   let connectionNotifications=ConnectionNotifications()
   let relay:Relay
   let displayMode=DisplayModeController()
+  #if TC_QUALITY_TIERS
+  let displayQualityCapPicker=NSPopUpButton(frame:.zero,pullsDown:false)
+  let displayPresentationPicker=NSSegmentedControl(labels:DisplayPresentationMode.allCases.map(\.label),trackingMode:.selectOne,target:nil,action:nil)
+  let displayQualityActualLabel=NSTextField(wrappingLabelWithString:"")
+  #endif
   let displayPreferenceToggle=NSButton(checkboxWithTitle:TCText("Use this Mac as a virtual display"),target:nil,action:nil)
   var displayPreferencePending:Bool?
   var displayPreferencePendingPair:LayoutDevicePair?
@@ -4127,7 +4142,12 @@ final class PasteCommandProbe: NSResponder {
     layoutTab.view = layoutContainer
     settingsTabs.addTabViewItem(layoutTab)
     let appearanceTab=NSTabViewItem(identifier:"appearance");appearanceTab.label=TCText("Settings")
-    appearanceTab.view=appearance.makePreferencesView();settingsTabs.addTabViewItem(appearanceTab)
+    #if TC_QUALITY_TIERS
+    appearanceTab.view=setupDisplayQualityUI(appearanceView:appearance.makePreferencesView())
+    #else
+    appearanceTab.view=appearance.makePreferencesView()
+    #endif
+    settingsTabs.addTabViewItem(appearanceTab)
     installDisplaySharing()
     screenLayout.onArrangementChanged = { [weak self] right,value in self?.setScreenArrangement(remoteOnRight:right,offset:value) }
     screenLayout.onSourceOriginChanged = { [weak self] origin in guard let self else{return}; _ = self.relay.setSourceOrigin(origin,fromLocalLayoutDrag:self.screenLayout.isSourceDragActive); self.refreshLayout() }
@@ -4609,7 +4629,12 @@ final class PasteCommandProbe: NSResponder {
   func tabView(_ tabView:NSTabView,didSelect tabViewItem:NSTabViewItem?) {resizeForCurrentTab()}
   func resizeForCurrentTab() {
     guard let window,let id=settingsTabs.selectedTabViewItem?.identifier as? String else{return}
-    let height:CGFloat = id=="displayStream" ? 570 : id=="layout" ? 520 : id=="permissions" ? 560 : id=="appearance" ? 260 : mode.selectedSegment==0 ? 350:260
+    #if TC_QUALITY_TIERS
+    let preferencesHeight:CGFloat = 660
+    #else
+    let preferencesHeight:CGFloat = 260
+    #endif
+    let height:CGFloat = id=="displayStream" ? 570 : id=="layout" ? 520 : id=="permissions" ? 560 : id=="appearance" ? preferencesHeight : mode.selectedSegment==0 ? 350:260
     let width:CGFloat = id=="displayStream" ? 660 : id=="layout" ? 740 : id=="permissions" ? 640:560
     let target=window.frameRect(forContentRect:NSRect(x:0,y:0,width:width,height:height))
     guard abs(window.frame.height-target.height)>1 || abs(window.frame.width-target.width)>1 else{return}
@@ -4737,6 +4762,9 @@ final class PasteCommandProbe: NSResponder {
   func refreshModeUI() {
     automatic.isEnabled = !relay.displayTopologyTransitionActive;forward.isEnabled = !relay.displayTopologyTransitionActive;enable.isEnabled = !relay.displayTopologyTransitionActive
     refreshDisplayPreferenceUI()
+    #if TC_QUALITY_TIERS
+    refreshDisplayQualityUI()
+    #endif
     let sending=mode.selectedSegment==0
     sendSection.isHidden = !sending; receiveSection.isHidden = sending
     connectButton.title = sending ? TCText("Connect") : TCText("Resume Listening")
@@ -5481,6 +5509,13 @@ struct ThunderControlMain {
     } else if CommandLine.arguments.contains("--desktop-map-self-test") {
       exit(runDesktopMapTransitionTests()==0 ? 0:1)
     } else if CommandLine.arguments.contains("--self-test") {
+      #if TC_QUALITY_TIERS
+      check(runDisplayQualityPolicySelfTests()==0)
+      check(runDisplayQualityNegotiationTests()==0)
+      check(runDisplayQualityTransportTests()==0)
+      check(runDisplayRuntimePresentationTests()==0)
+      check(runDisplayRuntimeViewerModeTests()==0)
+      #endif
       do { try tests();check(runLocalizationTests()==0);check(runConcurrentDisplayTests()==0);check(runReceiverDesktopRelayTests()==0);check(runReceiverDesktopTests()==0);check(runSavedDesktopPlacementTests()==0);check(runReceiverDesktopUITests()==0);check(runDesktopMapTransitionTests()==0);check(runDesktopHandoffRoutingTests()==0);check(runDesktopEntryPolicyTests()==0);check(runDisplayHeartbeatTests()==0);check(runDisplayTrustTests()==0);check(runDisplayRemoteInputTests()==0);check(runDisplayTransportTests()==0);check(runDisplayCadenceTests()==0);check(runDisplayFramePacingTests()==0);check(runDisplayVideoFormatTests()==0);check(runSavedSharingStateTests()==0);check(runAutomaticSharingResumeTests()==0);check(runSharingLifecycleIntegrationTests()==0);check(runDisplayPreferenceTests()==0);check(runUpdateReleaseTests()==0);check(runSavedVirtualDisplayPlacementTests()==0);check(runVirtualDisplayPlacementSessionTests()==0);check(runDisplayVideoDecoderTests()==0);check(runDisplayDecodeWorkerTests()==0);check(runScrollReplayTests()==0);check(runDiscoveryRecoveryPolicyTests()==0);check(runNativeGestureTests()==0);check((runDockTransferStateTests()+runDesktopSystemGestureTests())==0);check(runTransitionMotionTests()==0);check(runGestureTraceTests()==0);check(runCursorVisibilityTests()==0);check(runConnectedLayoutTests()==0);check(runCursorModeProtocolTests()==0);ReceiverCursorFocusTests.run();check(runAutomaticConnectionPolicyTests()==0);check(runCableReconnectPolicyTests()==0);check(runReceiverFocusRetryTests()==0);check(runReturnWarpResumeTests()==0);check(runDiagnosticStoreTests()==0);check(runDevelopmentDiagnosticsTests()==0);check(runDevelopmentFrameTraceTests()==0);check(runDisplayDiagnosticLinesTests()==0);check(runTrustedPairingTests()==0);check(runConnectionNotificationTests()==0);check(runSingleConnectionNotificationTests()==0);check(runAppAppearancePreferencesTests()==0);check(runAppWindowPresentationPolicyTests()==0);check(runConnectedWindowVisibilityTests()==0);check(runSavedScreenLayoutTests()==0);check(Relay.verifyDeviceLayoutPersistenceForTests());check(runSessionAutoResumeTests()==0);check(runSessionSuspensionOriginTests()==0);check(Relay.verifySessionSuspensionOriginsForTests());check(runAutomaticReconnectBackoffTests()==0);check(runBridgeRecoverySchedulingTests()==0);check(runLockedTransportPolicyTests()==0);check(runAuthenticatedRouteHintTests()==0);check(runFastReconnectPolicyTests()==0);check(Relay.verifyLockedTransportInputBarrierForTests());check(!Relay().receiverWantsCursorHidden);ScreenArrangementDragTests.run();check(Relay.verifyReceiverRecoveryBlocksStartForTests());check(Relay.verifyReceiverPhysicalInputCancelsActivationForTests());try dockProtocolTests();try appGesturePacketTests();print("PASS gesture memory classification and system stream ordering; no posting") } catch {
         fputs("FAIL \(error)\n", stderr)
         exit(1)

@@ -226,6 +226,14 @@ private final class DisplayTransportRun {
   var timers: [DispatchSourceTimer] = []
   let expectedPair:LayoutDevicePair
   let viewerFormat:DisplayVideoFormat
+#if TC_QUALITY_TIERS
+  var qualityEnabled=false
+  var qualityMask:UInt8=1
+  var localCeiling=3,peerCeiling=3,congestionCeiling=3,actualTier=0
+  var congestion=DisplayQualityCongestion()
+  var pendingQualityCeiling:Int?
+  var qualitySendScheduled=false,qualityNotificationPending=false
+#endif
   init(initial: OwnedSocket, bridge: Bridge, sending: Bool, remote: String?,expectedPair:LayoutDevicePair,viewerFormat:DisplayVideoFormat,diagnosticRecorder:DevelopmentDiagnostics = .shared) {
     self.diagnosticRecorder=diagnosticRecorder
     self.expectedPair=expectedPair;self.viewerFormat=viewerFormat
@@ -293,6 +301,55 @@ final class DisplayTransport: @unchecked Sendable {
   var onFailure: ((String) -> Void)?
   var onLatency: ((Double?) -> Void)?
   private let lock = NSLock()
+#if TC_QUALITY_TIERS
+  var qualityExtensionEnabled=false // Set from authenticated Relay before start.
+  var onQualityLimitChange: ((Int) -> Void)?
+  private let qualityQueue=DispatchQueue(label:"ThunderControl.video.quality")
+  private var desiredQualityCeiling=DisplayQualityPreferences.maximumTier.rawValue // protected by lock
+  var agreedQuality:DisplayQualityCapabilities? {
+    lock.lock();let run=current;lock.unlock();guard let run else{return nil}
+    run.state.lock();defer{run.state.unlock()}
+    return try? .init(mask:run.qualityMask,ceiling:min(run.localCeiling,run.peerCeiling,run.congestionCeiling))
+  }
+  private func notifyQuality(_ run:DisplayTransportRun) {
+    run.state.lock()
+    if run.qualityNotificationPending {run.state.unlock();return}
+    run.qualityNotificationPending=true;run.state.unlock()
+    DispatchQueue.main.async {[weak self,weak run] in
+      guard let self,let run else{return}
+      run.state.lock();run.qualityNotificationPending=false;run.state.unlock()
+      guard self.isCurrent(run),let latest=self.agreedQuality else{return}
+      if run.sending {self.onQualityLimitChange?(latest.ceiling)}
+    }
+  }
+  func updateQualityCeiling(_ ceiling:Int) {
+    guard (0...3).contains(ceiling) else{return}
+    lock.lock();desiredQualityCeiling=ceiling;let held=current;lock.unlock()
+    guard let run=held else{return} // Latest value is replayed after authentication.
+    run.state.lock()
+    let ready=run.authenticated && run.qualityEnabled
+    let accepted=run.qualityMask & UInt8((1 << (min(ceiling,run.peerCeiling)+1))-1) != 0
+    guard ready,accepted,run.localCeiling != ceiling else{run.state.unlock();return}
+    run.localCeiling=ceiling;run.congestionCeiling=3;run.congestion=DisplayQualityCongestion()
+    run.pendingQualityCeiling=ceiling
+    let schedule = !run.qualitySendScheduled
+    run.qualitySendScheduled=true;run.state.unlock()
+    guard schedule else{return}
+    qualityQueue.async {[weak self,weak run] in
+      guard let self,let run else{return}
+      while self.isCurrent(run) {
+        run.state.lock();let next=run.pendingQualityCeiling;run.pendingQualityCeiling=nil
+        if next==nil {run.qualitySendScheduled=false}
+        run.state.unlock()
+        guard let next else{return}
+        do {try run.transmit(Data([13,1,UInt8(next)]))}
+        catch {self.fail(run,"영상 옵션 변경 전송에 실패했습니다.",diagnosticReason:4);return}
+        self.notifyQuality(run)
+      }
+    }
+  }
+
+#endif
   private var current: DisplayTransportRun?
   private var generation = UUID()
   private var pendingStart = false
@@ -394,6 +451,10 @@ final class DisplayTransport: @unchecked Sendable {
   func start(sending: Bool, peer: String,expectedPair:LayoutDevicePair,viewerFormat:DisplayVideoFormat = .standard) throws {
     guard viewerFormat.valid else { throw DisplayTransportError.invalid }
     stop()
+#if TC_QUALITY_TIERS
+    let qualityEnabled=qualityExtensionEnabled, qualityCeiling=DisplayQualityPreferences.maximumTier.rawValue
+    lock.lock();desiredQualityCeiling=qualityCeiling;lock.unlock()
+#endif
     let remote = sending ? try address(peer, 49178) : nil // Pure validation only.
     let deadline = ProcessInfo.processInfo.systemUptime + 15
     lock.lock(); let epoch = generation; pendingStart = true; lock.unlock()
@@ -412,6 +473,9 @@ final class DisplayTransport: @unchecked Sendable {
           let initial = OwnedSocket(try boundSocket(b, sending ? 0 : 49178))
           if !sending { guard listen(initial.fd, 1) == 0 else { throw DisplayTransportError.unavailable } }
           run = DisplayTransportRun(initial: initial, bridge: b, sending: sending, remote: sending ? peer : nil,expectedPair:expectedPair,viewerFormat:viewerFormat)
+#if TC_QUALITY_TIERS
+          run.qualityEnabled=qualityEnabled;run.localCeiling=qualityCeiling
+#endif
           self.current = run; self.pendingStart = false; self.lock.unlock()
         } catch { self.lock.unlock(); throw error }
         self.begin(run, remote: remote, startupDeadline: sending ? deadline : nil)
@@ -447,7 +511,20 @@ final class DisplayTransport: @unchecked Sendable {
     guard !Thread.isMainThread, DisplayChannelCipher.validPayload(payload) else { throw DisplayTransportError.invalid }
     lock.lock(); let run = current; lock.unlock()
     guard let run, run.sending else { throw DisplayTransportError.stopped }
-    do { try run.transmit(payload) }
+    do {
+      let started=ProcessInfo.processInfo.systemUptime
+      try run.transmit(payload)
+#if TC_QUALITY_TIERS
+      if let tier=DisplayQualityCapabilities.tier(in:payload) {
+        let now=ProcessInfo.processInfo.systemUptime
+        run.state.lock();run.actualTier=tier
+        let lower=run.qualityEnabled ? run.congestion.observe(now:now,writeSeconds:now-started,current:min(tier,run.congestionCeiling),mask:run.qualityMask):nil
+        if let lower {run.congestionCeiling=lower}
+          run.state.unlock()
+        if lower != nil {notifyQuality(run)}
+      }
+#endif
+    }
     catch { fail(run, TCText("Screen transmission interrupted. Reconnect to continue."),diagnosticReason:4); throw error }
   }
   func sendInput(_ payload: Data) throws {
@@ -522,6 +599,22 @@ final class DisplayTransport: @unchecked Sendable {
     let capabilities = Data([8]) + Data("TC/display/stages-cursor/1".utf8)
     try run.transmit(capabilities, requireAuthentication: false)
     guard try incoming.open(displayReadFrame(fd, maximum: 64)) == capabilities else { throw DisplayTransportError.invalid }
+#if TC_QUALITY_TIERS
+    if run.qualityEnabled {
+      let local=try DisplayQualityCapabilities.local(ceiling:run.localCeiling)
+      var peerCeiling=0
+      let agreement=try displayNegotiateQualityCapabilities(enabled:true,local:local,
+        send:{try run.transmit($0,requireAuthentication:false)},receive:{
+          let data=try incoming.open(displayReadFrame(fd,maximum:64))
+          if data.first==11 {peerCeiling=try DisplayQualityCapabilities(packet:data).ceiling}
+          return data
+        })
+      run.state.lock();run.qualityMask=agreement.mask;run.peerCeiling=peerCeiling;run.state.unlock()
+    } else {
+      // Exact legacy handshake retained. A new sender never assumes old decoding support.
+      run.state.lock();run.qualityMask=1;run.localCeiling=0;run.peerCeiling=0;run.state.unlock()
+    }
+#endif
     guard isCurrent(run) else { throw DisplayTransportError.stopped }
     let diagnosticStream=SHA256.hash(data:Data(("ThunderControl/development-diagnostics/v1/"+senderNonce+receiverNonce).utf8)).map{String(format:"%02x",$0)}.joined()
     guard run.activateDiagnostics(stream:diagnosticStream) else{throw DisplayTransportError.stopped}
@@ -535,7 +628,13 @@ final class DisplayTransport: @unchecked Sendable {
       }
       catch { self.fail(run, TCText("Screen connection keepalive signal lost."),diagnosticReason:6) }
     }
-    DispatchQueue.main.sync { if self.isCurrent(run) { self.onAuthenticated?(agreedFormat) } }
+    DispatchQueue.main.sync { if self.isCurrent(run) {
+#if TC_QUALITY_TIERS
+      self.lock.lock();let latest=self.desiredQualityCeiling;self.lock.unlock()
+      self.updateQualityCeiling(latest)
+#endif
+      self.onAuthenticated?(agreedFormat)
+    } }
     var receivedDisplayIdentity = false
     var frameReadCadence = DisplayCadenceStats()
     var lastCadenceLog = ProcessInfo.processInfo.systemUptime
@@ -571,6 +670,21 @@ final class DisplayTransport: @unchecked Sendable {
         }
         continue
       }
+#if TC_QUALITY_TIERS
+      if payload.first==13 {
+        guard run.qualityEnabled,payload.count==3,payload[1]==1,payload[2]<=3 else{throw DisplayTransportError.invalid}
+        run.state.lock()
+        let candidate=Int(payload[2])
+        let valid=candidate != run.peerCeiling && run.qualityMask & UInt8((1 << (min(run.localCeiling,candidate)+1))-1) != 0
+        if valid {run.peerCeiling=candidate;run.congestionCeiling=3;run.congestion=DisplayQualityCongestion()}
+          run.state.unlock()
+        if valid && run.sending {notifyQuality(run)}
+        continue
+      }
+      if run.qualityEnabled,[UInt8(2),6,9,10].contains(payload.first ?? 255) {
+        guard let tier=DisplayQualityCapabilities.tier(in:payload),run.qualityMask & UInt8(1 << tier) != 0 else{throw DisplayTransportError.invalid}
+      }
+#endif
       guard DisplayChannelCipher.allowedPayload(payload, fromSender: !run.sending) else { throw DisplayTransportError.invalid }
       if !run.sending {
         guard payload.first == 1 ? !receivedDisplayIdentity : receivedDisplayIdentity else { throw DisplayTransportError.invalid }

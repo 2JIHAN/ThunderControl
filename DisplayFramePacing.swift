@@ -20,6 +20,18 @@ enum DisplayFrameSelectionPolicy {
     /// Oldest available decoded frame, with neither cushion nor age catchup.
     case buffered
 
+#if TC_QUALITY_TIERS
+    /// Response mode bypasses this pacer; its fallback selection is newest-only.
+    /// Smooth explicitly selects the established two-frame sequence policy,
+    /// independent of whichever legacy experiment flag accompanies this build.
+    static func forPresentationMode(_ mode: DisplayPresentationMode) -> Self {
+        switch mode {
+        case .response: return .latest
+        case .smooth: return .sequenceCatchUp
+        }
+    }
+#endif
+
     static var buildDefault: Self {
 #if TC_SEQUENCE_CATCHUP
         .sequenceCatchUp

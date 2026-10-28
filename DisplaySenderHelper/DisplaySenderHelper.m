@@ -633,7 +633,9 @@ static uint64_t submittedSequence=0;
 // Codec preference, first available wins. ProRes 422 Proxy encoded a retina frame in ~3.8ms
 // on the M4 ProRes engine versus 16-18ms for HEVC/H.264, at ~210Mbps (fine for Thunderbolt).
 // ProRes frames use kind 10 (codec FourCC + frame bytes; every frame is self-contained).
-#if defined(TC_PRORES_LT)
+#if defined(TC_QUALITY_TIERS)
+static CMVideoCodecType CodecPreference[4]={kCMVideoCodecType_H264};
+#elif defined(TC_PRORES_LT)
 // One quality step above Proxy (user found Proxy text slightly soft); ~4.2ms, ~354Mbps in the bench.
 static const CMVideoCodecType CodecPreference[]={kCMVideoCodecType_AppleProRes422LT,kCMVideoCodecType_AppleProRes422Proxy,kCMVideoCodecType_HEVC,kCMVideoCodecType_H264};
 #elif defined(TC_PRORES)
@@ -644,10 +646,91 @@ static const CMVideoCodecType CodecPreference[]={kCMVideoCodecType_HEVC,kCMVideo
 static const CMVideoCodecType CodecPreference[]={kCMVideoCodecType_H264};
 #endif
 static unsigned codecIndex=0;
+static unsigned codecCount=sizeof(CodecPreference)/sizeof(CodecPreference[0]);
+// Tier numbering is also the stdin command low nibble. Parsing is deliberately
+// byte-exact: whitespace, aliases, duplicates and ascending lists fail closed.
+static int CodecTier(CMVideoCodecType codec){
+  if(codec==kCMVideoCodecType_H264)return 0;
+  if(codec==kCMVideoCodecType_HEVC)return 1;
+  if(codec==kCMVideoCodecType_AppleProRes422Proxy)return 2;
+  if(codec==kCMVideoCodecType_AppleProRes422LT)return 3;
+  return -1;
+}
+static const char *CodecName(CMVideoCodecType codec){static const char *names[]={"h264","hevc","proxy","lt"};int tier=CodecTier(codec);return tier<0?"unknown":names[tier];}
+static BOOL ParseCodecList(const char *text,CMVideoCodecType result[4],unsigned *count){
+  static const char *names[]={"h264","hevc","proxy","lt"};
+  static const CMVideoCodecType types[]={kCMVideoCodecType_H264,kCMVideoCodecType_HEVC,kCMVideoCodecType_AppleProRes422Proxy,kCMVideoCodecType_AppleProRes422LT};
+  if(!text){result[0]=types[0];*count=1;return YES;}
+  CMVideoCodecType parsed[4];unsigned n=0;int previous=4;
+  while(*text){const char *end=strchr(text,',');size_t length=end?(size_t)(end-text):strlen(text);int tier=-1;
+    for(int i=0;i<4;i++)if(length==strlen(names[i])&&!memcmp(text,names[i],length))tier=i;
+    if(tier<0||tier>=previous||n==4)return NO;
+    parsed[n++]=types[tier];previous=tier;
+    if(!end)break;text=end+1;if(!*text)return NO;
+  }
+  if(!n)return NO;memcpy(result,parsed,n*sizeof(*result));*count=n;return YES;
+}
+static int CodecIndexForCeiling(const CMVideoCodecType *list,unsigned count,int ceiling){
+  if(ceiling<0||ceiling>3)return -1;
+  for(unsigned i=0;i<count;i++)if(CodecTier(list[i])<=ceiling)return (int)i;
+  return -1;
+}
+static BOOL ParseTier(const char *text,int *tier){if(!text||text[0]<'0'||text[0]>'3'||text[1])return NO;*tier=text[0]-'0';return YES;}
+static BOOL ParseCodecMask(const char *text,unsigned *mask){
+  if(!text||!*text)return NO;unsigned value=0;
+  for(const char *p=text;*p;p++){if(*p<'0'||*p>'9'||value>15)return NO;value=value*10+(unsigned)(*p-'0');}
+  if(value>15)return NO;*mask=value;return YES;
+}
+static BOOL ParseTierSteps(const char *text,int steps[8],unsigned *count){
+  if(!text||!*text)return NO;unsigned n=0;
+  for(;;){if(n==8||text[0]<'0'||text[0]>'3')return NO;steps[n++]=text[0]-'0';text++;
+    if(!*text)break;if(*text++!=','||!*text)return NO;
+  }
+  *count=n;return YES;
+}
+static unsigned testCodecMask=15,testCodecFailMask=0,testSwitchFailMask=0;
+static BOOL testSwitchFailure=NO;
+static int testCodecSteps[8];static unsigned testCodecStepCount=0;
+static BOOL codecTestHooks=NO,codecSwitching=NO,forceNextKeyframe=NO;
+static int handledCodecTier=-1;
+static atomic_int requestedCodecTier=3;
+static atomic_uint_fast64_t codecSwitchToken=0;
+static void MaybeSwitchCodec(void);
+static BOOL ConfigureCodecs(const char *mode){
+#if defined(TC_QUALITY_TIERS)
+  if(!ParseCodecList(getenv("TC_VIDEO_CODECS"),CodecPreference,&codecCount))return NO;
+  int ceiling=3;const char *initial=getenv("TC_VIDEO_INITIAL_TIER");if(initial&&!ParseTier(initial,&ceiling))return NO;
+  int index=CodecIndexForCeiling(CodecPreference,codecCount,ceiling);if(index<0)return NO;
+  codecIndex=(unsigned)index;atomic_store(&requestedCodecTier,ceiling);
+  // These fault/availability hooks cannot be enabled in --stream or benchmarks.
+  codecTestHooks=!strcmp(mode,"--synthetic");
+  if(codecTestHooks){const char *mask=getenv("TC_TEST_CODEC_MASK"),*fail=getenv("TC_TEST_CODEC_FAIL_MASK");
+    if(mask&&!ParseCodecMask(mask,&testCodecMask))return NO;
+    if(fail&&!ParseCodecMask(fail,&testCodecFailMask))return NO;
+    const char *steps=getenv("TC_TEST_CODEC_SWITCHES"),*switchFail=getenv("TC_TEST_CODEC_SWITCH_FAIL_MASK");
+    if(steps&&!ParseTierSteps(steps,testCodecSteps,&testCodecStepCount))return NO;
+    if(switchFail){if(!ParseCodecMask(switchFail,&testSwitchFailMask))return NO;testSwitchFailure=YES;}
+  }
+#else
+  (void)mode;
+#endif
+  return YES;
+}
+static int ControlByteTier(uint8_t byte){return byte>=0x20&&byte<=0x23?(int)byte-0x20:-1;}
+static void ReceiveControlByte(uint8_t byte){
+#if defined(TC_QUALITY_TIERS)
+  int tier=ControlByteTier(byte);if(tier>=0){
+    if(CodecIndexForCeiling(CodecPreference,codecCount,tier)>=0)atomic_store(&requestedCodecTier,tier);
+    else fprintf(stderr,"Encoder command rejected: no allowed codec below ceiling=%d\n",tier);
+  }
+#else
+  (void)byte;
+#endif
+}
 #define TC_CODEC_TYPE (CodecPreference[codecIndex])
 #define TC_IS_HEVC (TC_CODEC_TYPE==kCMVideoCodecType_HEVC)
 #define TC_IS_PRORES (TC_CODEC_TYPE==kCMVideoCodecType_AppleProRes422Proxy||TC_CODEC_TYPE==kCMVideoCodecType_AppleProRes422LT)
-typedef struct {double started,capturedAt;uint64_t sequence,captureSequence;uint64_t diagOrdinal,diagCapturedUS,diagAdmissionUS;} EncodeTicket;
+typedef struct {double started,capturedAt;uint64_t sequence,captureSequence;uint64_t diagOrdinal,diagCapturedUS,diagAdmissionUS;CMVideoCodecType codec;} EncodeTicket;
 static EncodeTicket diagPendingTickets[2];
 static BOOL OrderAccept(EncodedOrderWindow *order,uint64_t sequence,unsigned slots){
   if(slots<1||slots>2||sequence<order->next||sequence-order->next>=slots)return NO;
@@ -726,11 +809,12 @@ static void Encoded(void *ctx,void *source,OSStatus status,VTEncodeInfoFlags fla
     CMFormatDescriptionRef fmt=CMSampleBufferGetFormatDescription(sample);
     CMBlockBufferRef block=CMSampleBufferGetDataBuffer(sample);size_t n=block?CMBlockBufferGetDataLength(block):0;
     NSMutableData *packet=nil;
-    if(TC_IS_PRORES){
+    // Packet identity belongs to this admitted frame, never a mutable session.
+    if(ticket.codec==kCMVideoCodecType_AppleProRes422Proxy||ticket.codec==kCMVideoCodecType_AppleProRes422LT){
       if(!n||n>MaxPayload-40)Fail("encoded size");
       uint8_t kind=10;packet=[NSMutableData dataWithBytes:&kind length:1];
-      uint32_t fourcc=CFSwapInt32HostToBig((uint32_t)TC_CODEC_TYPE);[packet appendBytes:&fourcc length:4];
-    } else if(TC_IS_HEVC){
+      uint32_t fourcc=CFSwapInt32HostToBig((uint32_t)ticket.codec);[packet appendBytes:&fourcc length:4];
+    } else if(ticket.codec==kCMVideoCodecType_HEVC){
       const uint8_t *vps=NULL,*sps=NULL,*pps=NULL;size_t vn=0,sn=0,pn=0,count=0;int header=0;
       if(!fmt || CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt,0,&vps,&vn,&count,&header)!=noErr || header!=4 || count<3 || CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt,1,&sps,&sn,NULL,NULL)!=noErr || CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt,2,&pps,&pn,NULL,NULL)!=noErr || !vn||!sn||!pn||vn>UINT16_MAX||sn>UINT16_MAX||pn>UINT16_MAX)Fail("encoder parameters");
       if(!n||n>MaxPayload-40-vn-sn-pn)Fail("encoded size");
@@ -765,7 +849,15 @@ static BOOL ReferenceLimitVerified(OSStatus set,OSStatus read,CFTypeRef value){
   return set==noErr && read==noErr && value && CFGetTypeID(value)==CFNumberGetTypeID() && [(__bridge NSNumber*)value intValue]==1;
 }
 static BOOL ReadBool(CFStringRef key){CFTypeRef v=NULL;OSStatus e=VTSessionCopyProperty(encoder,key,NULL,&v);BOOL result=e==noErr&&v&&CFEqual(v,kCFBooleanTrue);if(v)CFRelease(v);return result;}
-static void InitEncoder(void){
+static BOOL InitEncoder(void);
+static BOOL NextEncoder(void){
+  if(encoder){VTCompressionSessionInvalidate(encoder);CFRelease(encoder);encoder=NULL;}
+  if(codecIndex+1>=codecCount)return NO;
+  fprintf(stderr,"Encoder fallback: unavailable=%s next=%s\n",CodecName(CodecPreference[codecIndex]),CodecName(CodecPreference[codecIndex+1]));
+  codecIndex++;return InitEncoder();
+}
+static BOOL InitEncoder(void){
+  if(codecTestHooks&&(!(testCodecMask&(1u<<CodecTier(TC_CODEC_TYPE)))||(testCodecFailMask&(1u<<CodecTier(TC_CODEC_TYPE)))))return NextEncoder();
   lowLatencyRateControl=NO;maxDelayZero=NO;speedPriority=NO;
   NSMutableDictionary *spec=[@{(__bridge NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder:@YES} mutableCopy];
   if(experimentalRateControl)spec[(__bridge NSString*)kVTVideoEncoderSpecification_EnableLowLatencyRateControl]=@YES;
@@ -779,13 +871,12 @@ static void InitEncoder(void){
   }
   if(created!=noErr||!encoder){
     if(encoder){VTCompressionSessionInvalidate(encoder);CFRelease(encoder);encoder=NULL;}
-    if(codecIndex+1<sizeof(CodecPreference)/sizeof(CodecPreference[0])){fprintf(stderr,"Encoder fallback: codec=%u unavailable status=%d\n",(unsigned)TC_CODEC_TYPE,(int)created);codecIndex++;InitEncoder();return;}
-    Fail("hardware encoder unavailable");
+    return NextEncoder();
   }
   CFStringRef profile=TC_IS_HEVC?kVTProfileLevel_HEVC_Main_AutoLevel:negotiatedFormat->pixelScale==2?(tuneBaselineProfile?kVTProfileLevel_H264_Baseline_5_2:kVTProfileLevel_H264_High_5_2):kVTProfileLevel_H264_Baseline_4_2;
   unsigned bitrate=negotiatedFormat->pixelScale==2?MIN(64000000u,MAX(16000000u,PixelWidth*PixelHeight*(tuneHighBitrate?9u:6u))):8000000u;
   NSDictionary *props=TC_IS_PRORES?@{(__bridge NSString*)kVTCompressionPropertyKey_RealTime:@YES,(__bridge NSString*)kVTCompressionPropertyKey_ExpectedFrameRate:@(targetFPS)}:@{(__bridge NSString*)kVTCompressionPropertyKey_RealTime:@YES,(__bridge NSString*)kVTCompressionPropertyKey_AllowFrameReordering:@NO,(__bridge NSString*)kVTCompressionPropertyKey_ProfileLevel:(__bridge NSString*)profile,(__bridge NSString*)kVTCompressionPropertyKey_ExpectedFrameRate:@(targetFPS),(__bridge NSString*)kVTCompressionPropertyKey_MaxKeyFrameInterval:@(targetFPS),(__bridge NSString*)kVTCompressionPropertyKey_AverageBitRate:@(bitrate)};
-  if(VTSessionSetProperties(encoder,(__bridge CFDictionaryRef)props)!=noErr)Fail("encoder setup");
+  if(VTSessionSetProperties(encoder,(__bridge CFDictionaryRef)props)!=noErr)return NextEncoder();
   if(experimentalRateControl){
     OSStatus referenceStatus=VTSessionSetProperty(encoder,kVTCompressionPropertyKey_ReferenceBufferCount,(__bridge CFTypeRef)@1);
     CFTypeRef references=NULL;OSStatus referenceRead=VTSessionCopyProperty(encoder,kVTCompressionPropertyKey_ReferenceBufferCount,NULL,&references);
@@ -794,7 +885,7 @@ static void InitEncoder(void){
     if(references)CFRelease(references);
     if(lowLatencyRateControl && !referenceVerified){
       fprintf(stderr,"Low latency fallback: referenceLimitUnverified=yes decoderBoundsUnchanged=yes\n");
-      VTCompressionSessionInvalidate(encoder);CFRelease(encoder);encoder=NULL;experimentalRateControl=NO;InitEncoder();return;
+      VTCompressionSessionInvalidate(encoder);CFRelease(encoder);encoder=NULL;experimentalRateControl=NO;return InitEncoder();
     }
   }
   if(!legacyEncoder){
@@ -806,20 +897,59 @@ static void InitEncoder(void){
     // Some hardware low-latency encoders do not expose MaxFrameDelayCount.
     // Accept only the requested low-latency encoder OR verified delay-zero;
     // report unsupported optional property instead of claiming it was applied.
-    if(!lowLatencyRateControl && !maxDelayZero && !TC_IS_PRORES)Fail("bounded low-latency encoding unavailable");
+    if(!lowLatencyRateControl && !maxDelayZero && !TC_IS_PRORES)return NextEncoder();
     if(negotiatedFormat->pixelScale==1 || benchmarkSpeed)if(@available(macOS 14.0,*)){OSStatus speed=VTSessionSetProperty(encoder,kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,kCFBooleanTrue);speedPriority=speed==noErr&&ReadBool(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality);}
   }
-  if(VTCompressionSessionPrepareToEncodeFrames(encoder)!=noErr)Fail("encoder prepare");
+  if(VTCompressionSessionPrepareToEncodeFrames(encoder)!=noErr)return NextEncoder();
   CFTypeRef hardwareValue=NULL;OSStatus hardwareStatus=VTSessionCopyProperty(encoder,kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,NULL,&hardwareValue);
   fprintf(stderr,"Hardware capability: readStatus=%d value=%s\n",(int)hardwareStatus,hardwareValue&&CFEqual(hardwareValue,kCFBooleanTrue)?"true":"false/unavailable");
   BOOL hardware=hardwareStatus==noErr&&hardwareValue&&CFEqual(hardwareValue,kCFBooleanTrue);if(hardwareValue)CFRelease(hardwareValue);
   // RequireHardwareAcceleratedVideoEncoder was mandatory in both creation paths.
   // The low-latency wrapper may not expose its optional introspection key.
-  if(!hardware && hardwareStatus!=kVTPropertyNotSupportedErr)Fail("hardware encoder required");
+  if(!hardware && hardwareStatus!=kVTPropertyNotSupportedErr)return NextEncoder();
+  fprintf(stderr,"Encoder selected: name=%s tier=%d\n",CodecName(TC_CODEC_TYPE),CodecTier(TC_CODEC_TYPE));
   fprintf(stderr,"Encoder codec: %c%c%c%c\n",(char)(TC_CODEC_TYPE>>24),(char)(TC_CODEC_TYPE>>16),(char)(TC_CODEC_TYPE>>8),(char)TC_CODEC_TYPE);
   fprintf(stderr,"Encoder: hardwareRequired=yes lowLatencyRateControl=%s maxFrameDelayZero=%s speedPriority=%s targetFPS=%d legacyConfiguration=%s\n",lowLatencyRateControl?"accepted":"fallback/not-requested",maxDelayZero?"verified":legacyEncoder?"not-requested":"unsupported",speedPriority?"verified":"unsupported/not-requested",targetFPS,legacyEncoder?"yes":"no");
+  forceNextKeyframe=YES;return YES;
+}
+// frameQueue owns admission and switch state. Never wait for a VT callback or
+// writer on that queue: FinishEncoded posts DrainCapture back to frameQueue.
+// A separate deadline also bounds a stuck CompleteFrames/create/prepare call.
+static void MaybeSwitchCodec(void){
+#if defined(TC_QUALITY_TIERS)
+  if(codecSwitching||!frameQueue)return;
+  int desired=atomic_load(&requestedCodecTier);
+  int index=CodecIndexForCeiling(CodecPreference,codecCount,desired);
+  if(index<0||desired==handledCodecTier)return;
+  handledCodecTier=desired;
+  if((unsigned)index==codecIndex)return;
+  codecSwitching=YES;
+  if(latestCapture){CVPixelBufferRelease(latestCapture);latestCapture=NULL;}
+  uint64_t token=atomic_fetch_add(&codecSwitchToken,1)+1;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW,4*NSEC_PER_SEC),dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE,0),^{
+    if(atomic_load(&codecSwitchToken)==token)Fail("encoder switch timeout");
+  });
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{@autoreleasepool{
+    VTCompressionSessionRef previous=encoder;unsigned previousIndex=codecIndex;
+    BOOL previousRate=experimentalRateControl,previousLow=lowLatencyRateControl,previousDelay=maxDelayZero,previousSpeed=speedPriority;
+    if(VTCompressionSessionCompleteFrames(previous,kCMTimeInvalid)!=noErr)Fail("encoder switch drain");
+    double deadline=Now()+3;while(atomic_load(&inFlight)){if(Now()>deadline)Fail("encoder switch drain timeout");usleep(200);}
+    // zero includes ordered pipe writes, not merely encoded callbacks. Keep
+    // submittedSequence/outputOrder intact across session replacement.
+    encoder=NULL;codecIndex=(unsigned)index;
+    BOOL prepared=InitEncoder();
+    if(prepared){VTCompressionSessionInvalidate(previous);CFRelease(previous);}
+    else {encoder=previous;codecIndex=previousIndex;experimentalRateControl=previousRate;lowLatencyRateControl=previousLow;maxDelayZero=previousDelay;speedPriority=previousSpeed;forceNextKeyframe=YES;}
+    fprintf(stderr,"Encoder switch: requested=%d actual=%s prepared=%s sourceSequencePreserved=yes displayUnchanged=yes\n",desired,CodecName(TC_CODEC_TYPE),prepared?"yes":"no/retained");
+    dispatch_async(frameQueue,^{
+      atomic_fetch_add(&codecSwitchToken,1);codecSwitching=NO;
+      MaybeSwitchCodec();if(!codecSwitching)DrainCapture();
+    });
+  }});
+#endif
 }
 static void SubmitAt(CVPixelBufferRef pixel,CMTime pts,double capturedAt){
+  if(codecSwitching)return;
   uint64_t diagGuardStartUS=DiagUS();Guard();uint64_t diagGuardUS=DiagUS()-diagGuardStartUS; // observation only
   // Bounded transient: drop BEFORE encode when owned proof is not fresh. Does
   // not touch encoded reference frames already queued; never leaks a physical
@@ -829,17 +959,19 @@ static void SubmitAt(CVPixelBufferRef pixel,CMTime pts,double capturedAt){
   if(CVPixelBufferGetWidth(pixel)!=PixelWidth||CVPixelBufferGetHeight(pixel)!=PixelHeight||CVPixelBufferGetPixelFormatType(pixel)!=(nativeYUV?kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:kCVPixelFormatType_32BGRA))Fail("capture dimensions or pixel format");
   if(submittedSequence>=UINT64_MAX-2)Fail("encoding sequence exhausted");
   EncodeTicket *ticket=malloc(sizeof(EncodeTicket));if(!ticket)Fail("encoder ticket allocation");
-  *ticket=(EncodeTicket){.started=Now(),.capturedAt=capturedAt,.sequence=submittedSequence++,.captureSequence=(uint64_t)pts.value,.diagOrdinal=diagSourceOrdinal,.diagCapturedUS=diagSourceUS,.diagAdmissionUS=DiagUS()};VTEncodeInfoFlags flags=0;
+  *ticket=(EncodeTicket){.started=Now(),.capturedAt=capturedAt,.sequence=submittedSequence++,.captureSequence=(uint64_t)pts.value,.diagOrdinal=diagSourceOrdinal,.diagCapturedUS=diagSourceUS,.diagAdmissionUS=DiagUS(),.codec=TC_CODEC_TYPE};VTEncodeInfoFlags flags=0;
   // Callback may synchronously free ticket: keep only a value copy for tracing.
   EncodeTicket diagnostic=*ticket;
   Diag("encoder_admission",diagnostic.sequence,diagnostic.diagOrdinal,"us=%llu capture_us=%llu in_flight=%u slots=%u guard_us=%llu submit_entry_us=%llu",DU(diagnostic.diagAdmissionUS),DU(diagnostic.diagCapturedUS),atomic_load(&inFlight),encodingSlots,DU(diagGuardUS),DU(diagGuardStartUS));
   Diag("encode_call_start",diagnostic.sequence,diagnostic.diagOrdinal,"us=%llu",DU(DiagUS()));
-  OSStatus diagnosticStatus=VTCompressionSessionEncodeFrame(encoder,pixel,pts,CMTimeMake(1,targetFPS),NULL,ticket,&flags);
+  NSDictionary *frameProperties=forceNextKeyframe?@{(__bridge NSString*)kVTEncodeFrameOptionKey_ForceKeyFrame:@YES}:nil;forceNextKeyframe=NO;
+  OSStatus diagnosticStatus=VTCompressionSessionEncodeFrame(encoder,pixel,pts,CMTimeMake(1,targetFPS),(__bridge CFDictionaryRef)frameProperties,ticket,&flags);
   Diag("encode_call_end",diagnostic.sequence,diagnostic.diagOrdinal,"us=%llu status=%u flags=%u",DU(DiagUS()),(unsigned)diagnosticStatus,(unsigned)flags);
   if(diagnosticStatus!=noErr)Fail("encode failed");
 }
 static void Submit(CVPixelBufferRef pixel,CMTime pts){SubmitAt(pixel,pts,Now());}
 static void DrainCapture(void){
+  MaybeSwitchCodec();if(codecSwitching)return;
   if(atomic_load(&inFlight)>=encodingSlots || !latestCapture)return;
   CVPixelBufferRef pixel=latestCapture;CMTime pts=latestCapturePTS;latestCapture=NULL;
   uint64_t savedOrdinal=diagSourceOrdinal,savedUS=diagSourceUS;
@@ -848,6 +980,7 @@ static void DrainCapture(void){
   diagSourceOrdinal=savedOrdinal;diagSourceUS=savedUS;
 }
 static void OfferCaptureAt(CVPixelBufferRef pixel,CMTime pts,double capturedAt){
+  MaybeSwitchCodec();if(codecSwitching)return;
   // At most one pending source image; replacement occurs BEFORE H264 encoding.
   // Keeping the last damage frame also prevents a frozen final cursor/window
   // position when ScreenCaptureKit sends only idle frames after motion stops.
@@ -966,7 +1099,7 @@ static void StartWatchdog(void){
       }
       struct pollfd fd={STDIN_FILENO,POLLIN,0};int r=poll(&fd,1,50);
       if(r<0&&errno!=EINTR)Fail("heartbeat poll");
-      if(r>0){ssize_t rn=read(STDIN_FILENO,buf,sizeof(buf));if(rn>0)heartbeat=Now();else if(rn==0)Fail("parent closed");else if(errno!=EAGAIN&&errno!=EINTR)Fail("heartbeat read");}
+      if(r>0){ssize_t rn=read(STDIN_FILENO,buf,sizeof(buf));if(rn>0){heartbeat=Now();for(ssize_t i=0;i<rn;i++)ReceiveControlByte(buf[i]);}else if(rn==0)Fail("parent closed");else if(errno!=EAGAIN&&errno!=EINTR)Fail("heartbeat read");}
       if(!CGPreflightScreenCaptureAccess())Fail("capture permission revoked");
     }}
   }});
@@ -1024,19 +1157,34 @@ static CVPixelBufferRef PatternPixel(unsigned n){
   CVPixelBufferUnlockBaseAddress(pixel,0);return pixel;
 }
 static int Synthetic(void){
-  InitEncoder();uint8_t id[5]={1,0,0,0,0};Output([NSData dataWithBytes:id length:5]);
-  for(int n=0;n<8;n++){@autoreleasepool {
-    CVPixelBufferRef pixel=PatternPixel((unsigned)n);
+  if(!InitEncoder())Fail("hardware encoder unavailable");handledCodecTier=atomic_load(&requestedCodecTier);
+  uint8_t id[5]={1,0,0,0,0};Output([NSData dataWithBytes:id length:5]);
+  unsigned frameCount=testCodecStepCount?testCodecStepCount*4:8;
+  if(testCodecStepCount)frameQueue=dispatch_queue_create("local.ThunderControl.synthetic.codec",DISPATCH_QUEUE_SERIAL);
+  if(testSwitchFailure)testCodecFailMask=testSwitchFailMask;
+  for(unsigned n=0;n<frameCount;n++){@autoreleasepool {
+    if(testCodecStepCount&&n%4==0){
+      int tier=testCodecSteps[n/4];
+      dispatch_sync(frameQueue,^{ReceiveControlByte((uint8_t)(0x20+tier));MaybeSwitchCodec();});
+      double deadline=Now()+4;BOOL waiting=YES;
+      while(waiting){dispatch_sync(frameQueue,^{MaybeSwitchCodec();});__block BOOL switching=NO;dispatch_sync(frameQueue,^{switching=codecSwitching;});waiting=switching;
+        if(waiting){if(Now()>deadline)Fail("synthetic switch timeout");usleep(200);}
+      }
+      fprintf(stderr,"Synthetic codec group: requested=%d actual=%s firstSequence=%llu frames=4\n",tier,CodecName(TC_CODEC_TYPE),(unsigned long long)submittedSequence);
+    }
+    CVPixelBufferRef pixel=PatternPixel(n%8);
     double deadline=Now()+3;while(atomic_load(&inFlight)>=encodingSlots){if(Now()>deadline)Fail("encoder timeout");usleep(200);}
-    Submit(pixel,CMTimeMake(n,targetFPS));CVPixelBufferRelease(pixel);
+    if(frameQueue)dispatch_sync(frameQueue,^{Submit(pixel,CMTimeMake(n,targetFPS));});else Submit(pixel,CMTimeMake(n,targetFPS));
+    CVPixelBufferRelease(pixel);
   }}
   double finalDeadline=Now()+3;while(atomic_load(&inFlight)){if(Now()>finalDeadline)Fail("encoder final timeout");usleep(200);}
-  if(atomic_load(&emitted)!=8)Fail("synthetic frame count");VTCompressionSessionInvalidate(encoder);CFRelease(encoder);
-  fprintf(stderr,"PASS synthetic hardware H264 negotiatedFormatValid=yes frames=8 maximumInFlight=%u perFrameFlush=no; no display capture or network\n",atomic_load(&maximumInFlight));return 0;
+  if(atomic_load(&emitted)!=frameCount||submittedSequence!=frameCount||outputOrder.next!=frameCount)Fail("synthetic frame count or sequence");
+  VTCompressionSessionInvalidate(encoder);CFRelease(encoder);
+  fprintf(stderr,"PASS synthetic hardware video negotiatedFormatValid=yes frames=%u maximumInFlight=%u perFrameFlush=no sequenceMonotonic=yes; no display capture or network\n",frameCount,atomic_load(&maximumInFlight));return 0;
 }
 static int CompareDouble(const void *a,const void *b){double x=*(const double*)a,y=*(const double*)b;return (x>y)-(x<y);}
 static int Benchmark(void){
-  InitEncoder();
+  if(!InitEncoder())Fail("hardware encoder unavailable");handledCodecTier=atomic_load(&requestedCodecTier);
   CVPixelBufferRef pixels[8]={0};for(unsigned n=0;n<8;n++)pixels[n]=PatternPixel(n);
   if(captureBenchmark)frameQueue=dispatch_queue_create("local.ThunderControl.capture.benchmark",DISPATCH_QUEUE_SERIAL);
   double start=Now();BOOL stalled=NO;unsigned submitted=0;
@@ -1663,6 +1811,20 @@ static int SelfTest(void){
      char line[_POSIX_PIPE_BUF];int n=snprintf(line,sizeof(line),"TC_DIAG stage=capture_callback capture=%llu us=%llu gap_us=%llu status_class=%u raw_status=%lld pts_ok=%u pts_value=%lld pts_scale=%d display_avail=%u display_ticks=%llu dirty_count=%lld entry_us=%llu fastguard_us=%llu\n",DU(UINT64_MAX),DU(UINT64_MAX),DU(UINT64_MAX),3u,-1LL,1u,-9223372036854775807LL,-1000000000,1u,DU(UINT64_MAX),-1LL,DU(UINT64_MAX),DU(UINT64_MAX));
      CHECK(n>0&&n<(int)sizeof(line)-1&&n<=512,"diag-meta-worst-case-line-fits");}
   }
+  {CMVideoCodecType list[4];unsigned count=0;int tier=-1;unsigned mask=0;
+    CHECK(ParseCodecList(NULL,list,&count)&&count==1&&list[0]==kCMVideoCodecType_H264,"codec-default-h264-only");
+    CHECK(ParseCodecList("lt,proxy,hevc,h264",list,&count)&&count==4,"codec-list-descending");
+    CHECK(CodecIndexForCeiling(list,count,3)==0&&CodecIndexForCeiling(list,count,2)==1&&CodecIndexForCeiling(list,count,1)==2&&CodecIndexForCeiling(list,count,0)==3,"codec-ceiling-downshift");
+    const char *bad[]={"","lt,","lt,,h264",",h264","h264,lt","lt,lt","LT","h264 "," hevc","av1","lt,proxy,hevc,h264,h264"};
+    for(unsigned i=0;i<sizeof(bad)/sizeof(bad[0]);i++)CHECK(!ParseCodecList(bad[i],list,&count),"codec-malformed-rejected");
+    CHECK(ParseCodecList("lt,h264",list,&count)&&count==2&&CodecIndexForCeiling(list,count,2)==1,"codec-sparse-downshift-never-invents-codec");
+    CHECK(ParseCodecList("lt,proxy",list,&count)&&CodecIndexForCeiling(list,count,1)==-1,"codec-no-unauthorized-fallback");
+    CHECK(CodecIndexForCeiling(list,count,-1)==-1&&CodecIndexForCeiling(list,count,4)==-1,"codec-invalid-ceiling");
+    CHECK(ControlByteTier(1)==-1&&ControlByteTier(0x20)==0&&ControlByteTier(0x23)==3&&ControlByteTier(0x24)==-1&&ControlByteTier(0xff)==-1,"codec-command-byte-bounds-heartbeat-unchanged");
+    {int steps[8];unsigned n=0;CHECK(ParseTierSteps("3,2,1,0",steps,&n)&&n==4&&steps[0]==3&&steps[3]==0&&!ParseTierSteps("3,",steps,&n)&&!ParseTierSteps("0,1,2,3,0,1,2,3,0",steps,&n)&&!ParseTierSteps("4",steps,&n),"codec-synthetic-step-list-bounded");}
+    CHECK(ParseTier("0",&tier)&&tier==0&&ParseTier("3",&tier)&&tier==3&&!ParseTier("03",&tier)&&!ParseTier("4",&tier)&&!ParseTier("",&tier),"codec-initial-tier-strict");
+    CHECK(ParseCodecMask("15",&mask)&&mask==15&&ParseCodecMask("0",&mask)&&mask==0&&!ParseCodecMask("16",&mask)&&!ParseCodecMask("-1",&mask)&&!ParseCodecMask("1 ",&mask),"codec-test-mask-strict");
+  }
   #undef CHECK
   fprintf(stderr,"%s selftest bounded-helper state machine + preservation policy (offline, no display mutation)\n",failures?"FAIL":"PASS");
   return failures?5:0;
@@ -1716,6 +1878,7 @@ int main(int argc,const char **argv){@autoreleasepool {
     if(!strcmp(argv[1],"--benchmark-tune")){captureBenchmark=YES;benchmark=YES;}
   }
   if(LiveVideoMode(argv[1])){LiveEncoderPolicy policy=ResponseFirstPolicy(*negotiatedFormat);encodingSlots=policy.slots;experimentalRateControl=policy.lowLatency;benchmarkSpeed=policy.speedPriority;tuneHighBitrate=policy.bitrateFactor==9;}
+  if(!ConfigureCodecs(argv[1])){fprintf(stderr,"Invalid codec configuration\n");return 2;}
   synthetic=benchmark||!strcmp(argv[1],"--synthetic")||!strcmp(argv[1],"--synthetic-tune");if(!synthetic&&strcmp(argv[1],"--stream"))return 2;
   signal(SIGPIPE,SIG_IGN);signal(SIGTERM,SignalStop);signal(SIGINT,SignalStop);signal(SIGALRM,SignalStop);
   int flags=fcntl(STDOUT_FILENO,F_GETFL);if(flags<0||fcntl(STDOUT_FILENO,F_SETFL,flags|O_NONBLOCK)<0)Fail("output flags");
@@ -1745,7 +1908,7 @@ int main(int argc,const char **argv){@autoreleasepool {
   [NSWorkspace.sharedWorkspace.notificationCenter addObserverForName:NSWorkspaceScreensDidSleepNotification object:nil queue:nil usingBlock:stop];
   [NSWorkspace.sharedWorkspace.notificationCenter addObserverForName:NSWorkspaceSessionDidResignActiveNotification object:nil queue:nil usingBlock:stop];
   [NSDistributedNotificationCenter.defaultCenter addObserverForName:@"com.apple.screenIsLocked" object:nil queue:nil usingBlock:stop];
-  InitEncoder();
+  if(!InitEncoder())Fail("hardware encoder unavailable");handledCodecTier=atomic_load(&requestedCodecTier);
   CGVirtualDisplayDescriptor *d=[[NSClassFromString(@"CGVirtualDisplayDescriptor") alloc]init];d.vendorID=OwnedDisplayVendor;d.productID=OwnedDisplayProduct;
   d.serialNum=displaySerial;d.serialNumber=displaySerial;d.name=@"ThunderControl MacBook Extension";
   d.queue=dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0);d.maxPixelsWide=PixelWidth;d.maxPixelsHigh=PixelHeight;double ppi=negotiatedFormat->pixelScale==2?220.0:96.0;d.sizeInMillimeters=CGSizeMake(PixelWidth*25.4/ppi,PixelHeight*25.4/ppi);
@@ -1957,6 +2120,10 @@ int main(int argc,const char **argv){@autoreleasepool {
   // Capture filter identity is locked to ownedID: non-owned displays are never
   // reachable through this stream, regardless of OS topology transients.
   double firstFrameDeadline=Now()+8;__block double encodeDeadline=0;__block unsigned lastProgress=0;
-  for(;;){RunPooledIteration(^{Pump(1.0/60.0);DiagPeriodic();PublishCursor();if(!atomic_load(&emitted)&&Now()>firstFrameDeadline)Fail("first frame timeout");if(atomic_load(&inFlight)){unsigned progress=atomic_load(&emitted)+atomic_load(&encoderDropped);if(!encodeDeadline||progress!=lastProgress){encodeDeadline=Now()+5;lastProgress=progress;}if(Now()>encodeDeadline)Fail("encode timeout");}else encodeDeadline=0;});}
+  for(;;){RunPooledIteration(^{Pump(1.0/60.0);
+#if defined(TC_QUALITY_TIERS)
+  dispatch_async(frameQueue,^{MaybeSwitchCodec();});
+#endif
+  DiagPeriodic();PublishCursor();if(!atomic_load(&emitted)&&Now()>firstFrameDeadline)Fail("first frame timeout");if(atomic_load(&inFlight)){unsigned progress=atomic_load(&emitted)+atomic_load(&encoderDropped);if(!encodeDeadline||progress!=lastProgress){encodeDeadline=Now()+5;lastProgress=progress;}if(Now()>encodeDeadline)Fail("encode timeout");}else encodeDeadline=0;});}
   (void)display;(void)stream;(void)sink;
 }}

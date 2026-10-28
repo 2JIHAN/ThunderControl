@@ -160,6 +160,14 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     try displayLiveRequire(ownershipFixture.sourceWindowOwnership.restore() && window.isVisible,"local return keeps viewer visible")
     for (index, packet) in frames.prefix(7).enumerated() {
         try displayLiveRequire(closed == 0, "viewer unexpectedly closed")
+#if TC_QUALITY_TIERS
+        // Explicit fixture-only switch: never used in a real streaming session.
+        if ProcessInfo.processInfo.environment["TC_TEST_PRESENTATION_SWITCH"] == "1" {
+            if index==2 {viewer.setPresentationMode(.smooth)}
+            if index==5 {viewer.setPresentationMode(.response)}
+            try displayLiveRequire(viewer.presentationMode == ((2..<5).contains(index) ? .smooth:.response), "runtime presentation mode applied without reopening")
+        }
+#endif
 #if TC_ADAPTIVE_PRESENTATION
         // Feed at panel rate: faster bursts are dropped by design to bound added delay.
         try await Task.sleep(nanoseconds: 17_000_000)

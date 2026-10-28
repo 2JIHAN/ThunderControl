@@ -789,9 +789,53 @@ struct DisplayViewerStartup {
     let format: DisplayVideoFormat
     private let targetScreen: NSScreen?
     private let frameTrace: DisplayFrameTrace
-    init(format: DisplayVideoFormat = .standard, targetScreen: NSScreen? = nil, diagnosticStream: String? = DevelopmentDiagnostics.shared.currentStream) {
-        self.format = format; self.targetScreen = targetScreen; self.frameTrace = DisplayFrameTrace(stream: diagnosticStream); super.init()
+#if TC_QUALITY_TIERS
+    // Main-actor serialization makes the latest requested choice win. Switching
+    // retires callbacks and decoded queues without restarting the decoder/window.
+    private(set) var presentationMode: DisplayPresentationMode
+#endif
+    private var usesImmediatePresentation: Bool {
+#if TC_QUALITY_TIERS
+        presentationMode == .response
+#elseif TC_IMMEDIATE_PRESENTATION
+        true
+#else
+        false
+#endif
     }
+    init(format: DisplayVideoFormat = .standard, targetScreen: NSScreen? = nil, diagnosticStream: String? = DevelopmentDiagnostics.shared.currentStream) {
+#if TC_QUALITY_TIERS
+        self.presentationMode = DisplayQualityPreferences.presentation
+#endif
+        self.format = format; self.targetScreen = targetScreen; self.frameTrace = DisplayFrameTrace(stream: diagnosticStream); super.init()
+#if TC_QUALITY_TIERS
+        frameTrace.record("presentation_mode", fields: ["mode": Double(presentationMode.rawValue)])
+#endif
+    }
+#if TC_QUALITY_TIERS
+    var qualityPresentationGenerationForTests: UInt64 { pacingGeneration }
+    func setPresentationMode(_ mode: DisplayPresentationMode) {
+        guard presentationMode != mode else { return }
+        stopReadiness(); stopPacingLink()
+        pacedFrames.clear()
+        immediatePending = nil; immediateOffered = 0; immediateReplaced = 0; immediateSubmitted = 0
+#if TC_SLOT_IMMEDIATE
+        slotUsed = false; slotHold.removeAll()
+#endif
+#if TC_ADAPTIVE_PRESENTATION
+        adaptiveSlots.reset(); adaptiveLastDrops = nil
+#endif
+        presentationMode = mode
+        // The old lazy pacer's selection is immutable. Recreate it for this mode
+        // only after dropping its retained buffers and resetting its clocks.
+        pacedFrames = DisplayFramePacer<DisplayTracedFrame>(selectionPolicy: .forPresentationMode(mode), onDiscard: { [frameTrace] frame, reason in
+            frameTrace.record("pacer_discard", identity: frame.identity, fields: ["reason": Double(reason.rawValue)])
+        })
+        rendererMetricsSample = nil
+        frameTrace.record("presentation_mode", fields: ["mode": Double(mode.rawValue), "generation": Double(pacingGeneration)])
+        if !closing, viewerWindow != nil { ensurePacingLink() }
+    }
+#endif
     var startsFullScreen = true
     private var windowEpoch: UInt64 = 0
     private var startup = DisplayViewerStartup()
@@ -818,7 +862,13 @@ struct DisplayViewerStartup {
     private var focusArmed = false
     private var viewerWindow: DisplayViewerWindow?
     private var surface: DisplayVideoSurface?
-#if TC_NATIVE_VSYNC
+#if TC_QUALITY_TIERS
+    // Match the sequenceCatchUp experiment's existing wall-budget cadence, not
+    // the unrelated native-vsync or timed-PTS experimental scheduling paths.
+    private lazy var pacedFrames = DisplayFramePacer<DisplayTracedFrame>(selectionPolicy: .forPresentationMode(presentationMode), onDiscard: { [frameTrace] frame, reason in
+        frameTrace.record("pacer_discard", identity: frame.identity, fields: ["reason": Double(reason.rawValue)])
+    })
+#elseif TC_NATIVE_VSYNC
     private lazy var pacedFrames = DisplayFramePacer<DisplayTracedFrame>(selectionPolicy: .buffered, cadencePolicy: .displayTargets, onDiscard: { [frameTrace] frame, reason in
         frameTrace.record("pacer_discard", identity: frame.identity, fields: ["reason": Double(reason.rawValue)])
     })
@@ -870,12 +920,13 @@ struct DisplayViewerStartup {
     var deadlineEndLeadForTests: Double { deadlineMinimumLeadMs }
     var deadlineLastEnqueueForTests: [String: Double]? { deadlineLastEnqueue }
 #endif
-#if TC_IMMEDIATE_PRESENTATION
+#if TC_IMMEDIATE_PRESENTATION || TC_QUALITY_TIERS
     // One newest decoded frame only. No app FPS cap, no future PTS wait:
     // macOS composites the latest submitted image at the panel's own refresh.
     private var immediatePending: DisplayTracedFrame?
     private var immediateOffered: UInt64 = 0
     private var immediateReplaced: UInt64 = 0
+    private var immediateSubmitted: UInt64 = 0
 #if TC_SLOT_IMMEDIATE
     private var slotUsed = false
     private var slotHold: [DisplayTracedFrame] = []
@@ -1072,7 +1123,7 @@ struct DisplayViewerStartup {
         receivedFrameCount += 1; presentationStats.decoded &+= 1
         // Record the exact receiver-local clock passed to the pacing policy.
         let pacingArrival = CACurrentMediaTime()
-        frameTrace.record("pacer_offer", identity: identity, fields: ["time": lastDecodedAt, "offerTime": pacingArrival, "pending": Double(pacedFrames.pendingCount)])
+        frameTrace.record("pacer_offer", identity: identity, fields: ["time": lastDecodedAt, "offerTime": pacingArrival, "pending": Double(presentationPendingCount)])
 #if TC_DEADLINE_PRESENTATION
         deadlineOffered &+= 1
         if deadlineFrames.count == 2 {
@@ -1081,29 +1132,33 @@ struct DisplayViewerStartup {
             frameTrace.record("pacer_discard", identity: old.identity, fields: ["reason": 2])
         }
         deadlineFrames.append(DisplayTracedFrame(pixel: pixel, identity: identity, decodedMainAt: lastDecodedAt))
-#elseif TC_IMMEDIATE_PRESENTATION
-        immediateOffered &+= 1
+#elseif TC_IMMEDIATE_PRESENTATION || TC_QUALITY_TIERS
+        if usesImmediatePresentation {
+            immediateOffered &+= 1
 #if TC_SLOT_IMMEDIATE
-        // Show at once unless a frame was already handed over in this refresh interval;
-        // then hold it for the next panel tick instead of letting it overwrite the first.
-        let arrived = DisplayTracedFrame(pixel: pixel, identity: identity, decodedMainAt: lastDecodedAt)
-        if immediatePending == nil && !slotUsed && slotHold.isEmpty {
-            immediatePending = arrived
-        } else {
-            slotHold.append(arrived)
-            if slotHold.count > 2 {
-                let old = slotHold.removeFirst()
+            // Show at once unless a frame was already handed over in this refresh interval;
+            // then hold it for the next panel tick instead of letting it overwrite the first.
+            let arrived = DisplayTracedFrame(pixel: pixel, identity: identity, decodedMainAt: lastDecodedAt)
+            if immediatePending == nil && !slotUsed && slotHold.isEmpty {
+                immediatePending = arrived
+            } else {
+                slotHold.append(arrived)
+                if slotHold.count > 2 {
+                    let old = slotHold.removeFirst()
+                    immediateReplaced &+= 1; presentationStats.replacedDecoded &+= 1
+                    frameTrace.record("pacer_discard", identity: old.identity, fields: ["reason": 2])
+                }
+            }
+#else
+            if let old = immediatePending {
                 immediateReplaced &+= 1; presentationStats.replacedDecoded &+= 1
                 frameTrace.record("pacer_discard", identity: old.identity, fields: ["reason": 2])
             }
-        }
-#else
-        if let old = immediatePending {
-            immediateReplaced &+= 1; presentationStats.replacedDecoded &+= 1
-            frameTrace.record("pacer_discard", identity: old.identity, fields: ["reason": 2])
-        }
-        immediatePending = DisplayTracedFrame(pixel: pixel, identity: identity, decodedMainAt: lastDecodedAt)
+            immediatePending = DisplayTracedFrame(pixel: pixel, identity: identity, decodedMainAt: lastDecodedAt)
 #endif
+        } else {
+            if pacedFrames.offer(DisplayTracedFrame(pixel: pixel, identity: identity, decodedMainAt: lastDecodedAt), at: pacingArrival) { presentationStats.replacedDecoded &+= 1 }
+        }
 #else
         if pacedFrames.offer(DisplayTracedFrame(pixel: pixel, identity: identity, decodedMainAt: lastDecodedAt), at:pacingArrival) { presentationStats.replacedDecoded &+= 1 }
 #endif
@@ -1149,7 +1204,7 @@ struct DisplayViewerStartup {
 #endif
     }
     fileprivate func displayPacingTick(generation:UInt64,targetTimestamp:Double,period:Double = 1.0/60.0) {
-        frameTrace.record("displaylink_tick", fields: ["time": CACurrentMediaTime(), "target": targetTimestamp, "generation": Double(generation), "currentGeneration": Double(pacingGeneration), "closing": closing ? 1 : 0, "active": pacingLink != nil ? 1 : 0, "pending": Double(pacedFrames.pendingCount)])
+        frameTrace.record("displaylink_tick", fields: ["time": CACurrentMediaTime(), "target": targetTimestamp, "generation": Double(generation), "currentGeneration": Double(pacingGeneration), "closing": closing ? 1 : 0, "active": pacingLink != nil ? 1 : 0, "pending": Double(presentationPendingCount)])
         guard !closing, generation == pacingGeneration, pacingLink != nil else { return }
 #if TC_RENDERER_HEALTH
         nativeDisplayLinkTicks &+= 1
@@ -1187,11 +1242,12 @@ struct DisplayViewerStartup {
     @discardableResult func requestRendererMetricsForTests() -> Bool { requestRendererMetrics() }
     var pacingActiveForTests: Bool { pacingLink != nil }
     var pacingTicksForTests: UInt64 { displayLinkCadence.count }
-    var pacingPendingForTests: Int {
+    var pacingPendingForTests: Int { presentationPendingCount }
+    private var presentationPendingCount: Int {
 #if TC_DEADLINE_PRESENTATION
         deadlineFrames.count
-#elseif TC_IMMEDIATE_PRESENTATION
-        immediatePending == nil ? 0 : 1
+#elseif TC_IMMEDIATE_PRESENTATION || TC_QUALITY_TIERS
+        usesImmediatePresentation ? (immediatePending == nil ? 0 : 1) : pacedFrames.pendingCount
 #else
         pacedFrames.pendingCount
 #endif
@@ -1203,9 +1259,11 @@ struct DisplayViewerStartup {
         drainDeadlinePresentation()
         return
 #endif
-#if TC_IMMEDIATE_PRESENTATION
-        drainImmediatePresentation(layer)
-        return
+#if TC_IMMEDIATE_PRESENTATION || TC_QUALITY_TIERS
+        if usesImmediatePresentation {
+            drainImmediatePresentation(layer)
+            return
+        }
 #endif
         // Decode and renderer-readiness callbacks only queue/wake. Enqueue happens
         // exclusively on the display-link callback, never on packet arrival.
@@ -1218,7 +1276,7 @@ struct DisplayViewerStartup {
         }
         let rendererReady = renderer.isReadyForMoreMediaData
         let pacingNow = CACurrentMediaTime()
-        frameTrace.record("renderer_control", fields: ["time": pacingNow, "pacingNow": pacingNow, "target": targetTimestamp, "ready": rendererReady ? 1 : 0, "status": Double(renderer.status.rawValue), "pending": Double(pacedFrames.pendingCount), "readinessRequested": readinessRequested ? 1 : 0, "deferrals": Double(presentationStats.readinessDeferrals), "registrations": Double(readinessRegistrations), "callbacks": Double(readinessCallbacks)])
+        frameTrace.record("renderer_control", fields: ["time": pacingNow, "pacingNow": pacingNow, "target": targetTimestamp, "ready": rendererReady ? 1 : 0, "status": Double(renderer.status.rawValue), "pending": Double(presentationPendingCount), "readinessRequested": readinessRequested ? 1 : 0, "deferrals": Double(presentationStats.readinessDeferrals), "registrations": Double(readinessRegistrations), "callbacks": Double(readinessCallbacks)])
         guard rendererReady else {
             presentationStats.readinessDeferrals &+= 1
             requestRendererReadiness(renderer)
@@ -1226,7 +1284,7 @@ struct DisplayViewerStartup {
         }
         stopReadiness(ready: true)
         guard let frame = pacedFrames.take(now:pacingNow,targetTimestamp:targetTimestamp) else { return }
-        frameTrace.record("pacer_select", identity: frame.identity, fields: ["target": targetTimestamp, "time": CACurrentMediaTime(), "pacingNow": pacingNow, "pending": Double(pacedFrames.pendingCount)])
+        frameTrace.record("pacer_select", identity: frame.identity, fields: ["target": targetTimestamp, "time": CACurrentMediaTime(), "pacingNow": pacingNow, "pending": Double(presentationPendingCount)])
         let started = ProcessInfo.processInfo.systemUptime
         do {
 #if TC_TIMED_PRESENTATION
@@ -1355,11 +1413,11 @@ struct DisplayViewerStartup {
         DispatchQueue.main.asyncAfter(deadline: .now()+delay, execute: work)
     }
 #endif
-#if TC_IMMEDIATE_PRESENTATION
+#if TC_IMMEDIATE_PRESENTATION || TC_QUALITY_TIERS
     /// Decode arrival and renderer readiness submit immediately. The display
     /// link remains only as a diagnostic clock; it never gates submission.
     private func drainImmediatePresentation(_ layer: AVSampleBufferDisplayLayer) {
-        guard #available(macOS 14.0, *), let frame = immediatePending else { return }
+        guard usesImmediatePresentation, #available(macOS 14.0, *), let frame = immediatePending else { return }
         let renderer = layer.sampleBufferRenderer
         guard renderer.status != .failed else {
             frameTrace.record("renderer_failure", fields: ["status": Double(renderer.status.rawValue)])
@@ -1395,7 +1453,7 @@ struct DisplayViewerStartup {
             frameTrace.record("renderer_enqueue", identity: frame.identity, fields: [
                 "time": now, "decodedMainToEnqueueMs": (now-frame.decodedMainAt)*1000, "immediate": 1, "target": traceTarget])
             rendererCadence.observe(now)
-            presentationStats.submitted &+= 1
+            presentationStats.submitted &+= 1; immediateSubmitted &+= 1
 #if TC_SLOT_IMMEDIATE
             slotUsed = true
 #endif
@@ -1458,6 +1516,9 @@ struct DisplayViewerStartup {
                     self.rendererMetricsPending = false
                     guard !self.closing, self.pacingGeneration == generation else { return }
                     var snapshot = sample
+#if TC_QUALITY_TIERS
+                    snapshot["presentationMode"] = Double(self.presentationMode.rawValue)
+#endif
 #if TC_ADAPTIVE_PRESENTATION
                     if let drops = sample["numberOfDroppedFrames"] {
                         self.adaptiveSlots.adapt(newRendererDrops: drops - (self.adaptiveLastDrops ?? drops))
@@ -1480,10 +1541,12 @@ struct DisplayViewerStartup {
                     snapshot["pacerEmpty"] = Double(pacing.emptyTicks)
                     snapshot["pacerWaiting"] = Double(pacing.waitingTicks)
                     snapshot["pacerInvalid"] = Double(pacing.invalidInputs)
-#if TC_IMMEDIATE_PRESENTATION
-                    snapshot["pacerOffered"] = Double(self.immediateOffered)
-                    snapshot["pacerSelected"] = Double(self.presentationStats.submitted)
-                    snapshot["pacerOverflow"] = Double(self.immediateReplaced)
+#if TC_IMMEDIATE_PRESENTATION || TC_QUALITY_TIERS
+                    if self.usesImmediatePresentation {
+                        snapshot["pacerOffered"] = Double(self.immediateOffered)
+                        snapshot["pacerSelected"] = Double(self.immediateSubmitted)
+                        snapshot["pacerOverflow"] = Double(self.immediateReplaced)
+                    }
 #endif
 #if TC_DEADLINE_PRESENTATION
                     snapshot["pacerOffered"] = Double(self.deadlineOffered)
@@ -1524,7 +1587,15 @@ struct DisplayViewerStartup {
         return true
     }
     private func logCadence(force: Bool = false) {
-#if TC_NATIVE_VSYNC
+#if TC_QUALITY_TIERS
+        let pacingPolicyDescription = usesImmediatePresentation
+            ? "response 반응속도 우선 immediate newest-only capacity=1"
+            : "smooth 부드러움 우선 sequenceCatchUp wall-budget capacity=2 catchUpHoldSeconds=1"
+#elseif TC_IMMEDIATE_PRESENTATION
+        let pacingPolicyDescription = "immediate newest-only"
+#elseif TC_SEQUENCE_CATCHUP
+        let pacingPolicyDescription = "sequenceCatchUp wall-budget capacity=2 catchUpHoldSeconds=1"
+#elseif TC_NATIVE_VSYNC
         let pacingPolicyDescription = "buffered display-target-slots no-wall-budget hardAgeCap=false pacingHoldNominalMs=0"
 #elseif TC_LATEST_DECODED
         let pacingPolicyDescription = "latest-decoded hardAgeCap=false pacingHoldNominalMs=0"
@@ -1577,8 +1648,8 @@ struct DisplayViewerStartup {
         rendererMetricsSample = nil
         logCadence(force: true)
         pacedFrames.clear(); displayLinkCadence=DisplayCadenceStats()
-#if TC_IMMEDIATE_PRESENTATION
-        immediatePending = nil; immediateOffered = 0; immediateReplaced = 0
+#if TC_IMMEDIATE_PRESENTATION || TC_QUALITY_TIERS
+        immediatePending = nil; immediateOffered = 0; immediateReplaced = 0; immediateSubmitted = 0
 #if TC_SLOT_IMMEDIATE
         slotUsed = false; slotHold.removeAll()
 #endif
