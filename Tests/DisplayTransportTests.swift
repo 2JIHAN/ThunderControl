@@ -110,6 +110,8 @@ func runDisplayTransportTests() -> Int {
     // Kind 9 carries HEVC (VPS, SPS, PPS); framing accepts it like kind 2.
     verify(DisplayChannelCipher.validPayload(envelope(6,100,110,150,Data(repeating: 9,count: 10))))
     verify(!DisplayChannelCipher.validPayload(envelope(6,100,110,150,Data(repeating: 8,count: 10))))
+    // Kind 10 carries ProRes (FourCC + frame).
+    verify(DisplayChannelCipher.validPayload(envelope(6,100,110,150,Data(repeating: 10,count: 10))))
     for invalid in invalidEnvelopes {
       rejects { _ = try DisplayStreamFrameHeader(invalid) }
       rejects { _ = try DisplayStreamFrame(invalid) }

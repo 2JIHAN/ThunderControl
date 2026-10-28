@@ -117,8 +117,26 @@ private func displayValidateSPS(_ sps: Data, pps: Data, format: DisplayVideoForm
     guard try ppsBits.ue() <= 255, try ppsBits.ue() == spsID else { throw DisplayVideoError.malformed }
 }
 
+/// Decoder outputs the renderer accepts. YUV outputs avoid a BGRA conversion in the decoder.
+let displayAcceptedPixelFormats: Set<OSType> = [kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_422YpCbCr8]
+func displayDecoderOutputPreference(_ codec: CMVideoCodecType) -> [OSType] {
+#if TC_YUV_DECODE_OUTPUT
+    // ProRes 422 is 4:2:2 (2vuy matches it); H.264/HEVC are 4:2:0 (NV12 matches them).
+    let native: OSType = [kCMVideoCodecType_AppleProRes422Proxy, kCMVideoCodecType_AppleProRes422LT, kCMVideoCodecType_AppleProRes422].contains(codec)
+        ? kCVPixelFormatType_422YpCbCr8 : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+    return [native, kCVPixelFormatType_32BGRA]
+#else
+    return [kCVPixelFormatType_32BGRA]
+#endif
+}
+func displayFourCC(_ value: UInt32) -> String {
+    String(bytes: [24, 16, 8, 0].map { UInt8(truncatingIfNeeded: value >> $0) }, encoding: .ascii) ?? String(value)
+}
+
 struct DisplayH264Packet {
     static let maximumSize = 4 * 1024 * 1024
+    /// H.264 (kind 2), HEVC (kind 9) or ProRes 422 (kind 10).
+    let codec: CMVideoCodecType
     /// Present only for HEVC (packet kind 9).
     let vps: Data?
     let sps: Data
@@ -133,8 +151,17 @@ struct DisplayH264Packet {
         self.format = format
         guard payload.count >= 12, payload.count <= Self.maximumSize else { throw DisplayVideoError.malformed }
         let bytes = [UInt8](payload)
+        if bytes[0] == 10 {
+            // ProRes: codec FourCC then one self-contained frame; no parameter sets.
+            let fourcc = bytes[1..<5].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+            guard [kCMVideoCodecType_AppleProRes422Proxy, kCMVideoCodecType_AppleProRes422LT, kCMVideoCodecType_AppleProRes422].contains(fourcc) else { throw DisplayVideoError.unsupportedFormat }
+            codec = fourcc; vps = nil; sps = Data(bytes[1..<5]); pps = Data()
+            avcc = Data(bytes[5...]); isKeyFrame = true
+            return
+        }
         guard bytes[0] == 2 || bytes[0] == 9 else { throw DisplayVideoError.malformed }
         let hevc = bytes[0] == 9
+        codec = hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264
         var offset = 1
         func parameter(_ type: UInt8) throws -> Data {
             guard offset + 2 <= bytes.count else { throw DisplayVideoError.malformed }
@@ -181,6 +208,12 @@ struct DisplayH264Packet {
     func formatDescription() throws -> CMVideoFormatDescription {
         var result: CMFormatDescription?
         if let vps { return try hevcFormatDescription(vps) }
+        if codec != kCMVideoCodecType_H264 {
+            let status = CMVideoFormatDescriptionCreate(allocator: kCFAllocatorDefault, codecType: codec,
+                width: Int32(format.pixelWidth), height: Int32(format.pixelHeight), extensions: nil, formatDescriptionOut: &result)
+            guard status == noErr, let result else { throw DisplayVideoError.malformed }
+            return result
+        }
         let status = sps.withUnsafeBytes { s in pps.withUnsafeBytes { p in
             let pointers = [s.baseAddress!.assumingMemoryBound(to: UInt8.self), p.baseAddress!.assumingMemoryBound(to: UInt8.self)]
             let sizes = [sps.count, pps.count]
@@ -328,7 +361,7 @@ final class DisplayDecodeMailbox {
         decodeTiming.record((now-submission.at)*1000)
         if flags.contains(.frameDropped) { droppedCallbacks &+= 1 }
         if status == noErr, let pixel, CVPixelBufferGetWidth(pixel) == format.pixelWidth,
-           CVPixelBufferGetHeight(pixel) == format.pixelHeight, CVPixelBufferGetPixelFormatType(pixel) == kCVPixelFormatType_32BGRA {
+           CVPixelBufferGetHeight(pixel) == format.pixelHeight, displayAcceptedPixelFormats.contains(CVPixelBufferGetPixelFormatType(pixel)) {
             callbackCadence.observe(now)
             if latest != nil { mailboxReplacements &+= 1; trace.record("mailbox_replace", identity: latestIdentity) }
             latest = pixel; latestCallbackAt = now; latestIdentity = identity
@@ -491,12 +524,20 @@ private let displayDecodeCallback: VTDecompressionOutputCallback = { reference, 
             var callback = VTDecompressionOutputCallbackRecord(decompressionOutputCallback: displayDecodeCallback,
                 decompressionOutputRefCon: Unmanaged.passUnretained(box).toOpaque())
             var created: VTDecompressionSession?
-            let status = VTDecompressionSessionCreate(allocator: kCFAllocatorDefault, formatDescription: description,
-                decoderSpecification: [kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: true] as CFDictionary,
-                imageBufferAttributes: [kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
-                    kCVPixelBufferWidthKey: format.pixelWidth, kCVPixelBufferHeightKey: format.pixelHeight,
-                    kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary,
-                outputCallback: &callback, decompressionSessionOut: &created)
+            var status: OSStatus = kVTParameterErr, chosenPixelFormat: OSType = 0
+            // First output format the decoder accepts wins; BGRA is always the last resort.
+            for pixelFormat in displayDecoderOutputPreference(packet.codec) {
+                created = nil
+                status = VTDecompressionSessionCreate(allocator: kCFAllocatorDefault, formatDescription: description,
+                    decoderSpecification: [kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: true] as CFDictionary,
+                    imageBufferAttributes: [kCVPixelBufferPixelFormatTypeKey: pixelFormat,
+                        kCVPixelBufferWidthKey: format.pixelWidth, kCVPixelBufferHeightKey: format.pixelHeight,
+                        kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary,
+                    outputCallback: &callback, decompressionSessionOut: &created)
+                if status == noErr, created != nil { chosenPixelFormat = pixelFormat; break }
+            }
+            trace.record("decoder_configured", fields: ["codec": Double(packet.codec), "pixelFormat": Double(chosenPixelFormat), "status": Double(status)])
+            displayStageLog("Display decoder output codec=\(displayFourCC(packet.codec)) pixelFormat=\(displayFourCC(chosenPixelFormat))")
             guard status == noErr, let created else { logFailure(DisplayVideoError.decoderFailed, stage: "configure", status: status); throw DisplayVideoError.decoderFailed }
             worker = DisplayDecodeWorker(lease: lease) {
                 VTDecompressionSessionInvalidate(created)
@@ -583,7 +624,7 @@ private func displayImageSample(_ pixel: CVPixelBuffer, format expectedFormat: D
           width % 2 == 0, height % 2 == 0,
           width * height <= DisplayVideoFormat.maximumEncodedPixels,
           ((width + 15) / 16) * ((height + 15) / 16) <= DisplayVideoFormat.maximumEncodedMacroblocks,
-          CVPixelBufferGetPixelFormatType(pixel) == kCVPixelFormatType_32BGRA else { throw DisplayVideoError.unsupportedFormat }
+          displayAcceptedPixelFormats.contains(CVPixelBufferGetPixelFormatType(pixel)) else { throw DisplayVideoError.unsupportedFormat }
     if let expectedFormat {
         guard expectedFormat.valid, width == expectedFormat.pixelWidth, height == expectedFormat.pixelHeight else {
             throw DisplayVideoError.unsupportedFormat

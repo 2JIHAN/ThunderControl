@@ -630,13 +630,20 @@ static uint64_t submittedSequence=0;
 // HEVC test builds (-DTC_HEVC): the retina H.264 encode took 14.5-17ms per frame with wide
 // run-to-run spread; HEVC measured 15.3ms with a tighter tail. Video packets then use kind 9
 // (VPS, SPS, PPS) instead of kind 2 (SPS, PPS). Kinds 3 and 8 are handshake messages.
-#ifdef TC_HEVC
-#define TC_IS_HEVC 1
-#define TC_CODEC_TYPE kCMVideoCodecType_HEVC
+// Codec preference, first available wins. ProRes 422 Proxy encoded a retina frame in ~3.8ms
+// on the M4 ProRes engine versus 16-18ms for HEVC/H.264, at ~210Mbps (fine for Thunderbolt).
+// ProRes frames use kind 10 (codec FourCC + frame bytes; every frame is self-contained).
+#if defined(TC_PRORES)
+static const CMVideoCodecType CodecPreference[]={kCMVideoCodecType_AppleProRes422Proxy,kCMVideoCodecType_HEVC,kCMVideoCodecType_H264};
+#elif defined(TC_HEVC)
+static const CMVideoCodecType CodecPreference[]={kCMVideoCodecType_HEVC,kCMVideoCodecType_H264};
 #else
-#define TC_IS_HEVC 0
-#define TC_CODEC_TYPE kCMVideoCodecType_H264
+static const CMVideoCodecType CodecPreference[]={kCMVideoCodecType_H264};
 #endif
+static unsigned codecIndex=0;
+#define TC_CODEC_TYPE (CodecPreference[codecIndex])
+#define TC_IS_HEVC (TC_CODEC_TYPE==kCMVideoCodecType_HEVC)
+#define TC_IS_PRORES (TC_CODEC_TYPE==kCMVideoCodecType_AppleProRes422Proxy)
 typedef struct {double started,capturedAt;uint64_t sequence,captureSequence;uint64_t diagOrdinal,diagCapturedUS,diagAdmissionUS;} EncodeTicket;
 static EncodeTicket diagPendingTickets[2];
 static BOOL OrderAccept(EncodedOrderWindow *order,uint64_t sequence,unsigned slots){
@@ -714,24 +721,28 @@ static void Encoded(void *ctx,void *source,OSStatus status,VTEncodeInfoFlags fla
     if(status==noErr && (flags&kVTEncodeInfo_FrameDropped)){PublishEncoded(nil,ticket,YES);return;}
     if(status!=noErr || !sample || !CMSampleBufferDataIsReady(sample))Fail("encoder output");
     CMFormatDescriptionRef fmt=CMSampleBufferGetFormatDescription(sample);
-#ifdef TC_HEVC
-    const uint8_t *vps=NULL,*sps=NULL,*pps=NULL;size_t vn=0,sn=0,pn=0,count=0;int header=0;
-    if(!fmt || CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt,0,&vps,&vn,&count,&header)!=noErr || header!=4 || count<3 || CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt,1,&sps,&sn,NULL,NULL)!=noErr || CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt,2,&pps,&pn,NULL,NULL)!=noErr || !vn||!sn||!pn||vn>UINT16_MAX||sn>UINT16_MAX||pn>UINT16_MAX)Fail("encoder parameters");
     CMBlockBufferRef block=CMSampleBufferGetDataBuffer(sample);size_t n=block?CMBlockBufferGetDataLength(block):0;
-    if(!n||n>MaxPayload-40-vn-sn-pn)Fail("encoded size");
-    uint8_t kind=9;NSMutableData *packet=[NSMutableData dataWithBytes:&kind length:1];
-    uint16_t size=CFSwapInt16HostToBig((uint16_t)vn);[packet appendBytes:&size length:2];[packet appendBytes:vps length:vn];
-    size=CFSwapInt16HostToBig((uint16_t)sn);[packet appendBytes:&size length:2];[packet appendBytes:sps length:sn];
-    size=CFSwapInt16HostToBig((uint16_t)pn);[packet appendBytes:&size length:2];[packet appendBytes:pps length:pn];
-#else
-    const uint8_t *sps=NULL,*pps=NULL;size_t sn=0,pn=0,count=0;int header=0;
-    if(!fmt || CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt,0,&sps,&sn,&count,&header)!=noErr || header!=4 || count<2 || CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt,1,&pps,&pn,NULL,NULL)!=noErr || !sn||!pn||sn>UINT16_MAX||pn>UINT16_MAX)Fail("encoder parameters");
-    CMBlockBufferRef block=CMSampleBufferGetDataBuffer(sample);size_t n=block?CMBlockBufferGetDataLength(block):0;
-    if(!n||n>MaxPayload-38-sn-pn)Fail("encoded size");
-    uint8_t kind=2;NSMutableData *packet=[NSMutableData dataWithBytes:&kind length:1];
-    uint16_t size=CFSwapInt16HostToBig((uint16_t)sn);[packet appendBytes:&size length:2];[packet appendBytes:sps length:sn];
-    size=CFSwapInt16HostToBig((uint16_t)pn);[packet appendBytes:&size length:2];[packet appendBytes:pps length:pn];
-#endif
+    NSMutableData *packet=nil;
+    if(TC_IS_PRORES){
+      if(!n||n>MaxPayload-40)Fail("encoded size");
+      uint8_t kind=10;packet=[NSMutableData dataWithBytes:&kind length:1];
+      uint32_t fourcc=CFSwapInt32HostToBig((uint32_t)TC_CODEC_TYPE);[packet appendBytes:&fourcc length:4];
+    } else if(TC_IS_HEVC){
+      const uint8_t *vps=NULL,*sps=NULL,*pps=NULL;size_t vn=0,sn=0,pn=0,count=0;int header=0;
+      if(!fmt || CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt,0,&vps,&vn,&count,&header)!=noErr || header!=4 || count<3 || CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt,1,&sps,&sn,NULL,NULL)!=noErr || CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt,2,&pps,&pn,NULL,NULL)!=noErr || !vn||!sn||!pn||vn>UINT16_MAX||sn>UINT16_MAX||pn>UINT16_MAX)Fail("encoder parameters");
+      if(!n||n>MaxPayload-40-vn-sn-pn)Fail("encoded size");
+      uint8_t kind=9;packet=[NSMutableData dataWithBytes:&kind length:1];
+      uint16_t size=CFSwapInt16HostToBig((uint16_t)vn);[packet appendBytes:&size length:2];[packet appendBytes:vps length:vn];
+      size=CFSwapInt16HostToBig((uint16_t)sn);[packet appendBytes:&size length:2];[packet appendBytes:sps length:sn];
+      size=CFSwapInt16HostToBig((uint16_t)pn);[packet appendBytes:&size length:2];[packet appendBytes:pps length:pn];
+    } else {
+      const uint8_t *sps=NULL,*pps=NULL;size_t sn=0,pn=0,count=0;int header=0;
+      if(!fmt || CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt,0,&sps,&sn,&count,&header)!=noErr || header!=4 || count<2 || CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt,1,&pps,&pn,NULL,NULL)!=noErr || !sn||!pn||sn>UINT16_MAX||pn>UINT16_MAX)Fail("encoder parameters");
+      if(!n||n>MaxPayload-38-sn-pn)Fail("encoded size");
+      uint8_t kind=2;packet=[NSMutableData dataWithBytes:&kind length:1];
+      uint16_t size=CFSwapInt16HostToBig((uint16_t)sn);[packet appendBytes:&size length:2];[packet appendBytes:sps length:sn];
+      size=CFSwapInt16HostToBig((uint16_t)pn);[packet appendBytes:&size length:2];[packet appendBytes:pps length:pn];
+    }
     NSUInteger offset=packet.length;[packet increaseLengthBy:n];
     if(CMBlockBufferCopyDataBytes(block,0,n,(uint8_t*)packet.mutableBytes+offset)!=noErr)Fail("encoded copy");
     if(!synthetic){
@@ -763,10 +774,14 @@ static void InitEncoder(void){
     [spec removeObjectForKey:(__bridge NSString*)kVTVideoEncoderSpecification_EnableLowLatencyRateControl];
     created=VTCompressionSessionCreate(NULL,PixelWidth,PixelHeight,TC_CODEC_TYPE,(__bridge CFDictionaryRef)spec,(__bridge CFDictionaryRef)attrs,NULL,Encoded,NULL,&encoder);
   }
-  if(created!=noErr||!encoder)Fail("hardware encoder unavailable");
+  if(created!=noErr||!encoder){
+    if(encoder){VTCompressionSessionInvalidate(encoder);CFRelease(encoder);encoder=NULL;}
+    if(codecIndex+1<sizeof(CodecPreference)/sizeof(CodecPreference[0])){fprintf(stderr,"Encoder fallback: codec=%u unavailable status=%d\n",(unsigned)TC_CODEC_TYPE,(int)created);codecIndex++;InitEncoder();return;}
+    Fail("hardware encoder unavailable");
+  }
   CFStringRef profile=TC_IS_HEVC?kVTProfileLevel_HEVC_Main_AutoLevel:negotiatedFormat->pixelScale==2?(tuneBaselineProfile?kVTProfileLevel_H264_Baseline_5_2:kVTProfileLevel_H264_High_5_2):kVTProfileLevel_H264_Baseline_4_2;
   unsigned bitrate=negotiatedFormat->pixelScale==2?MIN(64000000u,MAX(16000000u,PixelWidth*PixelHeight*(tuneHighBitrate?9u:6u))):8000000u;
-  NSDictionary *props=@{(__bridge NSString*)kVTCompressionPropertyKey_RealTime:@YES,(__bridge NSString*)kVTCompressionPropertyKey_AllowFrameReordering:@NO,(__bridge NSString*)kVTCompressionPropertyKey_ProfileLevel:(__bridge NSString*)profile,(__bridge NSString*)kVTCompressionPropertyKey_ExpectedFrameRate:@(targetFPS),(__bridge NSString*)kVTCompressionPropertyKey_MaxKeyFrameInterval:@(targetFPS),(__bridge NSString*)kVTCompressionPropertyKey_AverageBitRate:@(bitrate)};
+  NSDictionary *props=TC_IS_PRORES?@{(__bridge NSString*)kVTCompressionPropertyKey_RealTime:@YES,(__bridge NSString*)kVTCompressionPropertyKey_ExpectedFrameRate:@(targetFPS)}:@{(__bridge NSString*)kVTCompressionPropertyKey_RealTime:@YES,(__bridge NSString*)kVTCompressionPropertyKey_AllowFrameReordering:@NO,(__bridge NSString*)kVTCompressionPropertyKey_ProfileLevel:(__bridge NSString*)profile,(__bridge NSString*)kVTCompressionPropertyKey_ExpectedFrameRate:@(targetFPS),(__bridge NSString*)kVTCompressionPropertyKey_MaxKeyFrameInterval:@(targetFPS),(__bridge NSString*)kVTCompressionPropertyKey_AverageBitRate:@(bitrate)};
   if(VTSessionSetProperties(encoder,(__bridge CFDictionaryRef)props)!=noErr)Fail("encoder setup");
   if(experimentalRateControl){
     OSStatus referenceStatus=VTSessionSetProperty(encoder,kVTCompressionPropertyKey_ReferenceBufferCount,(__bridge CFTypeRef)@1);
@@ -788,7 +803,7 @@ static void InitEncoder(void){
     // Some hardware low-latency encoders do not expose MaxFrameDelayCount.
     // Accept only the requested low-latency encoder OR verified delay-zero;
     // report unsupported optional property instead of claiming it was applied.
-    if(!lowLatencyRateControl && !maxDelayZero)Fail("bounded low-latency encoding unavailable");
+    if(!lowLatencyRateControl && !maxDelayZero && !TC_IS_PRORES)Fail("bounded low-latency encoding unavailable");
     if(negotiatedFormat->pixelScale==1 || benchmarkSpeed)if(@available(macOS 14.0,*)){OSStatus speed=VTSessionSetProperty(encoder,kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,kCFBooleanTrue);speedPriority=speed==noErr&&ReadBool(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality);}
   }
   if(VTCompressionSessionPrepareToEncodeFrames(encoder)!=noErr)Fail("encoder prepare");
@@ -798,6 +813,7 @@ static void InitEncoder(void){
   // RequireHardwareAcceleratedVideoEncoder was mandatory in both creation paths.
   // The low-latency wrapper may not expose its optional introspection key.
   if(!hardware && hardwareStatus!=kVTPropertyNotSupportedErr)Fail("hardware encoder required");
+  fprintf(stderr,"Encoder codec: %c%c%c%c\n",(char)(TC_CODEC_TYPE>>24),(char)(TC_CODEC_TYPE>>16),(char)(TC_CODEC_TYPE>>8),(char)TC_CODEC_TYPE);
   fprintf(stderr,"Encoder: hardwareRequired=yes lowLatencyRateControl=%s maxFrameDelayZero=%s speedPriority=%s targetFPS=%d legacyConfiguration=%s\n",lowLatencyRateControl?"accepted":"fallback/not-requested",maxDelayZero?"verified":legacyEncoder?"not-requested":"unsupported",speedPriority?"verified":"unsupported/not-requested",targetFPS,legacyEncoder?"yes":"no");
 }
 static void SubmitAt(CVPixelBufferRef pixel,CMTime pts,double capturedAt){

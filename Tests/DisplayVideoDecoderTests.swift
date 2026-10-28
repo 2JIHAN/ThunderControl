@@ -225,7 +225,11 @@ func runDisplayVideoDecoderTests() -> Int {
     check(CVPixelBufferCreate(nil, 1920, 1080, kCVPixelFormatType_32BGRA,
         [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &pixel) == kCVReturnSuccess)
     check(CVPixelBufferCreate(nil, 16, 16, kCVPixelFormatType_32BGRA, nil, &wrongSize) == kCVReturnSuccess)
-    check(CVPixelBufferCreate(nil, 1920, 1080, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, nil, &wrongFormat) == kCVReturnSuccess)
+    // NV12 and 2vuy are now accepted decoder outputs; 32ARGB is not.
+    check(CVPixelBufferCreate(nil, 1920, 1080, kCVPixelFormatType_32ARGB, nil, &wrongFormat) == kCVReturnSuccess)
+    var nv12: CVPixelBuffer?
+    check(CVPixelBufferCreate(nil, 1920, 1080, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &nv12) == kCVReturnSuccess)
+    if let nv12 { check((try? displayImmediateImageSample(nv12)) != nil) }
     if let pixel, let wrongSize, let wrongFormat {
         do {
             let sample = try displayImmediateImageSample(pixel)
