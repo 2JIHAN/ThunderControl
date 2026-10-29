@@ -598,32 +598,16 @@ static EncodedOrderWindow outputOrder={0};
 static NSData *pendingEncoded[2];
 static pthread_mutex_t outputMutex=PTHREAD_MUTEX_INITIALIZER;
 static void AppendU64(NSMutableData *data,uint64_t n){n=CFSwapInt64HostToBig(n);[data appendBytes:&n length:8];}
-// Public read-only APIs, sampled on MAIN. No event tap, Accessibility request,
-// cursor warp, hide/unhide, or input ownership change. Unknown shapes use arrow.
+// ScreenCaptureKit composites the OS cursor into video. Keep legacy overlays
+// hidden so current and older viewers cannot draw a duplicate cursor.
 static void PublishCursor(void){
   static uint64_t sequence=0;static double sampled=0;double now=Now();
   if(now-sampled<1.0/60.0)return;sampled=now;
   if(sequence==UINT64_MAX)Fail("cursor sequence exhausted");
-  BOOL visible=NO;uint8_t shape=0;uint32_t x=0,y=0;uint64_t sampledEpoch=atomic_load(&reconfigEpoch);
-  if(CanSubmitFrame() && atomic_load(&topologyArmed)){
-    uint64_t topologyBefore=atomic_load(&reconfigEpoch);
-    CGEventRef event=CGEventCreate(NULL);
-    if(event){CGPoint p=CGEventGetLocation(event);CFRelease(event);CGRect b=CGDisplayBounds(ownedID);
-      if(isfinite(p.x)&&isfinite(p.y)&&b.size.width>0&&b.size.height>0&&CGRectContainsPoint(b,p)){
-        visible=YES;x=(uint32_t)llround((p.x-b.origin.x)/b.size.width*1000000);y=(uint32_t)llround((p.y-b.origin.y)/b.size.height*1000000);
-        NSCursor *cursor=NSCursor.currentSystemCursor;
-        if([cursor isEqual:NSCursor.IBeamCursor])shape=1;
-        else if([cursor isEqual:NSCursor.crosshairCursor])shape=2;
-        else if([cursor isEqual:NSCursor.pointingHandCursor])shape=3;
-        else if([cursor isEqual:NSCursor.closedHandCursor])shape=4;
-        if(topologyBefore!=atomic_load(&reconfigEpoch)||!CanSubmitFrame()){visible=NO;shape=0;x=0;y=0;}
-      }
-    }
-  }
-  uint8_t kind=7,v=visible?1:0;NSMutableData *packet=[NSMutableData dataWithBytes:&kind length:1];AppendU64(packet,sequence++);
-  [packet appendBytes:&v length:1];[packet appendBytes:&shape length:1];x=CFSwapInt32HostToBig(x);y=CFSwapInt32HostToBig(y);[packet appendBytes:&x length:4];[packet appendBytes:&y length:4];
-  // Guard inside TryCursorOutput retains the authoritative live session check.
-  // Its atomic owned-epoch recheck hides any stale cursor before output.
+  uint64_t sampledEpoch=atomic_load(&reconfigEpoch);
+  uint8_t kind=7,hidden[10]={0};NSMutableData *packet=[NSMutableData dataWithBytes:&kind length:1];AppendU64(packet,sequence++);
+  [packet appendBytes:hidden length:sizeof(hidden)]; // visible, shape, x and y stay zero
+  // Retain the existing live session guard, atomic output and owned-epoch check.
   (void)TryCursorOutput(packet,sampledEpoch,^{Guard();},outputFD);
 }
 static uint64_t submittedSequence=0;
@@ -2111,7 +2095,7 @@ int main(int argc,const char **argv){@autoreleasepool {
   if(!target||target.width!=StreamWidth||target.height!=StreamHeight || !OwnedSafe())Fail("owned capture display missing");
   fprintf(stderr,"Capture contract: logical=%ux%u physical=%ux%u scale=%u nativeCGVerified=yes SCDisplayPointsVerified=yes\n",StreamWidth,StreamHeight,PixelWidth,PixelHeight,negotiatedFormat->pixelScale);
   SCContentFilter *filter=[[SCContentFilter alloc]initWithDisplay:target excludingWindows:@[]];
-  SCStreamConfiguration *cfg=[SCStreamConfiguration new];cfg.width=PixelWidth;cfg.height=PixelHeight;cfg.pixelFormat=kCVPixelFormatType_32BGRA;cfg.minimumFrameInterval=CMTimeMake(1,targetFPS*2);cfg.queueDepth=3;cfg.showsCursor=NO;cfg.capturesAudio=NO;
+  SCStreamConfiguration *cfg=[SCStreamConfiguration new];cfg.width=PixelWidth;cfg.height=PixelHeight;cfg.pixelFormat=kCVPixelFormatType_32BGRA;cfg.minimumFrameInterval=CMTimeMake(1,targetFPS*2);cfg.queueDepth=3;cfg.showsCursor=YES;cfg.capturesAudio=NO;
   FrameSink * __attribute__((objc_precise_lifetime)) sink=[FrameSink new];SCStream * __attribute__((objc_precise_lifetime)) stream=[[SCStream alloc]initWithFilter:filter configuration:cfg delegate:sink];
   frameQueue=dispatch_queue_create("local.ThunderControl.display.capture",DISPATCH_QUEUE_SERIAL);NSError *error=nil;
   if(![stream addStreamOutput:sink type:SCStreamOutputTypeScreen sampleHandlerQueue:frameQueue error:&error])Fail("capture output setup");
