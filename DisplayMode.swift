@@ -387,7 +387,7 @@ struct OwnedDisplayMonitor {
     #endif
     if inputBindingConflicts?()==true {stop(message:TCText("The input peer changed. Closing the previous peer's video connection."));return}
     let now=ProcessInfo.processInfo.systemUptime
-    if connected,now-lastStatsAt>=2,RunLoop.main.currentMode != .eventTracking,RunLoop.main.currentMode != .modalPanel {
+    if connected,now-lastStatsAt>=2 {
       let rate=Double(receivedVideo-lastReceivedVideo)/(now-lastStatsAt);lastReceivedVideo=receivedVideo;lastStatsAt=now
       let latency=networkRTT.map{String(format:TCText("Video channel round trip %.1fms"),$0)} ?? TCText("Measuring video latency")
       status?(sending ? TCText("Sending Mac mini → MacBook screen / ")+latency : String(format:TCText("Receiving Mac mini screen / %@ / recent %.0f fps"),latency,rate))

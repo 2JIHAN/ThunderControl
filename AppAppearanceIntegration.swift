@@ -39,7 +39,7 @@ import AppKit
   }
   func prepareAppWindowPresentation() {
     connectedWindowVisibility.userOpenedWindow(connected:relay.authenticated)
-    relay.appWindowPresentationPolicy.perform(stopSource:{self.stop()},resetLocalIntent:{
+    relay.appWindowPresentationPolicy.perform(pauseSource:{self.relay.pauseSourceForForegroundLoss()},resetLocalIntent:{
       self.relay.receiverLocalCursorOverride(reason:"local-window-opened")
       self.receiverCursorFocus.userReopened()
     })

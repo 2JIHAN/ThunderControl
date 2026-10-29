@@ -194,3 +194,23 @@ func runAppAppearancePreferencesTests() -> Int {
     print("AppAppearancePreferences: \(checks) checks, \(failures) failures")
     return failures
 }
+
+@MainActor func runSourcePreferencesConnectionTests()->Int {
+  final class Focus:ReceiverCursorFocusAPI {
+    let ownPID:Int32=1,frontmostPID:Int32?=nil,now:TimeInterval=0,isActive=false
+    func captureForeground()->Int32? {nil}
+    func targetIsAlive(_ pid:Int32)->Bool {false}
+    func activateSelf() {}
+    func activateTarget(_ pid:Int32) {}
+    func hideWindow()->Bool {false}
+    func restoreWindow() {}
+    func enqueue(after delay:TimeInterval,_ action:@escaping @MainActor ()->Void) {}
+  }
+  let passed=Relay.verifySourceWindowPresentationForTests { source in
+    let app=App(relay:source)
+    app.receiverCursorFocus=ReceiverCursorFocusController(api:Focus())
+    app.prepareToShowPreferences()
+  }
+  print("\(passed ? "PASS":"FAIL") actual Sender preferences entry pauses input, quarantines held keys and preserves authenticated socket, context, key, sequence and generation; no OS input/network")
+  return passed ? 0:1
+}
