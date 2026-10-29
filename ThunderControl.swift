@@ -1164,6 +1164,7 @@ final class Relay {
   var desktopPhysicalInputsForTests:(()->Bool)?
   var desktopInputPermissionForTests:(()->Bool)?
   var desktopInputPostForTests:((CGEvent)->Void)?
+  private let hidMouseMotionPoster=HIDMouseMotionPoster()
   private var inputTimingGeneration:UUID?
   private var inputQueueTiming=DisplayTimingStats(),inputMapTiming=DisplayTimingStats(),inputPostTiming=DisplayTimingStats()
   private var inputTimingLoggedAt:Double=0
@@ -2655,6 +2656,7 @@ final class Relay {
     return sawCancellationBeforeCallback && !recovery.needsRecovery && context.cancelled
   }
   func stop(reason:String="Local Stop") {
+    hidMouseMotionPoster.close()
     bridgeRecovery=BridgeInputRecovery();bridgeGrace=BridgeLinkGrace();bridgeRecoveryCompatible=false;bridgeResetTokens.removeAll();bridgeLease=BridgeInputLease();lastLeaseSent=0
     if desktopObserverActive {DesktopInjectionEpoch.shared.release();desktopObserverActive=false}
     desktopValidatedEpoch=nil
@@ -4222,7 +4224,19 @@ final class Relay {
     }
     // The final gate above precedes bookkeeping and post, but WindowServer
     // asynchronous dispatch still has an unavoidable OS-level residual race.
-    if let post=desktopInputPostForTests {post(e)} else {e.post(tap: replayTapLocation(for: t))}
+    if let post=desktopInputPostForTests {post(e)} else {
+      let motion=MotionPlan.make(type:t,location:e.location,
+        dx:e.getDoubleValueField(.mouseEventDeltaX),dy:e.getDoubleValueField(.mouseEventDeltaY),
+        flags:e.flags.rawValue,budget:Double(ReceiverDesktop.coordinateLimit)*4)
+      switch hidMouseMotionPoster.post(motion,canPost:finalDesktopInjectionGate) {
+      case .posted: break
+      case .useCG:
+        guard finalDesktopInjectionGate() else{return}
+        e.post(tap:replayTapLocation(for:t))
+      case .cancelled: return
+      case .failed(let code): stop(reason:"HID mouse motion failed (\(code))");return
+      }
+    }
     noteMousePost(t,startedAt:inputStartedAt)
     if multiDisplayDesktopCompatible {
       if let back=desktopReverse,let token=handoff.token,let revision=desktopHandoffRevision,handoff.phase == .targetActive {
@@ -5801,6 +5815,7 @@ struct ThunderControlMain {
       exit(runBridgeLinkRecoveryTests()==0 ? 0:1)
     } else if CommandLine.arguments.contains("--self-test") {
       check(runMouseMotionPreservationTests()==0)
+      check(runHIDMouseMotionTests()==0)
       check(runSystemControlKeyTests()==0)
       check(runSystemControlRelayTests()==0)
       #if TC_QUALITY_TIERS
