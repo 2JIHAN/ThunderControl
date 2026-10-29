@@ -111,6 +111,7 @@ struct AutomaticSharingResume {
     guard relay.authenticated,let pair=relay.authenticatedDevicePair,
       let host=relay.authenticatedSharingPeerHost,DisplayPeerRoute.valid(host) else{sharingResume.bind(nil);displayPreferenceLastSent=nil;refreshDisplayPreferenceUI();return}
     sharingResume.bind(.init(pair:pair,inputIsSender:relay.inputIsSender,host:host))
+    if relay.bridgeInputSuspended {return}
     let safe = !automaticConnectionPaused && !relay.automaticReconnectSuspended && relay.sessionAllowed && !relay.sessionLockedSignal && !relay.screenSleeping && !relay.systemSleeping && !relay.hasUnresolvedLocalRecovery && inputPermissionsReady()
     guard safe else{sharingReportGate(TCText("Sharing paused: check session, permissions or safety stop."));return}
     _ = sharingApplyExplicitConnectIntent(pair:pair,sender:relay.inputIsSender)

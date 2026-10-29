@@ -79,9 +79,28 @@ func displayStartPermitted(sameEpoch: Bool, pending: Bool, hasRun: Bool, now: Do
   sameEpoch && pending && !hasRun && now.isFinite && deadline.isFinite && now < deadline
 }
 
+// Startup never borrows continuity grace: a new socket requires an active bridge.
+private func displayVerifiedBridge(cancelled: () -> Bool) throws -> Bridge {
+  guard case .active(let bridge) = try displayVerifiedBridgeStatus(cancelled: cancelled) else {
+    throw DisplayTransportError.unavailable
+  }
+  return bridge
+}
+
+// Called under run.state. Only an explicitly classified inactive observation on
+// the exact original bridge can borrow grace; no new route or socket is allowed.
+func displayBridgeContinuityPermitted(status: BridgeLinkStatus, expected: Bridge, now: Double,
+  grace: inout BridgeLinkGrace) -> Bool {
+  guard status.bridge == expected else { return false }
+  switch status {
+  case .active: return grace.observe(active: true, now: now)
+  case .inactive: return grace.observe(active: false, now: now)
+  }
+}
+
 // Bounded counterpart of bridge(): same Thunderbolt membership and IPv4 rules,
 // without a blocking readDataToEndOfFile/waitUntilExit on the UI or monitor queue.
-private func displayVerifiedBridge(cancelled: () -> Bool) throws -> Bridge {
+private func displayVerifiedBridgeStatus(cancelled: () -> Bool) throws -> BridgeLinkStatus {
   guard !cancelled() else { throw DisplayTransportError.stopped }
   let process = Process(), pipe = Pipe()
   process.executableURL = URL(fileURLWithPath: "/sbin/ifconfig")
@@ -114,40 +133,19 @@ private func displayVerifiedBridge(cancelled: () -> Bool) throws -> Bridge {
     }
   }
   guard !cancelled(), process.terminationStatus == 0, let text = String(data: output, encoding: .utf8) else { throw DisplayTransportError.unavailable }
-  var members = Set<String>(), active = false
-  for line in text.components(separatedBy: .newlines) {
-    let words = line.split(whereSeparator: { $0.isWhitespace })
-    if words.count >= 2, words[0] == "member:" { members.insert(String(words[1])) }
-    if words.count == 2, words[0] == "status:", words[1] == "active" { active = true }
-  }
-  try validateThunderboltMembers(members, thunderboltHardwareNames(), active: active)
   guard !cancelled(), ProcessInfo.processInfo.systemUptime < deadline else { throw DisplayTransportError.unavailable }
-  var list: UnsafeMutablePointer<ifaddrs>?
-  guard getifaddrs(&list) == 0 else { throw DisplayTransportError.unavailable }
-  defer { freeifaddrs(list) }
-  var entry = list
-  while let item = entry {
-    defer { entry = item.pointee.ifa_next }
-    let value = item.pointee
-    guard String(cString: value.ifa_name) == "bridge0", let addr = value.ifa_addr,
-      Int32(addr.pointee.sa_family) == AF_INET, (value.ifa_flags & UInt32(IFF_UP)) != 0,
-      (value.ifa_flags & UInt32(IFF_RUNNING)) != 0 else { continue }
-    var host = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-    var sin = UnsafeRawPointer(addr).assumingMemoryBound(to: sockaddr_in.self).pointee
-    guard inet_ntop(AF_INET, &sin.sin_addr, &host, socklen_t(host.count)) != nil else { throw DisplayTransportError.unavailable }
-    let ip = String(cString: host), index = if_nametoindex("bridge0")
-    _ = try address(ip, 49178)
-    guard index > 0, !cancelled() else { throw DisplayTransportError.unavailable }
-    return Bridge(name: "bridge0", index: index, ip: ip)
-  }
-  throw DisplayTransportError.unavailable
+  let status = try verifiedBridgeLinkStatus("bridge0", text: text)
+  guard !cancelled(), ProcessInfo.processInfo.systemUptime < deadline else { throw DisplayTransportError.unavailable }
+  return status
 }
 
 private func displayWriteFrame(_ fd: Int32, _ data: Data) throws {
   guard !data.isEmpty, data.count <= DisplayChannelCipher.maximumFrame else { throw DisplayTransportError.invalid }
   var n = UInt32(data.count).bigEndian
   let bytes = withUnsafeBytes(of: &n) { Data($0) } + data
-  let deadline = ProcessInfo.processInfo.systemUptime + 3
+  // Leave headroom beyond the two-second link grace on the existing TCP stream.
+  // A failed write still closes it: never reseal, replay, or restart a partial frame.
+  let deadline = ProcessInfo.processInfo.systemUptime + 4
   try bytes.withUnsafeBytes { ptr in
     var offset = 0
     while offset < ptr.count {
@@ -223,6 +221,7 @@ private final class DisplayTransportRun {
   }
   var authenticated = false, authStart: Double?, lastRX = ProcessInfo.processInfo.systemUptime
   var lastBridgeProof = ProcessInfo.processInfo.systemUptime
+  var bridgeGrace = BridgeLinkGrace() // Protected by state, like lastBridgeProof.
   var timers: [DispatchSourceTimer] = []
   let expectedPair:LayoutDevicePair
   let viewerFormat:DisplayVideoFormat
@@ -495,8 +494,14 @@ final class DisplayTransport: @unchecked Sendable {
     run.timer(interval: 1, queue: DispatchQueue(label: "ThunderControl.display.bridge")) { [weak self, weak run] in
       guard let self, let run, self.isCurrent(run) else { return }
       do {
-        guard try displayVerifiedBridge(cancelled: { !self.isCurrent(run) }) == run.bridge else { throw DisplayTransportError.unavailable }
-        run.state.lock(); let socket = run.socket; run.state.unlock()
+        let status = try displayVerifiedBridgeStatus(cancelled: { !self.isCurrent(run) })
+        run.state.lock()
+        let permitted = displayBridgeContinuityPermitted(status: status, expected: run.bridge,
+          now: ProcessInfo.processInfo.systemUptime, grace: &run.bridgeGrace)
+        let socket = run.socket
+        run.state.unlock()
+        guard permitted else { throw DisplayTransportError.unavailable }
+        // Grace applies only to link status, never to socket identity or TCP death.
         if let socket { try displayVerifySocket(socket.fd, bridge: run.bridge, remote: run.remote) }
         run.state.lock(); run.lastBridgeProof = ProcessInfo.processInfo.systemUptime; run.state.unlock()
       } catch { self.fail(run, TCText("Screen transmission stopped because the Thunderbolt connection changed."),diagnosticReason:2) }
@@ -553,7 +558,8 @@ final class DisplayTransport: @unchecked Sendable {
     try setBlocking(connected.fd)
     let fd = connected.fd
     var idx = run.bridge.index; var one: Int32 = 1
-    var timeout = timeval(tv_sec: 2, tv_usec: 0)
+    // Longer than link grace, while hard send errors remain fatal immediately.
+    var timeout = timeval(tv_sec: 3, tv_usec: 0)
     guard setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &idx, socklen_t(MemoryLayout.size(ofValue: idx))) == 0,
       setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, 4) == 0,
       setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, 4) == 0,

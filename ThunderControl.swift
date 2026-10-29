@@ -162,6 +162,8 @@ struct Wire: Codable {
   var desktopGestureCodec:Int? = nil
   var systemControlKeyCodec:Int? = nil
   var videoQualityCodec:Int? = nil
+  var bridgeRecoveryCodec:Int? = nil
+  var inputLease:String? = nil
   var displayPreferenceCodec:Int? = nil
   var displayPreference:Bool? = nil
   var desktopGestureTargetID:UInt32? = nil
@@ -526,10 +528,20 @@ struct PeerValidator {
   var desktopGesturesSupported=false
   var displayPreferenceSupported=false
   var systemControlKeysSupported=false
+  var bridgeRecoverySupported=false
   mutating func accept(_ w: Wire) throws {
     guard w.session == session, w.sequence == next, next < UInt64.max else {
       throw Failure("Replay or sequence mismatch")
     }
+    guard w.bridgeRecoveryCodec==nil else{throw Failure("Unexpected bridge recovery capability")}
+    if ["linkReset","linkReady","inputLease"].contains(w.kind) {
+      guard bridgeRecoverySupported,(w.kind != "inputLease" || !senderPeer),BridgeInputRecovery.validEnvelope(w) else{throw Failure("Invalid bridge recovery envelope")}
+      next += 1;return
+    }
+    if let lease=w.inputLease {
+      guard bridgeRecoverySupported,senderPeer,BridgeInputLease.inputKinds.contains(w.kind),UUID(uuidString:lease)?.uuidString==lease else{throw Failure("Invalid input freshness lease")}
+    }
+    if bridgeRecoverySupported,senderPeer,BridgeInputLease.inputKinds.contains(w.kind),w.inputLease==nil {throw Failure("Missing input freshness lease")}
     if w.kind == "displayPreference" {
       guard senderPeer,displayPreferenceSupported,DisplayPreferencePolicy.validEnvelope(w) else{throw Failure("Invalid display preference")}
       next += 1;return
@@ -744,29 +756,8 @@ func verifyThunderboltBridge(_ name: String) throws {
   try validateThunderboltMembers(members, thunderboltHardwareNames(), active: active)
 }
 func bridge(_ name: String) throws -> Bridge {
-  try verifyThunderboltBridge(name)
-  guard !name.isEmpty, name == "bridge0", name.utf8.count < IFNAMSIZ else {
-    throw Failure("Only an explicit bridge interface is permitted")
-  }
-  var list: UnsafeMutablePointer<ifaddrs>?
-  guard getifaddrs(&list) == 0 else { throw Failure("getifaddrs failed") }
-  defer { freeifaddrs(list) }
-  var p = list
-  while let a = p {
-    defer { p = a.pointee.ifa_next }
-    let v = a.pointee
-    guard String(cString: v.ifa_name) == name, let addr = v.ifa_addr,
-      Int32(addr.pointee.sa_family) == AF_INET, (v.ifa_flags & UInt32(IFF_UP)) != 0,
-      (v.ifa_flags & UInt32(IFF_RUNNING)) != 0
-    else { continue }
-    var host = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-    var sin = UnsafeRawPointer(addr).assumingMemoryBound(to: sockaddr_in.self).pointee
-    inet_ntop(AF_INET, &sin.sin_addr, &host, socklen_t(host.count))
-    let ip = String(cString: host)
-    guard !ip.hasPrefix("127."), ip != "0.0.0.0" else { continue }
-    return Bridge(name: name, index: if_nametoindex(name), ip: ip)
-  }
-  throw Failure("Named bridge is not running with IPv4; no fallback")
+  guard case .active(let verified)=try bridgeLinkStatus(name) else{throw Failure("Bridge is inactive; no fallback")}
+  return verified
 }
 func address(_ ip: String, _ port: UInt16) throws -> sockaddr_in {
   var a = sockaddr_in()
@@ -1091,7 +1082,7 @@ final class Relay {
     return automaticInputSharingPermitted?(pair,sending) != false
   }
   func restoreSavedSharingAutoIfReady() {
-    guard authenticated,sender,receiverAvailable,sessionAllowed,!automaticReconnectSuspended,!lockedTransportOnly,
+    guard authenticated,sender,receiverAvailable,sessionAllowed,!automaticReconnectSuspended,!lockedTransportOnly,!bridgeInputSuspended,
       !hasUnresolvedLocalRecovery,!displayTopologyTransitionActive,!ownership.blocked,dockOrphanMotion==nil,
       !sourceGesture.blockAuto,cursorResources.canAcquire,topologyUnchanged(),inputPermissionsReady() else{return}
     if multiDisplayDesktopCompatible {
@@ -1104,8 +1095,8 @@ final class Relay {
     configureAuto(true,edge:selectedEdge)
   }
   func restoreSavedSharingForwardIfReady() {
-    guard authenticated,sender,receiverAvailable,sessionAllowed,!automaticReconnectSuspended,!lockedTransportOnly,
-      !hasUnresolvedLocalRecovery,!displayTopologyTransitionActive,inputPermissionsReady(),NSApp.isActive else{return}
+    guard authenticated,sender,receiverAvailable,sessionAllowed,!automaticReconnectSuspended,!lockedTransportOnly,!bridgeInputSuspended,
+      !hasUnresolvedLocalRecovery,!displayTopologyTransitionActive,!ownership.blocked,localKeys.isEmpty,localButtons.isEmpty,localFlags.isEmpty,!sourceGesture.blockAuto,dockOrphanMotion==nil,inputPermissionsReady(),NSApp.isActive else{return}
     forward=true
   }
   private var concurrentDisplayCompatible=false
@@ -1801,6 +1792,13 @@ final class Relay {
   private var localFlags: CGEventFlags = []
   private var gestureUntil = 0.0
   private var lastBridgeCheck = 0.0
+  private var bridgeGrace=BridgeLinkGrace()
+  private var bridgeRecovery=BridgeInputRecovery()
+  private var bridgeRecoveryCompatible=false
+  private var bridgeResetTokens=ConcurrentDisplayNonceCache()
+  private var bridgeLease=BridgeInputLease()
+  private var lastLeaseSent=0.0
+  var bridgeInputSuspended:Bool {bridgeRecovery.suspended}
   private var displayBounds = CGRect.zero
   private var lastInput = ProcessInfo.processInfo.systemUptime
   private var context: SessionContext?
@@ -1986,6 +1984,7 @@ final class Relay {
     return r.connection === socket && r.context === ctx && !ctx.cancelled && r.generation==generation && r.key!.withUnsafeBytes({Data($0)})==key && r.topology?.mainID==lease.accepted.main && r.topology?.bounds==lease.accepted.bounds && !r.topologyUnchanged()
   }
   func beginDisplayTopologyTransition(completion:@escaping(Result<Void,Error>)->Void) {
+    guard !bridgeInputSuspended else{stop(reason:"Display transition during link recovery");completion(.failure(Failure("Link recovery is still pending")));return}
     guard authenticated,!sender,!lockedTransportOnly,concurrentDisplayCompatible else {completion(.failure(Failure("Authenticated receiver required")));return}
     if let barrier=displayBarrier {
       guard receiverOwnsMapTransition,displayBarrierCompletion==nil,
@@ -2304,6 +2303,7 @@ final class Relay {
     }
   }
   func configureAuto(_ enabled: Bool, edge: Edge) {
+    guard !bridgeInputSuspended else{auto=false;forward=false;return}
     guard displayBarrier == nil else{if !enabled {cancelDesktopFocusRestore();_ = restoreLocal()};auto=false;forward=false;return}
     guard !lockedTransportOnly else{auto=false;forward=false;return}
     defer {sendCursorMode()}
@@ -2634,6 +2634,7 @@ final class Relay {
     return sawCancellationBeforeCallback && !recovery.needsRecovery && context.cancelled
   }
   func stop(reason:String="Local Stop") {
+    bridgeRecovery=BridgeInputRecovery();bridgeGrace=BridgeLinkGrace();bridgeRecoveryCompatible=false;bridgeResetTokens.removeAll();bridgeLease=BridgeInputLease();lastLeaseSent=0
     if desktopObserverActive {DesktopInjectionEpoch.shared.release();desktopObserverActive=false}
     desktopValidatedEpoch=nil
     let barrierCompletion=displayBarrierCompletion;displayBarrierCompletion=nil;displayBarrier=nil
@@ -2702,7 +2703,7 @@ final class Relay {
     for k in keys {
       let e = CGEvent(keyboardEventSource: nil, virtualKey: k, keyDown: false)
       e?.setIntegerValueField(.eventSourceUserData, value: marker)
-      e?.post(tap: .cghidEventTap)
+      if let e {if let post=desktopInputPostForTests {post(e)} else{e.post(tap:.cghidEventTap)}}
     }
     keys.removeAll()
     for b in buttons {
@@ -2713,7 +2714,7 @@ final class Relay {
         mouseButton: CGMouseButton(rawValue: b) ?? .left)
       {
         e.setIntegerValueField(.eventSourceUserData, value: marker)
-        e.post(tap: .cghidEventTap)
+        if let post=desktopInputPostForTests {post(e)} else{e.post(tap:.cghidEventTap)}
       }
     }
     buttons.removeAll()
@@ -2873,6 +2874,16 @@ final class Relay {
         return
       }
       let now = ProcessInfo.processInfo.systemUptime
+      if !self.bridgeRecovery.valid(now:now) {self.stop(reason:"Bridge input recovery timed out");return}
+      if self.authenticated,self.bridgeRecoveryCompatible {
+        if !self.sender,now-self.lastLeaseSent>=0.1 {
+          self.lastLeaseSent=now
+          guard self.control("inputLease",token:self.bridgeLease.issue(now:now)) else{return}
+        } else if self.sender,!self.bridgeInputSuspended,(self.forward || self.handoff.phase != .local),!self.bridgeLease.sourceFresh(now:now) {
+          self.quarantineStaleSourceInput(now:now)
+        }
+      }
+      guard self.generation==g else{return}
       if self.receiverActivationPendingToken != nil,let deadline=self.receiverActivationDeadline,now>=deadline {self.safetyStop("Receiver foreground restore deadline exceeded");return}
       if self.connection==nil,sessionContext.authenticationExpired(now:now) {sessionContext.cancel(reason:sessionContext.authenticationTimeoutReason);self.stop(reason:sessionContext.authenticationTimeoutReason);return}
       if self.sourceGesture.expired(now:now) || self.receiverAppGesture.expired(now:now) {self.stop(reason:"App gesture stream expired; lift fingers, then explicitly reconnect");return}
@@ -2894,11 +2905,11 @@ final class Relay {
         self.status("Peer heartbeat lost. Local restored.")
         return
       }
-      guard now - self.lastBridgeCheck >= 1 else { return }
+      guard now - self.lastBridgeCheck >= (self.bridgeInputSuspended ? 0.25:1) else { return }
       self.lastBridgeCheck = now
       if self.sender && self.connection != nil { _ = self.control("ping") }
       if !self.sender && self.connection != nil {
-        _ = self.control("available", width: self.inject ? 1 : 0)
+        _ = self.control("available", width: self.inject && !self.bridgeInputSuspended ? 1 : 0)
       }
       self.checkBridgeContinuity(b,generation:g)
     }
@@ -2978,7 +2989,7 @@ final class Relay {
           seal(
             Wire(
               concurrentDisplayCodec:1,kind: sendMode ? "sender-hello-v5" : "receiver-hello-v5", session: localSession,
-              sequence: 0, os: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,osBuild:systemBuildIdentifier(),gestureCodec:DockGestureCodec.supported ? 1 : 0,appGestureCodec:AppGestureCodec.supported ? 1 : 0,cursorVisibilityCodec:1,peerDisplayName:ConnectionNotificationTracker.displayName(Host.current().localizedName ?? "ThunderControl Mac"),multiDisplayDesktopCodec:1,desktopGestureCodec:DockGestureCodec.supported ? 1:0,systemControlKeyCodec:1,videoQualityCodec:localVideoQualityCodec,displayPreferenceCodec:1), k))
+              sequence: 0, os: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,osBuild:systemBuildIdentifier(),gestureCodec:DockGestureCodec.supported ? 1 : 0,appGestureCodec:AppGestureCodec.supported ? 1 : 0,cursorVisibilityCodec:1,peerDisplayName:ConnectionNotificationTracker.displayName(Host.current().localizedName ?? "ThunderControl Mac"),multiDisplayDesktopCodec:1,desktopGestureCodec:DockGestureCodec.supported ? 1:0,systemControlKeyCodec:1,videoQualityCodec:localVideoQualityCodec,bridgeRecoveryCodec:1,displayPreferenceCodec:1), k))
         var remoteHello = try unseal(readFrame(c), k)
         guard (sendMode || remoteHello.session==pairingScope),remoteHello.kind == (sendMode ? "receiver-hello-v5" : "sender-hello-v5") else {
           throw Failure("Handshake role mismatch")
@@ -2991,6 +3002,7 @@ final class Relay {
         let displayPreferenceNegotiated=multiDisplayDesktopCompatibleNegotiated && remoteHello.displayPreferenceCodec==1
         let videoQualityNegotiated=localVideoQualityCodec==1 && displayPreferenceNegotiated && remoteHello.videoQualityCodec==1
         let systemControlKeysNegotiated=remoteHello.systemControlKeyCodec==1
+        let bridgeRecoveryNegotiated=remoteHello.bridgeRecoveryCodec==1
         let visibilityCompatible=remoteHello.cursorVisibilityCodec==1
         let appCompatible=AppGestureCodec.compatible(build:remoteHello.osBuild,codec:remoteHello.appGestureCodec)
         remoteHello.kind = "hello"
@@ -3004,7 +3016,7 @@ final class Relay {
           k, sender: senderNonce, receiver: receiverNonce, reverse: !sendMode)
         let incomingKey = connectionKey(
           k, sender: senderNonce, receiver: receiverNonce, reverse: sendMode)
-        var peerValidator = PeerValidator(senderPeer: !sendMode, session: remoteHello.session,cursorVisibilitySupported:visibilityCompatible,concurrentDisplaySupported:displayCompatible,multiDisplayDesktopSupported:multiDisplayDesktopCompatibleNegotiated,desktopGesturesSupported:desktopSystemGestureNegotiated,displayPreferenceSupported:displayPreferenceNegotiated,systemControlKeysSupported:systemControlKeysNegotiated)
+        var peerValidator = PeerValidator(senderPeer: !sendMode, session: remoteHello.session,cursorVisibilitySupported:visibilityCompatible,concurrentDisplaySupported:displayCompatible,multiDisplayDesktopSupported:multiDisplayDesktopCompatibleNegotiated,desktopGesturesSupported:desktopSystemGestureNegotiated,displayPreferenceSupported:displayPreferenceNegotiated,systemControlKeysSupported:systemControlKeysNegotiated,bridgeRecoverySupported:bridgeRecoveryNegotiated)
         timeout.tv_sec = 0
         setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         DispatchQueue.main.async {
@@ -3017,6 +3029,7 @@ final class Relay {
           self.authenticatedDevicePair=confirmedLayoutPair;self.authenticatedSharingPeerHost=DisplayPeerRoute.authenticatedSocketHost(c);self.concurrentDisplayCompatible=displayCompatible
           self.multiDisplayDesktopCompatible=multiDisplayDesktopCompatibleNegotiated;self.desktopSystemGestureCompatible=desktopSystemGestureNegotiated
           self.systemControlKeysCompatible=systemControlKeysNegotiated
+          self.bridgeRecoveryCompatible=bridgeRecoveryNegotiated
           self.peerVideoQualityCompatible=videoQualityNegotiated
           self.displayPreferenceCompatible=displayPreferenceNegotiated;self.peerDisplayPreference=nil
           self.layoutDevicePair=sendMode ? confirmedLayoutPair:nil
@@ -3088,17 +3101,152 @@ final class Relay {
     }
     return b
   }
+  @discardableResult private func quarantineBridgeInput(local:Bool,now:Double)->Bool {
+    guard displayBarrier==nil else{stop(reason:"Display transition interrupted by link recovery");return false}
+    let alreadySuspended=bridgeInputSuspended
+    bridgeRecovery.begin(local:local,now:now)
+    guard !alreadySuspended else{return true}
+    // Establish the gate before cleanup can invoke callbacks. Retire the old
+    // handoff token and quarantine held source inputs, not the whole session.
+    auto=false;forward=false;receiverAvailable=false;sourceAutoCursorMode=false
+    bridgeLease=BridgeInputLease();lastLeaseSent=0
+    cancelPostedDockStream();forceLocal();cancelReceiverCursorFocus?()
+    status("Thunderbolt link interrupted briefly. Input restored locally; waiting for safe recovery.")
+    return true
+  }
+  private func quarantineStaleSourceInput(now:Double) {
+    if authenticated,sender,bridgeRecoveryCompatible,!bridgeInputSuspended,(forward || handoff.phase != .local),!bridgeLease.sourceFresh(now:now) {
+      quarantineBridgeInput(local:true,now:now);lastBridgeCheck=0
+    }
+  }
+  private func advanceBridgeInputRecovery(now:Double) {
+    guard bridgeInputSuspended else{return}
+    guard bridgeRecovery.valid(now:now) else{stop(reason:"Bridge input recovery timed out");return}
+    if let token=bridgeRecovery.makeRequest() {guard control("linkReset",token:token) else{return}}
+    if let token=bridgeRecovery.takeReply() {guard control("linkReady",token:token) else{return}}
+    guard bridgeRecovery.finishIfReady() else{return}
+    // Ordered reset/ready bytes drained the previous stream. Old ownership
+    // never resumes: a fresh available + new handoff token is required.
+    receiverAvailable=false
+    status("Thunderbolt link recovered. Connection maintained; input resumes from local control.")
+    if !sender {_ = control("available",width:inject ? 1:0)}
+  }
+  private func receiveBridgeRecovery(_ w:Wire,now:Double) {
+    guard bridgeRecoveryCompatible,!lockedTransportOnly else{return}
+    if w.kind=="linkReset",let token=w.token {
+      guard !bridgeResetTokens.contains(token) else{return}
+      bridgeResetTokens.insert(token)
+      guard quarantineBridgeInput(local:false,now:now) else{return}
+      bridgeRecovery.receiveRequest(token,now:now)
+      // Peer recovery also needs our own fresh, exact bridge proof.
+      lastBridgeCheck=0
+    } else if w.kind=="linkReady",let token=w.token,bridgeRecovery.acceptReply(token,now:now) {
+      advanceBridgeInputRecovery(now:now)
+    }
+  }
+  private func observeBridgeContinuity(_ status:BridgeLinkStatus,expected:Bridge,now:Double) {
+    guard status.bridge==expected else{bridgeBecameUnavailable?();stop(reason:"Bridge changed or lost");return}
+    switch status {
+    case .inactive:
+      guard authenticated,bridgeRecoveryCompatible,!lockedTransportOnly,displayBarrier==nil,
+        bridgeGrace.observe(active:false,now:now) else{bridgeBecameUnavailable?();stop(reason:"Bridge inactive beyond recovery window");return}
+      quarantineBridgeInput(local:true,now:now)
+    case .active:
+      guard bridgeGrace.observe(active:true,now:now) else{bridgeBecameUnavailable?();stop(reason:"Bridge inactive beyond recovery window");return}
+      if bridgeInputSuspended {bridgeRecovery.proveActive();advanceBridgeInputRecovery(now:now)}
+    }
+  }
   func checkBridgeContinuity(_ expected:Bridge,generation g:UUID) {
     guard !bridgeCheckInFlight else{return}
     bridgeCheckInFlight=true
     bridgeMonitor.async {[weak self] in
-      let verified=try? bridge(expected.name)
+      let result=Result {try bridgeLinkStatus(expected.name)}
       DispatchQueue.main.async {
         guard let self,self.generation==g else{return}
         self.bridgeCheckInFlight=false
-        if verified != expected {self.bridgeBecameUnavailable?();self.stop(reason:"Bridge changed or lost")}
+        switch result {
+        case .success(let status):self.observeBridgeContinuity(status,expected:expected,now:ProcessInfo.processInfo.systemUptime)
+        case .failure:self.bridgeBecameUnavailable?();self.stop(reason:"Bridge verification failed")
+        }
       }
     }
+  }
+  static func verifyBridgeInputRecoveryForTests()->Bool {
+    final class Cursor:CursorRecoveryAPI {
+      func associate(_ value:Bool)->CGError {.success}
+      func hide(display:CGDirectDisplayID)->CGError {.success}
+      func show(display:CGDirectDisplayID)->CGError {.success}
+      func warp(to:CGPoint)->CGError {.success}
+    }
+    func fixture()->Relay {
+      let r=Relay(cursorResources:CursorRecoveryController(api:Cursor()),receiverCursor:CursorVisibilityController(api:Cursor()))
+      let socket=OwnedSocket(-1);r.context=SessionContext(socket);r.connection=socket;r.key=SymmetricKey(size:.bits256)
+      r.bridgeRecoveryCompatible=true;r.sender=true
+      r.desktopInputPostForTests={_ in};r.desktopEnqueueForTests={_ in true}
+      return r
+    }
+    let expected=Bridge(name:"bridge0",index:7,ip:"169.254.1.1")
+    let r=fixture(),generation=r.generation,context=r.context,socket=r.connection
+    var packets=[Wire](),posts=0
+    r.desktopEnqueueForTests={packets.append($0);return true};r.desktopInputPostForTests={_ in posts+=1}
+    r.auto=true;r.forward=true;r.receiverAvailable=true
+    r.handoff.phase = .remote;r.handoff.token=UUID().uuidString
+    r.ownership.accepted(.key(12),down:true,suppressed:true)
+    r.keys=[12]
+    r.observeBridgeContinuity(.inactive(expected),expected:expected,now:10)
+    guard r.bridgeInputSuspended,!r.auto,!r.forward,!r.receiverAvailable,r.handoff.phase == .local,
+      r.handoff.token==nil,r.ownership.blocked,r.keys.isEmpty,posts==1,
+      r.generation==generation,r.context===context,r.connection===socket,context?.cancelled==false else{print("FAIL bridge integration line \(#line)");return false}
+    // Run the production receive gate using a safe cached session snapshot.
+    r.safetyObserversInstalled=true;r.sessionSnapshot=SessionSafetySnapshot(onConsole:true,loginDone:true,screenLocked:false)
+    r.lastSessionPoll=ProcessInfo.processInfo.systemUptime
+    r.receive(Wire(kind:"available",session:"fixture",sequence:1,width:1))
+    guard !r.receiverAvailable,!r.auto,r.bridgeInputSuspended else{print("FAIL bridge integration line \(#line)");return false}
+    r.receive(Wire(kind:"event",session:"fixture",sequence:2,raw:10,data:Data([1])))
+    guard posts==1 else{print("FAIL bridge integration line \(#line)");return false}
+    r.observeBridgeContinuity(.active(expected),expected:expected,now:11)
+    guard let token=r.bridgeRecovery.request,let reset=packets.last,reset.kind=="linkReset",BridgeInputRecovery.validEnvelope(reset),r.bridgeInputSuspended else{print("FAIL bridge integration line \(#line)");return false}
+    r.receiveBridgeRecovery(Wire(kind:"linkReady",session:"fixture",sequence:3,token:UUID().uuidString),now:11.1)
+    guard r.bridgeInputSuspended else{print("FAIL bridge integration line \(#line)");return false}
+    r.receiveBridgeRecovery(Wire(kind:"linkReady",session:"fixture",sequence:4,token:token),now:11.2)
+    guard !r.bridgeInputSuspended,!r.auto,!r.forward,!r.receiverAvailable,r.handoff.phase == .local,
+      r.generation==generation,r.context===context,context?.cancelled==false,posts==1 else{print("FAIL bridge integration line \(#line)");return false}
+    // Hard identity changes never borrow the inactive window.
+    for changed in [Bridge(name:"bridge0",index:8,ip:expected.ip),Bridge(name:"bridge0",index:7,ip:"169.254.1.2")] {
+      let mismatch=fixture();mismatch.observeBridgeContinuity(.inactive(changed),expected:expected,now:20)
+      guard !mismatch.hasSession else{print("FAIL bridge integration line \(#line)");return false}
+    }
+    let expired=fixture();expired.observeBridgeContinuity(.inactive(expected),expected:expected,now:30)
+    expired.observeBridgeContinuity(.active(expected),expected:expected,now:32)
+    guard !expired.hasSession else{print("FAIL bridge integration line \(#line)");return false}
+    let legacy=fixture();legacy.bridgeRecoveryCompatible=false
+    legacy.observeBridgeContinuity(.inactive(expected),expected:expected,now:40)
+    guard !legacy.hasSession else{print("FAIL bridge integration line \(#line)");return false}
+    let ackTimeout=fixture();ackTimeout.quarantineBridgeInput(local:true,now:50)
+    ackTimeout.advanceBridgeInputRecovery(now:54)
+    guard !ackTimeout.hasSession else{print("FAIL bridge integration line \(#line)");return false}
+    let stale=fixture();stale.sender=false;stale.safetyObserversInstalled=true
+    stale.sessionSnapshot=SessionSafetySnapshot(onConsole:true,loginDone:true,screenLocked:false)
+    stale.lastSessionPoll=ProcessInfo.processInfo.systemUptime
+    let staleLease=stale.bridgeLease.issue(now:ProcessInfo.processInfo.systemUptime-1)
+    var stalePosts=0;stale.desktopInputPostForTests={_ in stalePosts+=1}
+    stale.handoff.phase = .targetActive;stale.handoff.token=UUID().uuidString
+    // The receiver never observed inactive. A delayed old ciphertext still
+    // cannot inject because its receiver-issued lease expired locally.
+    stale.receive(Wire(kind:"event",session:"fixture",sequence:1,raw:10,data:Data([1]),token:stale.handoff.token,inputLease:staleLease))
+    guard stale.bridgeInputSuspended,stalePosts==0,stale.authenticated,stale.handoff.phase == .local else{print("FAIL bridge integration line \(#line)");return false}
+    let staleRelease=fixture();staleRelease.forward=true
+    staleRelease.ownership.accepted(.key(12),down:true,suppressed:true)
+    staleRelease.bridgeLease.receive(UUID().uuidString,now:70)
+    staleRelease.quarantineStaleSourceInput(now:71)
+    staleRelease.bridgeLease.receive(UUID().uuidString,now:71.01)
+    guard staleRelease.bridgeInputSuspended,!staleRelease.forward,staleRelease.ownership.blocked else{print("FAIL bridge integration line \(#line)");return false}
+    let failedReply=fixture();failedReply.desktopEnqueueForTests={_ in false}
+    failedReply.bridgeRecovery.receiveRequest(UUID().uuidString,now:60);failedReply.bridgeRecovery.proveActive()
+    failedReply.advanceBridgeInputRecovery(now:60.1)
+    guard !failedReply.hasSession else{print("FAIL bridge integration line \(#line)");return false}
+    r.context=nil;r.connection=nil // No OS operations in fixture teardown.
+    return true
   }
   func tickLockedTransport(context expected:SessionContext,generation g:UUID,bridge b:Bridge) {
     guard lockedTransportEligible else{stop(reason:"Locked standby session ended");return}
@@ -3148,6 +3296,9 @@ final class Relay {
   }
   @discardableResult
   func enqueue(_ input: Wire) -> Bool {
+    // No sequence is allocated for suppressed input; queued frames remain in
+    // order ahead of linkReset/linkReady and are discarded by the peer gate.
+    if bridgeInputSuspended,!["ping","available","linkReset","linkReady","inputLease","displayPreference"].contains(input.kind) {return true}
     if displayBarrier != nil,["event","dock","appGesture","begin","ready","commit","active","return","returnAck"].contains(input.kind) {return false}
     if lockedTransportOnly {
       guard lockedTransportEligible,lockedTransportOutgoingAllowed(input) else{return false}
@@ -3159,6 +3310,10 @@ final class Relay {
     guard !ctx.cancelled else {lastEnqueueFailure=ctx.terminalReason ?? "Transport already cancelled";connectionLog("TX rejected: \(self.lastEnqueueFailure)");return false}
     guard pending.wait(timeout:.now()) == .success else {lastEnqueueFailure="Output queue full";connectionLog("TX rejected: output queue full");return false}
     var w = input
+    if bridgeRecoveryCompatible,sender,BridgeInputLease.inputKinds.contains(w.kind) {
+      guard bridgeLease.sourceFresh(now:ProcessInfo.processInfo.systemUptime),let lease=bridgeLease.latest else{pending.signal();lastEnqueueFailure="Input freshness expired during dispatch";return false}
+      w.inputLease=lease
+    }
     w.sequence = seq
     seq += 1
     traceGesture(stage:.txQueued,packet:w)
@@ -3184,6 +3339,14 @@ final class Relay {
     _ kind: String, token: String? = nil, edge: Edge? = nil,
     y: Double? = nil, width: Double? = nil, height: Double? = nil
   ) -> Bool {
+    if ["linkReset","linkReady","inputLease"].contains(kind) {
+      let ok=(desktopEnqueueForTests ?? enqueue)(Wire(kind:kind,session:session,sequence:0,token:token))
+      if !ok,connection != nil {stop(reason:lastEnqueueFailure)}
+      return ok
+    }
+    if kind=="available",!sender,bridgeRecoveryCompatible {
+      guard control("inputLease",token:bridgeLease.issue(now:ProcessInfo.processInfo.systemUptime)) else{return false}
+    }
     if kind == "available",receiverMapPublicationCandidate==nil,detectReceiverMapTransition() {return true}
     let bounds = topology?.bounds
     let carriesGeometry = kind == "available" || kind == "begin"
@@ -3252,6 +3415,7 @@ final class Relay {
     guard e.getIntegerValueField(.eventSourceUserData) != marker,
       e.getIntegerValueField(.eventSourceUnixProcessID) != Int64(getpid())
     else { return false }
+    quarantineStaleSourceInput(now:ProcessInfo.processInfo.systemUptime)
     let systemKey=SystemControlKey.decode(e)
     if drainDesktopPauseInput(type:type,code:CGKeyCode(truncatingIfNeeded:e.getIntegerValueField(.keyboardEventKeycode)),button:e.getIntegerValueField(.mouseEventButtonNumber),flags:e.flags,systemKey:systemKey) {return true}
     if sender,handoff.phase == .local,type == .mouseMoved,let started=sourceReturnRestoredAt {
@@ -3367,7 +3531,7 @@ final class Relay {
       .maskShift, .maskControl, .maskAlternate, .maskCommand, .maskSecondaryFn,
     ])
 
-    guard sender,displayBarrier == nil else { return false }
+    guard sender,displayBarrier == nil,!bridgeInputSuspended else { return false }
     if auto,type == .mouseMoved,[EdgeHandoff.Phase.pending,.committed].contains(handoff.phase),let token=handoff.token {
       let dx=e.getDoubleValueField(.mouseEventDeltaX),dy=e.getDoubleValueField(.mouseEventDeltaY)
       let retracts:Bool
@@ -3688,7 +3852,7 @@ final class Relay {
       cursorDiagnostic("mode-received");_ = syncReceiverCursor();return
     }
     if w.kind == "available" {
-      receiverAvailable = w.width == 1
+      receiverAvailable = w.width == 1 && (!bridgeRecoveryCompatible || bridgeLease.sourceFresh(now:now))
       receiverGestureAvailable=w.gestureCodec==1 && gestureCompatible
       receiverAppGestureAvailable=w.width==1 && w.appGestureCodec==1 && appGestureCompatible
       if sender, let map = w.receiverDesktopMap,displayBarrier?.phase != .draining {
@@ -3881,6 +4045,14 @@ final class Relay {
       return
     }
     lastInput = ProcessInfo.processInfo.systemUptime
+    if w.kind=="inputLease",bridgeRecoveryCompatible,sender,let token=w.token {bridgeLease.receive(token,now:lastInput);return}
+    if ["linkReset","linkReady"].contains(w.kind) {receiveBridgeRecovery(w,now:lastInput);return}
+    // Authentication, direction and sequence validation already ran off-main.
+    // Consume stale stream bytes while quarantined, but never post or rearm.
+    if bridgeInputSuspended {return}
+    if bridgeRecoveryCompatible,!sender,BridgeInputLease.inputKinds.contains(w.kind),!bridgeLease.accepts(w.inputLease,now:lastInput) {
+      quarantineBridgeInput(local:true,now:lastInput);lastBridgeCheck=0;return
+    }
     // Ordinary input validates the fresh map once in currentRoutingDesktop,
     // after decoding and before any modifier reconciliation or OS posting.
     let mapPaused = w.kind == "event" ? displayBarrier != nil : detectReceiverMapTransition()
@@ -5596,6 +5768,8 @@ struct ThunderControlMain {
       ownershipTests()
     } else if CommandLine.arguments.contains("--desktop-map-self-test") {
       exit(runDesktopMapTransitionTests()==0 ? 0:1)
+    } else if CommandLine.arguments.contains("--bridge-recovery-self-test") {
+      exit(runBridgeLinkRecoveryTests()==0 ? 0:1)
     } else if CommandLine.arguments.contains("--self-test") {
       check(runSystemControlKeyTests()==0)
       check(runSystemControlRelayTests()==0)
@@ -5606,7 +5780,7 @@ struct ThunderControlMain {
       check(runDisplayRuntimePresentationTests()==0)
       check(runDisplayRuntimeViewerModeTests()==0)
       #endif
-      do { try tests();check(runLocalizationTests()==0);check(runConcurrentDisplayTests()==0);check(runReceiverDesktopRelayTests()==0);check(runReceiverDesktopTests()==0);check(runSavedDesktopPlacementTests()==0);check(runReceiverDesktopUITests()==0);check(runDesktopMapTransitionTests()==0);check(runDesktopHandoffRoutingTests()==0);check(runDesktopEntryPolicyTests()==0);check(runDisplayHeartbeatTests()==0);check(runDisplayTrustTests()==0);check(runDisplayRemoteInputTests()==0);check(runDisplayTransportTests()==0);check(runDisplayCadenceTests()==0);check(runDisplayFramePacingTests()==0);check(runDisplayVideoFormatTests()==0);check(runSavedSharingStateTests()==0);check(runAutomaticSharingResumeTests()==0);check(runSharingLifecycleIntegrationTests()==0);check(runDisplayPreferenceTests()==0);check(runUpdateReleaseTests()==0);check(runSavedVirtualDisplayPlacementTests()==0);check(runVirtualDisplayPlacementSessionTests()==0);check(runDisplayVideoDecoderTests()==0);check(runDisplayDecodeWorkerTests()==0);check(runScrollReplayTests()==0);check(runDiscoveryRecoveryPolicyTests()==0);check(runNativeGestureTests()==0);check((runDockTransferStateTests()+runDesktopSystemGestureTests())==0);check(runTransitionMotionTests()==0);check(runGestureTraceTests()==0);check(runCursorVisibilityTests()==0);check(runConnectedLayoutTests()==0);check(runCursorModeProtocolTests()==0);ReceiverCursorFocusTests.run();check(runAutomaticConnectionPolicyTests()==0);check(runCableReconnectPolicyTests()==0);check(runReceiverFocusRetryTests()==0);check(runReturnWarpResumeTests()==0);check(runDiagnosticStoreTests()==0);check(runDevelopmentDiagnosticsTests()==0);check(runDevelopmentFrameTraceTests()==0);check(runDisplayDiagnosticLinesTests()==0);check(runTrustedPairingTests()==0);check(runConnectionNotificationTests()==0);check(runSingleConnectionNotificationTests()==0);check(runAppAppearancePreferencesTests()==0);check(runAppWindowPresentationPolicyTests()==0);check(runConnectedWindowVisibilityTests()==0);check(runSavedScreenLayoutTests()==0);check(Relay.verifyDeviceLayoutPersistenceForTests());check(runSessionAutoResumeTests()==0);check(runSessionSuspensionOriginTests()==0);check(Relay.verifySessionSuspensionOriginsForTests());check(runAutomaticReconnectBackoffTests()==0);check(runBridgeRecoverySchedulingTests()==0);check(runLockedTransportPolicyTests()==0);check(runAuthenticatedRouteHintTests()==0);check(runFastReconnectPolicyTests()==0);check(Relay.verifyLockedTransportInputBarrierForTests());check(!Relay().receiverWantsCursorHidden);ScreenArrangementDragTests.run();check(Relay.verifyReceiverRecoveryBlocksStartForTests());check(Relay.verifyReceiverPhysicalInputCancelsActivationForTests());try dockProtocolTests();try appGesturePacketTests();print("PASS gesture memory classification and system stream ordering; no posting") } catch {
+      do { try tests();check(runLocalizationTests()==0);check(runConcurrentDisplayTests()==0);check(runReceiverDesktopRelayTests()==0);check(runReceiverDesktopTests()==0);check(runSavedDesktopPlacementTests()==0);check(runReceiverDesktopUITests()==0);check(runDesktopMapTransitionTests()==0);check(runDesktopHandoffRoutingTests()==0);check(runDesktopEntryPolicyTests()==0);check(runDisplayHeartbeatTests()==0);check(runDisplayTrustTests()==0);check(runDisplayRemoteInputTests()==0);check(runDisplayTransportTests()==0);check(runDisplayCadenceTests()==0);check(runDisplayFramePacingTests()==0);check(runDisplayVideoFormatTests()==0);check(runSavedSharingStateTests()==0);check(runAutomaticSharingResumeTests()==0);check(runSharingLifecycleIntegrationTests()==0);check(runDisplayPreferenceTests()==0);check(runUpdateReleaseTests()==0);check(runSavedVirtualDisplayPlacementTests()==0);check(runVirtualDisplayPlacementSessionTests()==0);check(runDisplayVideoDecoderTests()==0);check(runDisplayDecodeWorkerTests()==0);check(runScrollReplayTests()==0);check(runDiscoveryRecoveryPolicyTests()==0);check(runNativeGestureTests()==0);check((runDockTransferStateTests()+runDesktopSystemGestureTests())==0);check(runTransitionMotionTests()==0);check(runGestureTraceTests()==0);check(runCursorVisibilityTests()==0);check(runConnectedLayoutTests()==0);check(runCursorModeProtocolTests()==0);ReceiverCursorFocusTests.run();check(runAutomaticConnectionPolicyTests()==0);check(runBridgeLinkRecoveryTests()==0);check(runCableReconnectPolicyTests()==0);check(runReceiverFocusRetryTests()==0);check(runReturnWarpResumeTests()==0);check(runDiagnosticStoreTests()==0);check(runDevelopmentDiagnosticsTests()==0);check(runDevelopmentFrameTraceTests()==0);check(runDisplayDiagnosticLinesTests()==0);check(runTrustedPairingTests()==0);check(runConnectionNotificationTests()==0);check(runSingleConnectionNotificationTests()==0);check(runAppAppearancePreferencesTests()==0);check(runAppWindowPresentationPolicyTests()==0);check(runConnectedWindowVisibilityTests()==0);check(runSavedScreenLayoutTests()==0);check(Relay.verifyDeviceLayoutPersistenceForTests());check(runSessionAutoResumeTests()==0);check(runSessionSuspensionOriginTests()==0);check(Relay.verifySessionSuspensionOriginsForTests());check(runAutomaticReconnectBackoffTests()==0);check(runBridgeRecoverySchedulingTests()==0);check(runLockedTransportPolicyTests()==0);check(runAuthenticatedRouteHintTests()==0);check(runFastReconnectPolicyTests()==0);check(Relay.verifyLockedTransportInputBarrierForTests());check(!Relay().receiverWantsCursorHidden);ScreenArrangementDragTests.run();check(Relay.verifyReceiverRecoveryBlocksStartForTests());check(Relay.verifyReceiverPhysicalInputCancelsActivationForTests());try dockProtocolTests();try appGesturePacketTests();print("PASS gesture memory classification and system stream ordering; no posting") } catch {
         fputs("FAIL \(error)\n", stderr)
         exit(1)
       }

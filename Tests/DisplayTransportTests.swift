@@ -17,6 +17,56 @@ func runDisplayTransportTests() -> Int {
   }
   verify(!displayStartPermitted(sameEpoch: true, pending: true, hasRun: false, now: 0, deadline: .infinity))
   verify(!displayStartPermitted(sameEpoch: true, pending: true, hasRun: false, now: 0, deadline: .nan))
+  // Exercise the exact helper used under the production run lock. Grace is
+  // continuity-only, bounded from the first inactive sample, never a new route.
+  do {
+    let expected = Bridge(name: "bridge0", index: 7, ip: "169.254.1.1")
+    func observe(_ status: BridgeLinkStatus, _ now: Double, _ grace: inout BridgeLinkGrace) -> Bool {
+      displayBridgeContinuityPermitted(status: status, expected: expected, now: now, grace: &grace)
+    }
+    var grace = BridgeLinkGrace()
+    verify(observe(.active(expected), 9, &grace))
+    verify(grace.inactiveSince == nil)
+    verify(observe(.inactive(expected), 10, &grace))
+    verify(observe(.inactive(expected), 11.999, &grace))
+    verify(grace.inactiveSince == 10) // Repeated inactivity cannot extend grace.
+    verify(!observe(.inactive(expected), 12, &grace))
+
+    for activeAtDeadline in [true, false] {
+      var boundary = BridgeLinkGrace()
+      verify(observe(.inactive(expected), 20, &boundary))
+      let status: BridgeLinkStatus = activeAtDeadline ? .active(expected) : .inactive(expected)
+      verify(!observe(status, 22, &boundary))
+      verify(!observe(status, 22.001, &boundary))
+    }
+    var recovered = BridgeLinkGrace()
+    verify(observe(.inactive(expected), 30, &recovered))
+    verify(observe(.active(expected), 31.999, &recovered))
+    verify(recovered.inactiveSince == nil)
+    verify(observe(.inactive(expected), 40, &recovered))
+    verify(recovered.inactiveSince == 40) // A genuine recovery permits a later window.
+    verify(!observe(.active(expected), 42, &recovered))
+
+    for different in [Bridge(name: "bridge1", index: 7, ip: "169.254.1.1"),
+      Bridge(name: "bridge0", index: 8, ip: "169.254.1.1"),
+      Bridge(name: "bridge0", index: 7, ip: "169.254.1.2")] {
+      for status in [BridgeLinkStatus.active(different), .inactive(different)] {
+        var mismatch = BridgeLinkGrace()
+        verify(observe(.inactive(expected), 50, &mismatch))
+        verify(!observe(status, 50.1, &mismatch))
+        verify(mismatch.inactiveSince == 50) // Mismatch cannot clear or refresh grace.
+      }
+    }
+    for invalid in [Double.nan, Double.infinity, -Double.infinity, -1] {
+      for active in [false, true] {
+        var invalidClock = BridgeLinkGrace()
+        verify(!observe(active ? .active(expected) : .inactive(expected), invalid, &invalidClock))
+      }
+    }
+    var backwards = BridgeLinkGrace()
+    verify(observe(.inactive(expected), 60, &backwards))
+    verify(!observe(.active(expected), 59, &backwards))
+  }
   let root = SymmetricKey(size: .bits256)
   let s = "00000000-0000-4000-8000-000000000001", r = "00000000-0000-4000-8000-000000000002"
   func cipher(_ forward: Bool = true) -> DisplayChannelCipher { DisplayChannelCipher(root: root, senderNonce: s, receiverNonce: r, senderToReceiver: forward) }
