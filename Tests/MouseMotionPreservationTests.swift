@@ -15,7 +15,9 @@ func runMouseMotionPreservationTests() -> Int {
     check(output.flags==original.flags,"type \(raw) flags")
     check(original.location==CGPoint(x:900,y:700) && original.getDoubleValueField(.mouseEventDeltaX)==120,"type \(raw) original unchanged")
     original.setDoubleValueField(.mouseEventDeltaX,value:4_000_001)
-    check(destinationMouseEvent(original,type:raw,point:CGPoint(x:10,y:20))==nil,"type \(raw) excessive movement rejected")
+    let storedDX=original.getDoubleValueField(.mouseEventDeltaX)
+    let normalized=destinationMouseEvent(original,type:raw,point:CGPoint(x:10,y:20))
+    check(normalized?.getDoubleValueField(.mouseEventDeltaX)==storedDX,"type \(raw) framework-normalized movement survives")
   }
   for raw:UInt32 in [1,2,3,4,25,26] {
     let button:UInt32 = [3,4].contains(raw) ? 1 : [25,26].contains(raw) ? 2 : 0
