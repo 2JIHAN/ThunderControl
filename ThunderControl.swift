@@ -33,7 +33,7 @@ final class DesktopInjectionEpoch {
 }
 
 func connectionLog(_ text:String) {
-  guard !CommandLine.arguments.contains("--self-test"),!CommandLine.arguments.contains("--pairing-integration-test"),!CommandLine.arguments.contains("--ui-smoke-test"),!CommandLine.arguments.contains("--ui-ownership-test") else{return}
+  guard !CommandLine.arguments.contains("--self-test"),!CommandLine.arguments.contains("--pairing-integration-test"),!CommandLine.arguments.contains("--ui-smoke-test"),!CommandLine.arguments.contains("--ui-ownership-test"),!CommandLine.arguments.contains("--local-tcp-relay-integration-test") else{return}
   DiagnosticStore.shared.recordConnection("t=\(Date().timeIntervalSince1970) "+text)
 }
 func safeConnectionError(_ error: Error) -> String {
@@ -1023,7 +1023,7 @@ func returnTimeoutMustCancel(_ phase: EdgeHandoff.Phase) -> Bool { phase == .ret
 
 final class Relay {
   let gestureTrace=GestureTrace(persistSystemLog:false,recordingInitially:true,continuous:true,sink:{line in
-    guard !CommandLine.arguments.contains("--self-test"),!CommandLine.arguments.contains("--pairing-integration-test"),!CommandLine.arguments.contains("--ui-smoke-test"),!CommandLine.arguments.contains("--ui-ownership-test") else{return}
+    guard !CommandLine.arguments.contains("--self-test"),!CommandLine.arguments.contains("--pairing-integration-test"),!CommandLine.arguments.contains("--ui-smoke-test"),!CommandLine.arguments.contains("--ui-ownership-test"),!CommandLine.arguments.contains("--local-tcp-relay-integration-test") else{return}
     DiagnosticStore.shared.recordGesture(line)
   })
   var gestureDebugConfiguration:String {"auto=\(auto) inject=\(inject) systemOptIn=\(experimental) appOptIn=\(appGestureExperimental) systemCompatible=\(gestureCompatible) appCompatible=\(appGestureCompatible) receiverInput=\(receiverAvailable) receiverSystem=\(receiverGestureAvailable) receiverApp=\(receiverAppGestureAvailable) invertVertical=\(invertVerticalSystemGestures) invertHorizontal=\(invertHorizontalSystemGestures) cursorModeSupported=\(cursorVisibilityCompatible) receiverHideOwned=\(receiverCursor.isHidden) receiverLocalOverride=\(receiverCursorLocalOverride) phase=\(handoff.phase)"}
@@ -1164,7 +1164,9 @@ final class Relay {
   var desktopPhysicalInputsForTests:(()->Bool)?
   var desktopInputPermissionForTests:(()->Bool)?
   var desktopInputPostForTests:((CGEvent)->Void)?
-  private let hidMouseMotionPoster=HIDMouseMotionPoster()
+  var authenticatedFrameQueuedForTests:((Wire)->Void)?
+  private let hidMouseMotionPoster: HIDMouseMotionPoster
+  private let postCGEvent: (CGEvent, CGEventTapLocation) -> Void
   private var inputTimingGeneration:UUID?
   private var inputQueueTiming=DisplayTimingStats(),inputMapTiming=DisplayTimingStats(),inputPostTiming=DisplayTimingStats()
   private var inputTimingLoggedAt:Double=0
@@ -1577,10 +1579,46 @@ final class Relay {
   private var bridgeCheckInFlight = false
   private var lastEdgeGateReason = ""
   private let cursorResources: CursorRecoveryController
-  init(cursorResources: CursorRecoveryController = CursorRecoveryController(),receiverCursor:CursorVisibilityController = CursorVisibilityController(),layoutStore:SavedScreenLayoutStore=SavedScreenLayoutStore(),desktopPlacementStore:SavedDesktopPlacementStore=SavedDesktopPlacementStore()) {
+  init(cursorResources: CursorRecoveryController = CursorRecoveryController(),receiverCursor:CursorVisibilityController = CursorVisibilityController(),layoutStore:SavedScreenLayoutStore=SavedScreenLayoutStore(),desktopPlacementStore:SavedDesktopPlacementStore=SavedDesktopPlacementStore(),inputAPI:RelayInputAPI = .system) {
     self.savedScreenLayouts=layoutStore
     self.savedDesktopPlacements=desktopPlacementStore
     self.cursorResources = cursorResources;self.receiverCursor=receiverCursor
+    self.hidMouseMotionPoster=HIDMouseMotionPoster(api:inputAPI.motion)
+    self.postCGEvent=inputAPI.postCG
+  }
+  func prepareLocalTCPSafetyForTests() {
+    precondition(CommandLine.arguments.contains("--self-test") && CommandLine.arguments.contains("--local-tcp-relay-integration-test"))
+    safetyObserversInstalled=true
+    gestureTrace.setEnabled(false)
+    sessionSnapshot=SessionSafetySnapshot(onConsole:true,loginDone:true,screenLocked:false)
+    lastSessionPoll=ProcessInfo.processInfo.systemUptime
+    if session.isEmpty { session=UUID().uuidString }
+  }
+  func flushLocalTCPWritesForTests() {
+    precondition(CommandLine.arguments.contains("--self-test") && CommandLine.arguments.contains("--local-tcp-relay-integration-test"))
+    out.sync {}
+  }
+  func invalidateLocalTCPGenerationForTests() {
+    precondition(CommandLine.arguments.contains("--self-test") && CommandLine.arguments.contains("--local-tcp-relay-integration-test"))
+    generation=UUID()
+  }
+  func runAuthenticatedStream(fd:Int32,incomingKey:SymmetricKey,validator:inout PeerValidator,context:SessionContext,generation g:UUID) throws {
+    while !context.cancelled {
+      let w = try unseal(readFrame(fd), incomingKey)
+      try validator.accept(w)
+      guard self.inbound.wait(timeout: .now()) == .success else {
+        throw Failure("Inbound queue overload")
+      }
+      let inputQueuedAt=ProcessInfo.processInfo.systemUptime
+      DispatchQueue.main.async {
+        defer { self.inbound.signal() }
+        guard self.generation == g, !context.cancelled else { return }
+        self.noteInputQueue(w,queuedAt:inputQueuedAt)
+        self.receive(w)
+      }
+      authenticatedFrameQueuedForTests?(w)
+    }
+    context.cancel(reason:"Session loop ended")
   }
   /// Sender-only accepted source attachment. Validates against the current
   /// receiver desktop, snaps so the proposed source rectangle attaches to a
@@ -2717,7 +2755,7 @@ final class Relay {
     for key in receiverSystemKeys.releaseAll() {
       if let event=key.makeEvent() {
         event.setIntegerValueField(.eventSourceUserData,value:marker)
-        if let post=desktopInputPostForTests {post(event)} else{event.post(tap:.cghidEventTap)}
+        if let post=desktopInputPostForTests {post(event)} else{postCGEvent(event,.cghidEventTap)}
       }
     }
     streamFlags = []
@@ -2726,7 +2764,7 @@ final class Relay {
     for k in keys {
       let e = CGEvent(keyboardEventSource: nil, virtualKey: k, keyDown: false)
       e?.setIntegerValueField(.eventSourceUserData, value: marker)
-      if let e {if let post=desktopInputPostForTests {post(e)} else{e.post(tap:.cghidEventTap)}}
+      if let e {if let post=desktopInputPostForTests {post(e)} else{postCGEvent(e,.cghidEventTap)}}
     }
     keys.removeAll()
     for b in buttons {
@@ -2737,7 +2775,7 @@ final class Relay {
         mouseButton: CGMouseButton(rawValue: b) ?? .left)
       {
         e.setIntegerValueField(.eventSourceUserData, value: marker)
-        if let post=desktopInputPostForTests {post(e)} else{e.post(tap:.cghidEventTap)}
+        if let post=desktopInputPostForTests {post(e)} else{postCGEvent(e,.cghidEventTap)}
       }
     }
     buttons.removeAll()
@@ -3095,21 +3133,7 @@ final class Relay {
           }
         }
         stage = "Authenticated stream"
-        while !sessionContext.cancelled {
-          let w = try unseal(readFrame(c), incomingKey)
-          try peerValidator.accept(w)
-          guard self.inbound.wait(timeout: .now()) == .success else {
-            throw Failure("Inbound queue overload")
-          }
-          let inputQueuedAt=ProcessInfo.processInfo.systemUptime
-          DispatchQueue.main.async {
-            defer { self.inbound.signal() }
-            guard self.generation == g, !sessionContext.cancelled else { return }
-            self.noteInputQueue(w,queuedAt:inputQueuedAt)
-            self.receive(w)
-          }
-        }
-        sessionContext.cancel(reason:"Session loop ended")
+        try self.runAuthenticatedStream(fd:c,incomingKey:incomingKey,validator:&peerValidator,context:sessionContext,generation:g)
       } catch {
         let failureStage = stage
         let reason = safeConnectionError(error)
@@ -4167,7 +4191,9 @@ final class Relay {
         release?.flags = streamFlags
         release?.setIntegerValueField(.eventSourceUserData, value: marker)
         guard finalDesktopInjectionGate() else{return}
-        release?.post(tap: .cghidEventTap)
+        if let release {
+          if let post=desktopInputPostForTests {post(release)} else {postCGEvent(release,.cghidEventTap)}
+        }
         modifiers.remove(code)
       }
     }
@@ -4232,7 +4258,7 @@ final class Relay {
       case .posted: break
       case .useCG:
         guard finalDesktopInjectionGate() else{return}
-        e.post(tap:replayTapLocation(for:t))
+        postCGEvent(e,replayTapLocation(for:t))
       case .cancelled: return
       case .failed(let code): stop(reason:"HID mouse motion failed (\(code))");return
       }
@@ -5803,6 +5829,11 @@ struct ThunderControlMain {
         let format=try displayTestFormat(arguments:CommandLine.arguments,after:i+2)
         try runDisplayPipelineTests(path:CommandLine.arguments[i+1],format:format)
       }catch{fputs("Display offline pipeline failed\n",stderr);exit(1)}
+    } else if CommandLine.arguments.contains("--local-tcp-relay-integration-test") {
+      guard CommandLine.arguments.contains("--self-test") else {
+        fputs("--local-tcp-relay-integration-test requires --self-test; refusing to launch the normal app.\n",stderr); exit(2)
+      }
+      do {try runLocalTCPRelayIntegrationTests()}catch{fputs("FAIL local tcp relay integration: \(error)\n",stderr);exit(1)}
     } else if CommandLine.arguments.contains("--pairing-integration-test") {
       do {try runPINRelayIntegrationTests()}catch{fputs("FAIL paired protocol integration: \(error)\n",stderr);exit(1)}
     } else if CommandLine.arguments.contains("--localization-self-test") {

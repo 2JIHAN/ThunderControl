@@ -62,7 +62,14 @@ struct HIDMotionAPI {
   }
 }
 
-// Relay serializes all ownership and calls on the main thread. This owns no held inputs.
+struct RelayInputAPI {
+  var motion: HIDMotionAPI
+  var postCG: (CGEvent, CGEventTapLocation) -> Void
+  static var system: RelayInputAPI {
+    RelayInputAPI(motion: .system, postCG: { event, tap in event.post(tap: tap) })
+  }
+}
+
 final class HIDMouseMotionPoster {
   private let api: HIDMotionAPI
   private var connection: io_connect_t=0
