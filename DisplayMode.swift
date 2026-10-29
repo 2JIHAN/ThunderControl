@@ -275,6 +275,7 @@ struct OwnedDisplayMonitor {
     let observer=center.addObserver(forName:NSNotification.Name("com.apple.screenIsLocked"),object:nil,queue:.main){[weak self] _ in MainActor.assumeIsolated{guard let self,self.epoch==token else{return};self.stop(message:TCText("Screen transmission stopped because the screen locked."))}}
     observers.append((center,observer))
     timer=Timer.scheduledTimer(withTimeInterval:0.5,repeats:true){[weak self] _ in MainActor.assumeIsolated{guard let self,self.epoch==token else{return};self.tick()}}
+    if let timer {RunLoop.main.add(timer,forMode:.common)}
     do {try t.start(sending:sending,peer:peer,expectedPair:expectedPair,viewerFormat:viewerTarget?.format ?? .standard)}catch{stop(message:safeConnectionError(error));throw error}
     report(sending ? TCText("Authenticating the same MacBook as the existing input connection on the screen channel."):TCText("Waiting for a screen connection. The existing input connection remains active."))
   }
@@ -551,6 +552,7 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
         do {try self.heartbeat?.write(contentsOf:Data([1]))}
         catch {self.transitionFailed=true;self.abortInputTransition?();if !self.pausing{self.cleanUpHelper()}}
       }}
+      if let timer {RunLoop.main.add(timer,forMode:.common)}
     }
     guard sending else{baseline=nil;cleaning=false;report(message);return}
     if pausing{return}

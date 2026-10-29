@@ -2913,6 +2913,7 @@ final class Relay {
       }
       self.checkBridgeContinuity(b,generation:g)
     }
+    if let timer {RunLoop.main.add(timer,forMode:.common)}
     status(
       sendMode
         ? "Connecting through \(b.name) \(b.ip)…" : "Listening ONLY on \(b.name) \(b.ip):\(port)")
