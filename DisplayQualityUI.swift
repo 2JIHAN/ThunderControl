@@ -69,7 +69,7 @@ import AppKit
 
     func refreshDisplayQualityUI() {
         let preferences = DisplayQualityPreferences.load()
-        if displayQualityCapPicker.selectedItem?.tag != preferences.maximumTier.rawValue {displayQualityCapPicker.selectItem(withTag: preferences.maximumTier.rawValue)}
+        displayQualityCapPicker.selectItem(withTag: preferences.maximumTier.rawValue)
         displayPresentationPicker.selectedSegment = preferences.presentation.rawValue
         if let name = displayMode.currentDisplayCodecName,
            let tier = DisplayQualityTier(wireCodecName: name) {
