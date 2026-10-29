@@ -5194,12 +5194,19 @@ func matchingButton(_ type: UInt32, _ number: Int64) -> Bool {
   if [25, 26, 27].contains(type) { return (2...31).contains(number) }
   return true
 }
-// Memory-only construction: source relative deltas never compete with destination location.
+// Preserve bounded relative movement while rebuilding the destination location.
 func destinationMouseEvent(
   _ decoded: CGEvent, type: UInt32, point: CGPoint, source: CGEventSource? = nil
 ) -> CGEvent? {
   guard [1, 2, 3, 4, 5, 6, 7, 25, 26, 27].contains(type), point.x.isFinite, point.y.isFinite,
     let mouseType = CGEventType(rawValue: type)
+  else { return nil }
+  let moving = [5, 6, 7, 27].contains(type)
+  let dx = moving ? decoded.getDoubleValueField(.mouseEventDeltaX) : 0
+  let dy = moving ? decoded.getDoubleValueField(.mouseEventDeltaY) : 0
+  guard dx.isFinite, dy.isFinite,
+    abs(dx) <= ReceiverDesktop.coordinateLimit * 4,
+    abs(dy) <= ReceiverDesktop.coordinateLimit * 4
   else { return nil }
   let number = decoded.getIntegerValueField(.mouseEventButtonNumber)
   guard validButton(number), matchingButton(type, number),
@@ -5214,8 +5221,8 @@ func destinationMouseEvent(
   fresh.setIntegerValueField(.mouseEventButtonNumber, value: number)
   fresh.setDoubleValueField(
     .mouseEventPressure, value: decoded.getDoubleValueField(.mouseEventPressure))
-  fresh.setDoubleValueField(.mouseEventDeltaX, value: 0)
-  fresh.setDoubleValueField(.mouseEventDeltaY, value: 0)
+  fresh.setDoubleValueField(.mouseEventDeltaX, value: dx)
+  fresh.setDoubleValueField(.mouseEventDeltaY, value: dy)
   return fresh
 }
 func validFields(_ e: CGEvent, _ t: UInt32) -> Bool {
@@ -5601,7 +5608,7 @@ func tests() throws {
         event.getDoubleValueField(.mouseEventPressure)
           - original.getDoubleValueField(.mouseEventPressure)) < 0.004)
     check(
-      event.getDoubleValueField(.mouseEventDeltaX) == 0
+      event.getDoubleValueField(.mouseEventDeltaX) == ([5, 6, 7, 27].contains(type) ? 99 : 0)
         && event.getDoubleValueField(.mouseEventDeltaY) == 0)
     frame.x = nil
     check(!validMouseCoordinates(frame))
@@ -5620,7 +5627,7 @@ func tests() throws {
   wheelFrame.x = nil
   check(!validMouseCoordinates(wheelFrame))
   print(
-    "PASS all10 destination mouse types: required coordinates, button/click/pressure/flags and zero-delta consistency; no injection"
+    "PASS all10 destination mouse types: required coordinates, button/click/pressure/flags and move-only delta preservation; no injection"
   )
   let oldMouse = CGEvent(
     mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: CGPoint(x: 900, y: 700),
@@ -5631,12 +5638,12 @@ func tests() throws {
   let absolute = destinationMouseEvent(oldMouse, type: 5, point: CGPoint(x: 1, y: 321.5))!
   check(absolute.location == CGPoint(x: 1, y: 321.5))
   check(
-    absolute.getDoubleValueField(.mouseEventDeltaX) == 0
-      && absolute.getDoubleValueField(.mouseEventDeltaY) == 0)
+    absolute.getDoubleValueField(.mouseEventDeltaX) == 120
+      && absolute.getDoubleValueField(.mouseEventDeltaY) == -40)
   check(oldMouse.getDoubleValueField(.mouseEventDeltaX) == 120)
   check(absolute.flags == .maskShift)
   print(
-    "PASS fresh absolute mouse event matches destination and has no source-relative deltas; memory only"
+    "PASS fresh mouse event matches destination and preserves source-relative movement; memory only"
   )
   check(Relay.verifyStaleActiveForTests())
   var ordered=EntryMotionBuffer();let orderedToken=UUID().uuidString;ordered.begin(token:orderedToken)
@@ -5793,6 +5800,7 @@ struct ThunderControlMain {
     } else if CommandLine.arguments.contains("--bridge-recovery-self-test") {
       exit(runBridgeLinkRecoveryTests()==0 ? 0:1)
     } else if CommandLine.arguments.contains("--self-test") {
+      check(runMouseMotionPreservationTests()==0)
       check(runSystemControlKeyTests()==0)
       check(runSystemControlRelayTests()==0)
       #if TC_QUALITY_TIERS
