@@ -601,6 +601,8 @@ static void AppendU64(NSMutableData *data,uint64_t n){n=CFSwapInt64HostToBig(n);
 // ScreenCaptureKit composites the OS cursor into video. Keep legacy overlays
 // hidden so current and older viewers cannot draw a duplicate cursor.
 static void PublishCursor(void){
+  // The cursor is composited into video; one successful hide lasts this helper's lifetime.
+  static BOOL sent=NO;if(sent)return;
   static uint64_t sequence=0;static double sampled=0;double now=Now();
   if(now-sampled<1.0/60.0)return;sampled=now;
   if(sequence==UINT64_MAX)Fail("cursor sequence exhausted");
@@ -608,7 +610,7 @@ static void PublishCursor(void){
   uint8_t kind=7,hidden[10]={0};NSMutableData *packet=[NSMutableData dataWithBytes:&kind length:1];AppendU64(packet,sequence++);
   [packet appendBytes:hidden length:sizeof(hidden)]; // visible, shape, x and y stay zero
   // Retain the existing live session guard, atomic output and owned-epoch check.
-  (void)TryCursorOutput(packet,sampledEpoch,^{Guard();},outputFD);
+  if(TryCursorOutput(packet,sampledEpoch,^{Guard();},outputFD))sent=YES;
 }
 static uint64_t submittedSequence=0;
 // HEVC test builds (-DTC_HEVC): the retina H.264 encode took 14.5-17ms per frame with wide
