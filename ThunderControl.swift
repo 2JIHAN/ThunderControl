@@ -1165,8 +1165,11 @@ final class Relay {
   var desktopInputPermissionForTests:(()->Bool)?
   var desktopInputPostForTests:((CGEvent)->Void)?
   var authenticatedFrameQueuedForTests:((Wire)->Void)?
-  private let hidMouseMotionPoster: HIDMouseMotionPoster
+  private let hidInputPoster: HIDInputPoster
+  private var receiverCleanupPending=false
+  private var receiverPhysicalModifiers=Set<CGKeyCode>()
   private let postCGEvent: (CGEvent, CGEventTapLocation) -> Void
+  private let warpInputCursor: (CGPoint) -> CGError
   private var inputTimingGeneration:UUID?
   private var inputQueueTiming=DisplayTimingStats(),inputMapTiming=DisplayTimingStats(),inputPostTiming=DisplayTimingStats()
   private var inputTimingLoggedAt:Double=0
@@ -1583,8 +1586,9 @@ final class Relay {
     self.savedScreenLayouts=layoutStore
     self.savedDesktopPlacements=desktopPlacementStore
     self.cursorResources = cursorResources;self.receiverCursor=receiverCursor
-    self.hidMouseMotionPoster=HIDMouseMotionPoster(api:inputAPI.motion)
+    self.hidInputPoster=HIDInputPoster(api:inputAPI.native)
     self.postCGEvent=inputAPI.postCG
+    self.warpInputCursor=inputAPI.warp
   }
   func prepareLocalTCPSafetyForTests() {
     precondition(CommandLine.arguments.contains("--self-test") && CommandLine.arguments.contains("--local-tcp-relay-integration-test"))
@@ -1593,6 +1597,45 @@ final class Relay {
     sessionSnapshot=SessionSafetySnapshot(onConsole:true,loginDone:true,screenLocked:false)
     lastSessionPoll=ProcessInfo.processInfo.systemUptime
     if session.isEmpty { session=UUID().uuidString }
+  }
+  func holdLocalTCPWriterForTests(entered:DispatchSemaphore,released:DispatchSemaphore) {
+    prepareLocalTCPSafetyForTests()
+    out.async { entered.signal();_ = released.wait(timeout:.now()+3) }
+  }
+  func drainLocalTCPWriterForTests(_ done:@escaping ()->Void) {
+    prepareLocalTCPSafetyForTests();out.async {DispatchQueue.main.async(execute:done)}
+  }
+  var localTCPOutgoingFrameForTests:((Wire)->Wire)?
+  var localTCPLeaseForTests:String? {bridgeLease.latest}
+  var localTCPNextSequenceForTests:UInt64 {
+    get {seq}
+    set {precondition(CommandLine.arguments.contains("--self-test") && CommandLine.arguments.contains("--local-tcp-relay-integration-test"));seq=newValue}
+  }
+  var localTCPPhaseForTests:String {String(describing:handoff.phase)}
+  var localTCPTokenForTests:String? {handoff.token}
+  var localTCPMapForTests:ReceiverDesktop? {receiverDesktop}
+  var localTCPBridgeSuspendedForTests:Bool {bridgeInputSuspended}
+  func prepareLocalTCPNegotiationForTests(hello:Wire,topology snapshot:DisplayTopologySnapshot) {
+    prepareLocalTCPSafetyForTests()
+    precondition(handoff.phase == .local && hello.multiDisplayDesktopCodec==1 && hello.bridgeRecoveryCodec==1)
+    multiDisplayDesktopCompatible=hello.multiDisplayDesktopCodec==1
+    bridgeRecoveryCompatible=hello.bridgeRecoveryCodec==1
+    concurrentDisplayCompatible=true
+    topology=snapshot;displayBounds=snapshot.bounds
+    auto=sender
+  }
+  @discardableResult func sendLocalTCPDesktopBeginForTests(token:String)->Bool {
+    prepareLocalTCPSafetyForTests()
+    guard sender,handoff.phase == .pending,handoff.token==token,!ownership.blocked else{return false}
+    return sendDesktopBeginControl(token:token)
+  }
+  func observeLocalTCPBridgeForTests(_ status:BridgeLinkStatus,expected:Bridge,now:Double) {
+    prepareLocalTCPSafetyForTests();observeBridgeContinuity(status,expected:expected,now:now)
+  }
+  func refreshLocalTCPLeaseForTests() {
+    prepareLocalTCPSafetyForTests()
+    precondition(!sender && bridgeRecoveryCompatible)
+    _ = control("inputLease",token:bridgeLease.issue(now:ProcessInfo.processInfo.systemUptime))
   }
   func flushLocalTCPWritesForTests() {
     precondition(CommandLine.arguments.contains("--self-test") && CommandLine.arguments.contains("--local-tcp-relay-integration-test"))
@@ -2432,7 +2475,7 @@ final class Relay {
   func consent(_ enabled: Bool) {
     guard displayBarrier == nil else{if !enabled {displayBarrier?.savedConsent=false};inject=false;return}
     guard !lockedTransportOnly else{inject=false;return}
-    inject = enabled && !sender && inputPermissionsReady()
+    inject = enabled && !sender && (desktopInputPermissionForTests?() ?? inputPermissionsReady())
     if !inject {
       if let t = handoff.token { _ = control("cancel", token: t) }
       forceLocal()
@@ -2694,7 +2737,6 @@ final class Relay {
     return sawCancellationBeforeCallback && !recovery.needsRecovery && context.cancelled
   }
   func stop(reason:String="Local Stop") {
-    hidMouseMotionPoster.close()
     bridgeRecovery=BridgeInputRecovery();bridgeGrace=BridgeLinkGrace();bridgeRecoveryCompatible=false;bridgeResetTokens.removeAll();bridgeLease=BridgeInputLease();lastLeaseSent=0
     if desktopObserverActive {DesktopInjectionEpoch.shared.release();desktopObserverActive=false}
     desktopValidatedEpoch=nil
@@ -2732,13 +2774,12 @@ final class Relay {
     displayGeometryChanged?(nil)
     bridgeCheckInFlight = false
     gestureCompatible = false
-    localKeys.removeAll()
-    localButtons.removeAll()
-    localFlags = []
     gestureUntil = 0
     dockLocalActive=false
     removeCaptureIfClean()
     releaseInputs()
+    localKeys.removeAll();localButtons.removeAll();localFlags=[]
+    if receiverCleanupPending {status("Input cleanup is pending. Restore input permission and click Stop to retry.");return}
     if receiverCursor.needsRecovery {status(TCText("Waiting to restore the Receiver cursor's visibility. Click Stop to retry."));return}
     if cursorResources.needsRecovery {
       status(recoveryNotice)
@@ -2749,36 +2790,77 @@ final class Relay {
         ? "Stopped. Release remote-owned inputs; cleanup filtering active only while app and permission remain available. Hard quit or permission loss cannot guarantee orphan filtering."
         : "Stopped. Input forwarding and receiving disabled. Reason: " + lastStopReason)
   }
+  private func receiverModifierFlags(_ codes:Set<CGKeyCode>)->CGEventFlags {
+    CGEventFlags(rawValue:codes.reduce(UInt64(0)) { raw,code in
+      guard let descriptor=modifierDescriptors[code] else{return raw}
+      return raw | descriptor.aggregate.rawValue | descriptor.sideBit
+    })
+  }
+  private var receiverCleanupAllowed:Bool {
+    desktopInputPostForTests != nil || (desktopInputPermissionForTests?() ?? (AXIsProcessTrusted() && currentSessionBlockReason(forceRefresh:true)==nil))
+  }
+  private func postReceiverInput(_ event:CGEvent,modifierCodes:Set<CGKeyCode>,cleanup:Bool=false,canPost:()->Bool)->HIDInputResult {
+    guard canPost() else{return .cancelled}
+    if let post=desktopInputPostForTests {post(event);return .posted}
+    if event.type == .scrollWheel || event.type.rawValue == 14 {
+      postCGEvent(event,replayTapLocation(for:event.type.rawValue));return .posted
+    }
+    if !cleanup && !hidInputPoster.isSelected {
+      guard !(desktopPhysicalInputsForTests?() ?? physicalInputsHeld()) else{return .failed(Int32(kIOReturnNotPermitted),attempted:false)}
+      receiverPhysicalModifiers.removeAll()
+    }
+    let bounds=receiverDesktop?.displays.map{$0.bounds} ?? [topology?.bounds ?? CGDisplayBounds(CGMainDisplayID())]
+    let preferHID=cleanup || bounds.allSatisfy{$0.minX >= -32768 && $0.minY >= -32768 && $0.maxX <= 32768 && $0.maxY <= 32768}
+    var flags=receiverModifierFlags(modifierCodes)
+    flags.formUnion(event.flags.intersection([.maskAlphaShift,.maskNumericPad,.maskHelp]))
+    let result=hidInputPoster.post(event,keyboardFlags:flags,preferHID:preferHID,canPost:canPost)
+    if result == .useCG {
+      guard canPost() else{return .cancelled}
+      postCGEvent(event,replayTapLocation(for:event.type.rawValue));return .posted
+    }
+    return result
+  }
   func releaseInputs() {
-    // Only release function keys this receiver actually injected. Construct fresh
-    // whitelisted system events; never replay arbitrary systemDefined payloads.
+    guard receiverCleanupAllowed else {
+      receiverCleanupPending = !keys.isEmpty || !modifiers.isEmpty || !buttons.isEmpty || !receiverSystemKeys.pressed.isEmpty || hidInputPoster.hasGlobalStateToRestore
+      return
+    }
     for key in receiverSystemKeys.releaseAll() {
       if let event=key.makeEvent() {
         event.setIntegerValueField(.eventSourceUserData,value:marker)
         if let post=desktopInputPostForTests {post(event)} else{postCGEvent(event,.cghidEventTap)}
       }
     }
-    streamFlags = []
-    keys.formUnion(modifiers)
-    modifiers.removeAll()
-    for k in keys {
-      let e = CGEvent(keyboardEventSource: nil, virtualKey: k, keyDown: false)
-      e?.setIntegerValueField(.eventSourceUserData, value: marker)
-      if let e {if let post=desktopInputPostForTests {post(e)} else{postCGEvent(e,.cghidEventTap)}}
+    // Physical downs seen by our tap take over their resource without an up.
+    keys.subtract(localKeys)
+    modifiers.subtract(receiverPhysicalModifiers)
+    buttons=Set(buttons.filter{!localButtons.contains(Int64($0))})
+    for code in Array(keys) {
+      guard let event=CGEvent(keyboardEventSource:nil,virtualKey:code,keyDown:false) else{continue}
+      event.flags=receiverModifierFlags(modifiers.union(receiverPhysicalModifiers))
+      event.setIntegerValueField(.eventSourceUserData,value:marker)
+      if postReceiverInput(event,modifierCodes:modifiers.union(receiverPhysicalModifiers),cleanup:true,canPost:{self.receiverCleanupAllowed}) == .posted {keys.remove(code)}
     }
-    keys.removeAll()
-    for b in buttons {
-      let t: CGEventType = b == 0 ? .leftMouseUp : b == 1 ? .rightMouseUp : .otherMouseUp
-      if let e = CGEvent(
-        mouseEventSource: nil, mouseType: t,
-        mouseCursorPosition: CGEvent(source: nil)?.location ?? .zero,
-        mouseButton: CGMouseButton(rawValue: b) ?? .left)
-      {
-        e.setIntegerValueField(.eventSourceUserData, value: marker)
-        if let post=desktopInputPostForTests {post(e)} else{postCGEvent(e,.cghidEventTap)}
-      }
+    for code in Array(modifiers) {
+      let remaining=modifiers.subtracting([code]).union(receiverPhysicalModifiers)
+      guard let event=CGEvent(keyboardEventSource:nil,virtualKey:code,keyDown:false) else{continue}
+      event.type = .flagsChanged;event.flags=receiverModifierFlags(remaining)
+      event.setIntegerValueField(.eventSourceUserData,value:marker)
+      if postReceiverInput(event,modifierCodes:remaining,cleanup:true,canPost:{self.receiverCleanupAllowed}) == .posted {modifiers.remove(code)}
     }
-    buttons.removeAll()
+    for button in Array(buttons) {
+      let type:CGEventType=button == 0 ? .leftMouseUp:button == 1 ? .rightMouseUp:.otherMouseUp
+      guard let event=CGEvent(mouseEventSource:nil,mouseType:type,mouseCursorPosition:desktopReceiverPreviousPointer ?? CGEvent(source:nil)?.location ?? .zero,mouseButton:CGMouseButton(rawValue:button) ?? .left) else{continue}
+      event.flags=receiverModifierFlags(receiverPhysicalModifiers)
+      event.setIntegerValueField(.eventSourceUserData,value:marker)
+      if postReceiverInput(event,modifierCodes:receiverPhysicalModifiers,cleanup:true,canPost:{self.receiverCleanupAllowed}) == .posted {buttons.remove(button)}
+    }
+    var restored=true
+    if keys.isEmpty && modifiers.isEmpty && buttons.isEmpty {
+      restored=hidInputPoster.restoreModifiers(preserving:receiverModifierFlags(receiverPhysicalModifiers),canPost:{self.receiverCleanupAllowed}) == .posted
+    }
+    receiverCleanupPending = !keys.isEmpty || !modifiers.isEmpty || !buttons.isEmpty || !restored
+    if !receiverCleanupPending {streamFlags=[];hidInputPoster.close()}
   }
   static func verifySystemControlKeyReceiveForTests()->Bool {
     final class Mock:CursorRecoveryAPI {
@@ -3364,6 +3446,10 @@ final class Relay {
     }
     w.sequence = seq
     seq += 1
+    if let transform=localTCPOutgoingFrameForTests {
+      precondition(CommandLine.arguments.contains("--self-test") && CommandLine.arguments.contains("--local-tcp-relay-integration-test"))
+      w=transform(w)
+    }
     traceGesture(stage:.txQueued,packet:w)
     let g = generation
     out.async {
@@ -3463,6 +3549,24 @@ final class Relay {
     guard e.getIntegerValueField(.eventSourceUserData) != marker,
       e.getIntegerValueField(.eventSourceUnixProcessID) != Int64(getpid())
     else { return false }
+    if !sender {
+      let code=CGKeyCode(truncatingIfNeeded:e.getIntegerValueField(.keyboardEventKeycode))
+      if type == .flagsChanged,let down=modifierDown(code,flags:e.flags) {
+        if down {receiverPhysicalModifiers.insert(code)} else {receiverPhysicalModifiers.remove(code)}
+      }
+      if type == .flagsChanged,code == 57 {hidInputPoster.preserveLocalCaps(e.flags)}
+      if hidInputPoster.isSelected && (type == .keyDown || type == .keyUp || type == .flagsChanged || [1,2,3,4,25,26].contains(type.rawValue)) {
+        if type == .keyDown {localKeys.insert(code)}
+        if type == .keyUp {localKeys.remove(code)}
+        let button=e.getIntegerValueField(.mouseEventButtonNumber)
+        if [1,3,25].contains(type.rawValue) {localButtons.insert(button)}
+        if [2,4,26].contains(type.rawValue) {localButtons.remove(button)}
+        e.flags=filteredModifierFlags(e.flags,orphanCodes:modifiers.subtracting(receiverPhysicalModifiers),ambiguous:[])
+        if let token=handoff.token {_ = control("cancel",token:token)}
+        inject=false;_ = handoff.reset();releaseInputs()
+        status("Receiver local input ended remote input. Enable input explicitly to resume.")
+      }
+    }
     quarantineStaleSourceInput(now:ProcessInfo.processInfo.systemUptime)
     let systemKey=SystemControlKey.decode(e)
     if drainDesktopPauseInput(type:type,code:CGKeyCode(truncatingIfNeeded:e.getIntegerValueField(.keyboardEventKeycode)),button:e.getIntegerValueField(.mouseEventButtonNumber),flags:e.flags,systemKey:systemKey) {return true}
@@ -3852,7 +3956,7 @@ final class Relay {
   }
   private func receiveDockGesture(_ w:Wire) {
     guard !multiDisplayDesktopCompatible || desktopSystemGestureCompatible else{return}
-    guard receiverActivationPendingToken == nil,inject,experimental,gestureCompatible,(desktopSystemGesturePermissionForTests?() ?? AXIsProcessTrusted()),let token=w.token,acceptsToken(handoff,token),let id=w.dockID,let d=w.dock else{traceGesture(stage:.rxRejected,packet:w);return}
+    guard !receiverCleanupPending,receiverActivationPendingToken == nil,inject,experimental,gestureCompatible,(desktopSystemGesturePermissionForTests?() ?? AXIsProcessTrusted()),let token=w.token,acceptsToken(handoff,token),let id=w.dockID,let d=w.dock else{traceGesture(stage:.rxRejected,packet:w);return}
     var target:DesktopSystemGestureTarget?
     var destination:CGPoint?
     if multiDisplayDesktopCompatible {
@@ -3939,7 +4043,7 @@ final class Relay {
         return
       }
       if multiDisplayDesktopCompatible {
-        guard !sender,inject,AXIsProcessTrusted(),handoff.phase == .local,
+        guard !sender,inject,(desktopInputPermissionForTests?() ?? AXIsProcessTrusted()),handoff.phase == .local,
           UUID(uuidString:token)?.uuidString==token,let desktop=currentRoutingDesktop(),
           let portal=DesktopHandoffRouting.portal(w,desktop:desktop,publishedRevision:receiverDesktopPublishRevision),
           let entry=DesktopHandoffRouting.point(w,desktop:desktop,revision:receiverDesktopPublishRevision) else{_ = control("cancel",token:token);return}
@@ -3994,7 +4098,7 @@ final class Relay {
         status("Display topology changed before target activation")
         return
       }
-      guard inject && AXIsProcessTrusted() else {
+      guard inject && (desktopInputPermissionForTests?() ?? AXIsProcessTrusted()) else {
         _ = control("cancel", token: token)
         forceLocal()
         return
@@ -4072,7 +4176,7 @@ final class Relay {
   func finishReceiverActivation(token:String,generation expected:UUID,ready:Bool) {
     guard generation==expected,receiverActivationPendingToken==token,handoff.token==token,handoff.phase == .targetActive,authenticated else{return}
     if detectReceiverMapTransition() {return}
-    guard ready,!receiverCursorLocalOverride,localKeys.isEmpty,localButtons.isEmpty,localFlags.isEmpty,inject,inputPermissionsReady(),currentSessionBlockReason(forceRefresh:true)==nil,let deadline=receiverActivationDeadline,ProcessInfo.processInfo.systemUptime<deadline,let bounds=topology?.bounds else{safetyStop("Receiver target foreground not ready; handoff canceled safely");return}
+    guard ready,!receiverCursorLocalOverride,localKeys.isEmpty,localButtons.isEmpty,localFlags.isEmpty,inject,(desktopInputPermissionForTests?() ?? inputPermissionsReady()),currentSessionBlockReason(forceRefresh:true)==nil,let deadline=receiverActivationDeadline,ProcessInfo.processInfo.systemUptime<deadline,let bounds=topology?.bounds else{safetyStop("Receiver target foreground not ready; handoff canceled safely");return}
     guard topologyUnchanged() else{if !pauseReceiverTopologyFailure(){safetyStop("Receiver topology changed")};return}
     let entry:CGPoint
     if multiDisplayDesktopCompatible {
@@ -4080,7 +4184,7 @@ final class Relay {
       entry=p
     } else {entry=CGPoint(x:bounds.minX+handoff.x,y:bounds.minY+handoff.y)}
     guard finalDesktopInjectionGate() else{return}
-    guard CGWarpMouseCursorPosition(entry) == .success else{safetyStop("Target entry warp failed");return}
+    guard warpInputCursor(entry) == .success else{safetyStop("Target entry warp failed");return}
     receiverActivationPendingToken=nil;receiverActivationDeadline=nil
     status("Handoff: receiver target foreground confirmed; active acknowledgement sent")
     _ = control("active",token:token)
@@ -4178,7 +4282,15 @@ final class Relay {
           held:!receiverSystemKeys.pressed.isEmpty || !keys.isEmpty || !buttons.isEmpty || !modifiers.isEmpty || !localKeys.isEmpty || !localButtons.isEmpty || !localFlags.isEmpty || !e.flags.intersection(heldModifierMask).isEmpty || dockReceiver.active || receiverAppGesture.active)
       }
     }
-    guard finalDesktopInjectionGate() else{return}
+    let inputGeneration=generation
+    let inputToken=handoff.token
+    let canPostInput:()->Bool = {
+      guard self.generation==inputGeneration,self.authenticated,self.inject,!self.bridgeInputSuspended,
+        self.handoff.token==inputToken,!self.receiverCleanupPending else{return false}
+      if self.bridgeRecoveryCompatible,!self.bridgeLease.accepts(w.inputLease,now:ProcessInfo.processInfo.systemUptime) {return false}
+      return self.finalDesktopInjectionGate()
+    }
+    guard canPostInput() else{return}
     // System keys carry only safe fine-step flags, not a complete keyboard state.
     if t != 14 {
     streamFlags = e.flags.intersection(heldModifierMask)
@@ -4188,11 +4300,13 @@ final class Relay {
         modifierDown(code, flags: e.flags) == false
       {
         let release = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false)
+        release?.type = .flagsChanged
         release?.flags = streamFlags
         release?.setIntegerValueField(.eventSourceUserData, value: marker)
         guard finalDesktopInjectionGate() else{return}
         if let release {
-          if let post=desktopInputPostForTests {post(release)} else {postCGEvent(release,.cghidEventTap)}
+          let result=postReceiverInput(release,modifierCodes:modifiers.subtracting([code]),canPost:canPostInput)
+          guard result == .posted else {if case .failed(let error,_) = result {stop(reason:"HID modifier reconciliation failed (\(error))")};return}
         }
         modifiers.remove(code)
       }
@@ -4233,36 +4347,33 @@ final class Relay {
     e.setIntegerValueField(.eventSourceUserData, value: marker)
     guard finalDesktopInjectionGate() else{return}
     if let systemKey,!receiverSystemKeys.accept(systemKey) {return}
-    if let destination=desktopDestination {desktopReceiverPreviousPointer=destination;desktopGlobalPointer=destination}
+    var nextModifiers=modifiers
     if t == 12 {
-      let code = CGKeyCode(e.getIntegerValueField(.keyboardEventKeycode))
-      if let down = modifierDown(code, flags: e.flags) {
-        if down { modifiers.insert(code) } else { modifiers.remove(code) }
-      }
+      let code=CGKeyCode(e.getIntegerValueField(.keyboardEventKeycode))
+      if let down=modifierDown(code,flags:e.flags) {if down {nextModifiers.insert(code)} else {nextModifiers.remove(code)}}
     }
-    if t == 10 { keys.insert(CGKeyCode(e.getIntegerValueField(.keyboardEventKeycode))) }
-    if t == 11 { keys.remove(CGKeyCode(e.getIntegerValueField(.keyboardEventKeycode))) }
-    if [1, 3, 25].contains(t) {
-      buttons.insert(UInt32(e.getIntegerValueField(.mouseEventButtonNumber)))
+    let inputCode=CGKeyCode(e.getIntegerValueField(.keyboardEventKeycode))
+    if t == 11,!keys.contains(inputCode) {return}
+    if t == 12,modifierDescriptors[inputCode] != nil,modifierDown(inputCode,flags:e.flags) == false,!modifiers.contains(inputCode) {return}
+    if [UInt32(2),4,26].contains(t),!buttons.contains(UInt32(e.getIntegerValueField(.mouseEventButtonNumber))) {return}
+    let result=postReceiverInput(e,modifierCodes:nextModifiers,canPost:canPostInput)
+    let attempted:Bool
+    switch result {
+    case .posted: attempted=true
+    case .failed(_,let didAttempt):attempted=didAttempt
+    default:attempted=false
     }
-    if [2, 4, 26].contains(t) {
-      buttons.remove(UInt32(e.getIntegerValueField(.mouseEventButtonNumber)))
+    if attempted {
+      if let destination=desktopDestination {desktopReceiverPreviousPointer=destination;desktopGlobalPointer=destination}
+      modifiers = result == .posted ? nextModifiers:modifiers.union(nextModifiers)
+      let code=CGKeyCode(e.getIntegerValueField(.keyboardEventKeycode))
+      if t == 10 {keys.insert(code)}
+      if t == 11,result == .posted {keys.remove(code)}
+      let button=UInt32(e.getIntegerValueField(.mouseEventButtonNumber))
+      if [1,3,25].contains(t) {buttons.insert(button)}
+      if [2,4,26].contains(t),result == .posted {buttons.remove(button)}
     }
-    // The final gate above precedes bookkeeping and post, but WindowServer
-    // asynchronous dispatch still has an unavoidable OS-level residual race.
-    if let post=desktopInputPostForTests {post(e)} else {
-      let motion=MotionPlan.make(type:t,location:e.location,
-        dx:e.getDoubleValueField(.mouseEventDeltaX),dy:e.getDoubleValueField(.mouseEventDeltaY),
-        flags:e.flags.rawValue,budget:Double(ReceiverDesktop.coordinateLimit)*4)
-      switch hidMouseMotionPoster.post(motion,canPost:finalDesktopInjectionGate) {
-      case .posted: break
-      case .useCG:
-        guard finalDesktopInjectionGate() else{return}
-        postCGEvent(e,replayTapLocation(for:t))
-      case .cancelled: return
-      case .failed(let code): stop(reason:"HID mouse motion failed (\(code))");return
-      }
-    }
+    guard result == .posted else {if case .failed(let code,_) = result {stop(reason:"HID input failed (\(code))")};return}
     noteMousePost(t,startedAt:inputStartedAt)
     if multiDisplayDesktopCompatible {
       if let back=desktopReverse,let token=handoff.token,let revision=desktopHandoffRevision,handoff.phase == .targetActive {
