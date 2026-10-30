@@ -45,6 +45,7 @@ func runDiagnosticStoreTests() -> Int {
     let exportedGesture = try Data(contentsOf: published[0].appendingPathComponent("gesture.log"))
     check(exportedConnection == snap["connection"] && exportedGesture == unicode, "export matches queue-consistent snapshot")
     let manifest = try JSONSerialization.jsonObject(with: Data(contentsOf: published[0].appendingPathComponent("manifest.json"))) as! [String: Any]
+    check((manifest["acceptedLines"] as? Int) == 7 && (manifest["storedLines"] as? Int) == 7 && (manifest["ioDroppedLines"] as? Int) == 0 && (manifest["contentionDroppedLines"] as? Int) == 0 && (manifest["writerErrors"] as? Int) == 0, "manifest exports distinct health counters")
     check((manifest["connectionBytes"] as? Int) == exportedConnection.count && (manifest["gestureBytes"] as? Int) == exportedGesture.count, "manifest byte counts")
     try store.export(to: output)
     check(try fm.contentsOfDirectory(atPath: output.path).count == 2, "export never overwrites prior output")
@@ -61,7 +62,11 @@ func runDiagnosticStoreTests() -> Int {
     check(entered.wait(timeout: .now() + 5) == .success, "disk queue gate entered")
     for _ in 0..<20 { overloaded.recordConnection(String(repeating: "x", count: 10000)) }
     check(overloaded.droppedLineCount == 17, "bounded pending ingress drops newest including in-flight")
+    let queuedHealth = overloaded.health
+    check(queuedHealth.accepted == 4 && queuedHealth.outstanding == 4 && queuedHealth.overflowDropped == 17, "pending conservation under gated writer")
     release.signal(); try overloaded.flush()
+    let overloadHealth = overloaded.health
+    check(overloadHealth.accepted == overloadHealth.stored + overloadHealth.ioDropped + overloadHealth.outstanding && overloadHealth.stored == 4 && overloadHealth.dropped == 17, "overflow conservation after drain")
     let bounded = try overloaded.snapshot()["connection"]!
     check(bounded.split(separator: 10).count == 4 && bounded.count <= 32, "bounded queued bytes and accepted count")
 
@@ -83,6 +88,8 @@ func runDiagnosticStoreTests() -> Int {
     check(returned, "nonblocking producer returns while ingress held")
     check(contended.droppedLineCount == 1, "contention drop accounted")
     contended.recordGesture("stored"); try contended.flush()
+    let contentionHealth = contended.health
+    check(contentionHealth.accepted == 1 && contentionHealth.stored == 1 && contentionHealth.contentionDropped == 1 && contentionHealth.ioDropped == 0 && contentionHealth.overflowDropped == 0, "contention distinct from accepted and stored")
 
     let outside = root.appendingPathComponent("outside")
     try fm.createDirectory(at: outside, withIntermediateDirectories: false)
@@ -108,6 +115,8 @@ func runDiagnosticStoreTests() -> Int {
     badFile.recordGesture("still disabled")
     do { try badFile.flush(); check(false, "repair does not resume unsafe writer") } catch { }
     check(!fm.fileExists(atPath: badRoot.appendingPathComponent("gesture.active.log").path), "fault disables later writes")
+    let failedHealth = badFile.health
+    check(failedHealth.accepted == 3 && failedHealth.stored == 0 && failedHealth.ioDropped == 3 && failedHealth.outstanding == 0 && failedHealth.writerErrors == 1, "sticky writer fault accounts all accepted records once")
 
     do { try store.export(to: link); check(false, "symlink export destination rejected") } catch { }
     let hardRoot = root.appendingPathComponent("hardLink")

@@ -149,7 +149,7 @@ final class GestureTrace {
        event.getIntegerValueField(Self.field(138)) == 0,event.getDoubleValueField(Self.field(138)) == 0,
        [UInt32(124), 129, 130].allSatisfy({ event.getDoubleValueField(Self.field($0)) == 0 }) {
       beforeNeutralAccounting?()
-      lock.lock()
+      guard acquireRecordingLock() else { return }
       expireLocked(clock())
       if active && generation == token { neutralSkipped &+= 1 }
       lock.unlock()

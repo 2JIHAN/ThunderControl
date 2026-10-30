@@ -15,6 +15,14 @@ final class DiagnosticStore: @unchecked Sendable {
   private var pending: [(String, Data)] = []
   private var outstanding = 0, scheduled = false
   private var dropped: UInt64 = 0
+  // OSAtomic remains available on the macOS 13 deployment target. This counter
+  // cannot use ingress because its only writer has just failed to acquire it.
+  private var contentionDropped: Int64 = 0
+  private var accepted: UInt64 = 0, stored: UInt64 = 0, ioDropped: UInt64 = 0, writerErrors: UInt64 = 0
+  struct Health {
+    let accepted, stored, outstanding, overflowDropped, contentionDropped, ioDropped, writerErrors: UInt64
+    var dropped: UInt64 { overflowDropped &+ contentionDropped &+ ioDropped }
+  }
   private var failure: Error?
   private var directoryFD: Int32 = -1
   // Optional gate is strictly a deterministic test seam, invoked on the disk queue.
@@ -25,7 +33,7 @@ final class DiagnosticStore: @unchecked Sendable {
     self.root = root; self.segmentBytes = segmentBytes
     self.maxLineBytes = min(maxLineBytes, segmentBytes); self.pendingLimit = pendingLimit
     self.beforeDrain = beforeDrain
-    if segmentBytes < 2 || maxLineBytes < 2 || pendingLimit < 1 { failure = StoreError.invalidLimits }
+    if segmentBytes < 2 || maxLineBytes < 2 || pendingLimit < 1 { failure = StoreError.invalidLimits; writerErrors = 1 }
   }
   deinit { if directoryFD >= 0 { Darwin.close(directoryFD) } }
   func recordConnection(_ text: String) { enqueue("connection", text) }
@@ -36,21 +44,19 @@ final class DiagnosticStore: @unchecked Sendable {
     while String(bytes: bytes, encoding: .utf8) == nil && !bytes.isEmpty { bytes.removeLast() }
     for i in bytes.indices where bytes[i] < 32 || bytes[i] == 127 { bytes[i] = 32 }
     bytes.append(10)
-    if nonblockingIngress {guard ingress.try() else{return}} else {ingress.lock()} // Production never waits on event tap.
+    if nonblockingIngress {
+      guard ingress.try() else { OSAtomicIncrement64Barrier(&contentionDropped); return }
+    } else { ingress.lock() }
     defer { ingress.unlock() }
     guard outstanding < pendingLimit else { dropped &+= 1; return }
-    pending.append((channel, Data(bytes))); outstanding += 1
+    pending.append((channel, Data(bytes))); outstanding += 1; accepted &+= 1
     if !scheduled { scheduled = true; queue.async { self.drain() } }
   }
   private func drain() {
     beforeDrain?()
     ingress.lock(); let batch = pending; pending.removeAll(keepingCapacity: true); ingress.unlock()
-    for (channel, data) in batch {
-      if failure == nil {
-        do { try prepare(); try append(channel, data) } catch { failure = error }
-      }
-    }
-    ingress.lock(); outstanding -= batch.count
+    writeBatch(batch)
+    ingress.lock()
     if pending.isEmpty { scheduled = false } else { queue.async { self.drain() } }
     ingress.unlock()
   }
@@ -60,15 +66,38 @@ final class DiagnosticStore: @unchecked Sendable {
   }
   private func drainPending() throws {
     ingress.lock(); let batch = pending; pending.removeAll(keepingCapacity: true); ingress.unlock()
-    defer { ingress.lock(); outstanding -= batch.count; ingress.unlock() }
+    writeBatch(batch)
     if let error = failure { throw error }
-    do {
-      try prepare()
-      for (channel, data) in batch { try append(channel, data) }
-    } catch { failure = error; throw error }
   }
-  func withIngressLockForTesting(_ body: () -> Void) { ingress.lock(); defer { ingress.unlock() }; body() }
-  var droppedLineCount: UInt64 { ingress.lock(); defer { ingress.unlock() }; return dropped }
+  private func latchFailure(_ error: Error) {
+    if failure == nil {
+      failure = error
+      ingress.lock(); writerErrors &+= 1; ingress.unlock()
+    }
+  }
+  private func writeBatch(_ batch: [(String, Data)]) {
+    var written: UInt64 = 0
+    for (channel, data) in batch {
+      if failure == nil {
+        do { try prepare(); try append(channel, data); written &+= 1 }
+        catch { latchFailure(error) }
+      }
+    }
+    ingress.lock()
+    stored &+= written; ioDropped &+= UInt64(batch.count) - written; outstanding -= batch.count
+    ingress.unlock()
+  }
+  // The body must not re-enter the store. Only deterministic contention tests use it.
+  func withIngressLockForTesting(_ body: () -> Void) {
+    ingress.lock(); defer { ingress.unlock() }; body()
+  }
+  var health: Health {
+    ingress.lock(); defer { ingress.unlock() }
+    return Health(accepted: accepted, stored: stored, outstanding: UInt64(outstanding),
+      overflowDropped: dropped, contentionDropped: UInt64(bitPattern: OSAtomicAdd64Barrier(0, &contentionDropped)),
+      ioDropped: ioDropped, writerErrors: writerErrors)
+  }
+  var droppedLineCount: UInt64 { health.dropped }
   // Complete snapshot (previous then active) also serves deterministic small-cap tests.
   func snapshot() throws -> [String: Data] {
     try queue.sync { try drainPending(); return try snapshotLocked() }
@@ -102,9 +131,13 @@ final class DiagnosticStore: @unchecked Sendable {
         for name in ["connection", "gesture"] {
           try Self.writeNew(fd, name + ".log", snapshot[name]!)
         }
+        let health = self.health
         let manifest: [String: Any] = ["formatVersion": 1, "createdAt": ISO8601DateFormatter().string(from: Date()),
           "segmentBytes": segmentBytes, "channelCapBytes": segmentBytes * 2,
-          "maxLineBytesIncludingNewline": maxLineBytes, "droppedIngressLines": droppedLineCount,
+          "maxLineBytesIncludingNewline": maxLineBytes, "droppedIngressLines": health.dropped,
+          "acceptedLines": health.accepted, "storedLines": health.stored, "outstandingLines": health.outstanding,
+          "overflowDroppedLines": health.overflowDropped, "contentionDroppedLines": health.contentionDropped,
+          "ioDroppedLines": health.ioDropped, "writerErrors": health.writerErrors,
           "connectionBytes": snapshot["connection"]!.count, "gestureBytes": snapshot["gesture"]!.count,
           "order": "oldest-to-newest; previous then active"]
         try Self.writeNew(fd, "manifest.json", JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys, .prettyPrinted]))
@@ -120,14 +153,16 @@ final class DiagnosticStore: @unchecked Sendable {
   }
   private func prepare() throws {
     if let error = failure { throw error }
-    if directoryFD < 0 { directoryFD = try Self.openDirectory(root, create: true) }
-    guard fchmod(directoryFD, 0o700) == 0 else { throw StoreError.io(errno) }
-    for channel in ["connection", "gesture"] {
-      for suffix in [".active.log", ".previous.log"] {
-        let fd = try openLog(channel + suffix, create: false)
-        if fd >= 0 { Darwin.close(fd) }
+    do {
+      if directoryFD < 0 { directoryFD = try Self.openDirectory(root, create: true) }
+      guard fchmod(directoryFD, 0o700) == 0 else { throw StoreError.io(errno) }
+      for channel in ["connection", "gesture"] {
+        for suffix in [".active.log", ".previous.log"] {
+          let fd = try openLog(channel + suffix, create: false)
+          if fd >= 0 { Darwin.close(fd) }
+        }
       }
-    }
+    } catch { latchFailure(error); throw error }
   }
   // Walk every component using directory descriptors, never following symlinks,
   // including symlinked ancestors. Existing ancestor permissions are not changed.
