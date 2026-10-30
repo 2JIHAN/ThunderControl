@@ -67,6 +67,7 @@ final class DiagnosticStore: @unchecked Sendable {
       for (channel, data) in batch { try append(channel, data) }
     } catch { failure = error; throw error }
   }
+  func withIngressLockForTesting(_ body: () -> Void) { ingress.lock(); defer { ingress.unlock() }; body() }
   var droppedLineCount: UInt64 { ingress.lock(); defer { ingress.unlock() }; return dropped }
   // Complete snapshot (previous then active) also serves deterministic small-cap tests.
   func snapshot() throws -> [String: Data] {

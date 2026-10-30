@@ -65,6 +65,25 @@ func runDiagnosticStoreTests() -> Int {
     let bounded = try overloaded.snapshot()["connection"]!
     check(bounded.split(separator: 10).count == 4 && bounded.count <= 32, "bounded queued bytes and accepted count")
 
+    let ingressHeld = DispatchSemaphore(value: 0), releaseIngress = DispatchSemaphore(value: 0)
+    let ingressDone = DispatchSemaphore(value: 0), rejectedDone = DispatchSemaphore(value: 0)
+    let contended = DiagnosticStore(root: root.appendingPathComponent("contention"), nonblockingIngress: true)
+    DispatchQueue.global().async {
+      contended.withIngressLockForTesting {
+        ingressHeld.signal(); releaseIngress.wait()
+      }
+      ingressDone.signal()
+    }
+    check(ingressHeld.wait(timeout: .now() + 5) == .success, "ingress lock held deterministically")
+    DispatchQueue.global().async { contended.recordGesture("rejected"); rejectedDone.signal() }
+    let returned = rejectedDone.wait(timeout: .now() + 1) == .success
+    releaseIngress.signal()
+    check(ingressDone.wait(timeout: .now() + 5) == .success, "ingress holder joins")
+    if !returned { _ = rejectedDone.wait(timeout: .now() + 5) }
+    check(returned, "nonblocking producer returns while ingress held")
+    check(contended.droppedLineCount == 1, "contention drop accounted")
+    contended.recordGesture("stored"); try contended.flush()
+
     let outside = root.appendingPathComponent("outside")
     try fm.createDirectory(at: outside, withIntermediateDirectories: false)
     let marker = outside.appendingPathComponent("marker")
@@ -82,6 +101,14 @@ func runDiagnosticStoreTests() -> Int {
     badFile.recordConnection("no")
     do { try badFile.flush(); check(false, "symlink active rejected") } catch { }
     check(try String(contentsOf: marker, encoding: .utf8) == "untouched", "target not modified")
+    badFile.recordConnection("later")
+    do { try badFile.flush(); check(false, "fault remains latched") } catch { }
+    check(badFile.droppedLineCount == 2, "initial and later writer-fault drops accounted")
+    try fm.removeItem(at: badRoot.appendingPathComponent("connection.active.log"))
+    badFile.recordGesture("still disabled")
+    do { try badFile.flush(); check(false, "repair does not resume unsafe writer") } catch { }
+    check(!fm.fileExists(atPath: badRoot.appendingPathComponent("gesture.active.log").path), "fault disables later writes")
+
     do { try store.export(to: link); check(false, "symlink export destination rejected") } catch { }
     let hardRoot = root.appendingPathComponent("hardLink")
     try fm.createDirectory(at: hardRoot, withIntermediateDirectories: false)

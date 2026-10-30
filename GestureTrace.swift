@@ -14,6 +14,7 @@ enum GestureTraceNote: String {
 final class GestureTrace {
   private let lock = NSLock()
   private let clock: () -> Double
+  private let beforeNeutralAccounting: (() -> Void)?
   private let origin: Double
   private let lifetime: Double
   private let continuous: Bool
@@ -32,6 +33,7 @@ final class GestureTrace {
 
   init(persistSystemLog:Bool=false,recordingInitially:Bool=true,continuous:Bool=false,sink:((String)->Void)?=nil) {
     self.continuous = continuous; self.sink = sink
+    beforeNeutralAccounting = nil
     active=recordingInitially
     self.persistSystemLog=persistSystemLog
     let now = ProcessInfo.processInfo.systemUptime
@@ -39,8 +41,9 @@ final class GestureTrace {
     origin = now; deadline = now + 600; lifetime = 600
   }
   // Deterministic clock seam. Legacy default expiry remains ten minutes.
-  init(testClock: @escaping () -> Double, continuous: Bool = false, sink: ((String) -> Void)? = nil) {
+  init(testClock: @escaping () -> Double, continuous: Bool = false, sink: ((String) -> Void)? = nil, beforeNeutralAccounting: (() -> Void)? = nil) {
     self.continuous = continuous; self.sink = sink
+    self.beforeNeutralAccounting = beforeNeutralAccounting
     persistSystemLog=false
     let now = testClock()
     clock = testClock; origin = now; deadline = now + 600; lifetime = 600
@@ -145,6 +148,7 @@ final class GestureTrace {
        event.getIntegerValueField(Self.field(123)) == 0,
        event.getIntegerValueField(Self.field(138)) == 0,event.getDoubleValueField(Self.field(138)) == 0,
        [UInt32(124), 129, 130].allSatisfy({ event.getDoubleValueField(Self.field($0)) == 0 }) {
+      beforeNeutralAccounting?()
       lock.lock()
       expireLocked(clock())
       if active && generation == token { neutralSkipped &+= 1 }

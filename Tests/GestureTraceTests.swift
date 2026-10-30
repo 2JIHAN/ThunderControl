@@ -74,6 +74,34 @@ func runGestureTraceTests() -> Int {
   check(trace.snapshot().contains("lines=800 dropped=0"), "parallel bounded append and snapshot")
   trace.clear()
   check(trace.snapshot().contains("lines=0 dropped=0 expired=0"), "clear")
+  for continuous in [true, false] {
+    let ticketReady = DispatchSemaphore(value: 0), snapshotHeld = DispatchSemaphore(value: 0)
+    let releaseSnapshot = DispatchSemaphore(value: 0), producerDone = DispatchSemaphore(value: 0)
+    let snapshotDone = DispatchSemaphore(value: 0)
+    let stateLock = NSLock(); var holdSnapshot = false
+    let contended = GestureTrace(testClock: {
+      stateLock.lock(); let hold = holdSnapshot; holdSnapshot = false; stateLock.unlock()
+      if hold { snapshotHeld.signal(); releaseSnapshot.wait() }
+      return 100
+    }, continuous: continuous, beforeNeutralAccounting: {
+      ticketReady.signal(); snapshotHeld.wait()
+    })
+    let event = CGEvent(source: nil)!
+    event.type = CGEventType(rawValue: 29)!
+    event.setIntegerValueField(CGEventField(rawValue: 55)!, value: 29)
+    DispatchQueue.global().async {
+      contended.recordNative(stage: .txCapture, event: event); producerDone.signal()
+    }
+    check(ticketReady.wait(timeout: .now() + 5) == .success, "neutral ticket acquired")
+    stateLock.lock(); holdSnapshot = true; stateLock.unlock()
+    DispatchQueue.global().async { _ = contended.snapshot(); snapshotDone.signal() }
+    let returnedWhileHeld = producerDone.wait(timeout: .now() + 0.25) == .success
+    check(returnedWhileHeld == continuous, "neutral recording follows continuous try-lock or explicit blocking policy")
+    releaseSnapshot.signal()
+    if !returnedWhileHeld { check(producerDone.wait(timeout: .now() + 5) == .success, "producer joins after snapshot release") }
+    check(snapshotDone.wait(timeout: .now() + 5) == .success, "snapshot joins")
+    check(contended.snapshot().contains("neutralSkipped=\(continuous ? 0 : 1)"), "only counted neutral records increment counter")
+  }
   print("GestureTrace tests failures=\(failures)")
   return failures
 }
