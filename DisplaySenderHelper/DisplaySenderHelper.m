@@ -12,6 +12,7 @@
 #import <unistd.h>
 #import <sys/stat.h>
 #import <sys/file.h>
+#import <sys/uio.h>
 #import <sys/wait.h>
 #import <errno.h>
 #import <assert.h>
@@ -566,20 +567,29 @@ static int outputFD=STDOUT_FILENO; // changed only by isolated offline selftest
 static atomic_uint cursorBusyDropped=0,cursorPipeDropped=0,capturesReplacedBeforeEncode=0;
 typedef struct {double guardMs,lockMs,pipeMs;} OutputTiming;
 static _Thread_local OutputTiming outputTiming;
+static int OutputVectors(const uint32_t *prefix,NSData *payload,size_t sent,struct iovec vectors[2]){
+  if(sent<4){
+    vectors[0]=(struct iovec){(uint8_t*)prefix+sent,4-sent};
+    vectors[1]=(struct iovec){(void*)payload.bytes,payload.length};
+    return 2;
+  }
+  vectors[0]=(struct iovec){(uint8_t*)payload.bytes+(sent-4),payload.length-(sent-4)};
+  return 1;
+}
 static void OutputWithGuard(NSData *payload,void (^guard)(void),int fd){
   if(!payload.length || payload.length>MaxPayload)Fail("frame bounds");
   double guardStarted=Now();
   guard(); // fresh safety check BEFORE acquiring the byte writer
   outputTiming.guardMs=(Now()-guardStarted)*1000;
   uint32_t be=CFSwapInt32HostToBig((uint32_t)payload.length);
-  NSMutableData *framed=[NSMutableData dataWithBytes:&be length:4];[framed appendData:payload];
   double lockStarted=Now();pthread_mutex_lock(&writeMutex);
   double pipeStarted=Now();outputTiming.lockMs=(pipeStarted-lockStarted)*1000;
-  const uint8_t *p=framed.bytes;size_t left=framed.length;double deadline=Now()+2;
-  while(left){
+  size_t sent=0,total=4+payload.length;double deadline=Now()+2;
+  while(sent<total){
     FastGuard();if(Now()>deadline)Fail("output stalled");
-    ssize_t n=write(fd,p,left);
-    if(n>0){p+=n;left-=(size_t)n;continue;}
+    struct iovec vectors[2];int count=OutputVectors(&be,payload,sent,vectors);
+    ssize_t n=writev(fd,vectors,count);
+    if(n>0){sent+=(size_t)n;continue;}
     if(n<0&&errno==EINTR)continue;
     if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK)){struct pollfd pollFD={fd,POLLOUT,0};if(poll(&pollFD,1,50)<0&&errno!=EINTR)Fail("output poll");continue;}
     Fail("output closed");
@@ -1286,6 +1296,62 @@ static BOOL TestReadExact(int fd,void *bytes,size_t length){
 static NSData *TestReadPacket(int fd){uint32_t be=0;if(!TestReadExact(fd,&be,4))return nil;uint32_t n=CFSwapInt32BigToHost(be);if(!n||n>64)return nil;NSMutableData *data=[NSMutableData dataWithLength:n];return TestReadExact(fd,data.mutableBytes,n)?data:nil;}
 static BOOL TestPipe(int fd[2]){if(pipe(fd))return NO;for(int n=0;n<2;n++)if(fcntl(fd[n],F_SETFL,fcntl(fd[n],F_GETFL)|O_NONBLOCK)<0){close(fd[0]);close(fd[1]);return NO;}return YES;}
 static NSData *TestCursorPacket(void){uint8_t bytes[19]={7};bytes[9]=1;bytes[10]=2;return [NSData dataWithBytes:bytes length:19];}
+static BOOL TestOutputVectorProgress(void){
+  const uint8_t bytes[]={9,8,7,6,5},wire[]={0,0,0,5,9,8,7,6,5};
+  NSData *payload=[NSData dataWithBytes:bytes length:sizeof(bytes)];uint32_t prefix=CFSwapInt32HostToBig(5);
+  for(size_t sent=0;sent<=sizeof(wire);sent++){
+    struct iovec vectors[2];int count=OutputVectors(&prefix,payload,sent,vectors);
+    size_t offset=sent;
+    if(count!=(sent<4?2:1))return NO;
+    for(int i=0;i<count;i++){
+      if(vectors[i].iov_len>sizeof(wire)-offset||memcmp(vectors[i].iov_base,wire+offset,vectors[i].iov_len))return NO;
+      offset+=vectors[i].iov_len;
+    }
+    if(offset!=sizeof(wire))return NO;
+  }
+  return YES;
+}
+static BOOL TestOutputWireConservation(void){
+  int fd[2];if(!TestPipe(fd))return NO;
+  NSMutableData *source=[NSMutableData dataWithLength:MaxPayload];
+  uint8_t *bytes=source.mutableBytes;for(size_t i=0;i<source.length;i++)bytes[i]=(uint8_t)(i*37+11);
+  NSData *payload=[source copy];
+  uint8_t filler[512]={0};size_t filled=0;ssize_t count;
+  do{count=write(fd[1],filler,sizeof(filler));if(count>0)filled+=(size_t)count;}while(count>0||(count<0&&errno==EINTR));
+  BOOL ok=filled>0&&filled<MaxPayload&&count<0&&(errno==EAGAIN||errno==EWOULDBLOCK);
+  dispatch_group_t done=dispatch_group_create();dispatch_semaphore_t guarded=dispatch_semaphore_create(0);
+  int writer=fd[1];
+  dispatch_group_async(done,dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{@autoreleasepool{
+    OutputWithGuard(payload,^{dispatch_semaphore_signal(guarded);},writer);
+  }});
+  ok=(dispatch_semaphore_wait(guarded,dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC))==0)&&ok;
+  BOOL locked=NO;double deadline=Now()+1;
+  while(Now()<deadline){int result=pthread_mutex_trylock(&writeMutex);if(result==EBUSY){locked=YES;break;}if(!result)pthread_mutex_unlock(&writeMutex);usleep(100);}
+  ok=ok&&locked&&dispatch_group_wait(done,DISPATCH_TIME_NOW)!=0;
+  unsigned busy=atomic_load(&cursorBusyDropped);
+  BOOL cursor=TryCursorOutput(TestCursorPacket(),atomic_load(&reconfigEpoch),^{},fd[1]);
+  ok=ok&&!cursor&&atomic_load(&cursorBusyDropped)==busy+1;
+  while(filled){size_t n=MIN(filled,sizeof(filler));if(!TestReadExact(fd[0],filler,n)){ok=NO;break;}filled-=n;}
+  uint8_t prefix[4]={0};ok=TestReadExact(fd[0],prefix,4)&&ok;
+  ok=ok&&prefix[0]==0&&prefix[1]==0x40&&prefix[2]==0&&prefix[3]==0;
+  NSMutableData *received=[NSMutableData dataWithLength:payload.length];
+  ok=TestReadExact(fd[0],received.mutableBytes,received.length)&&ok;
+  ok=(dispatch_group_wait(done,dispatch_time(DISPATCH_TIME_NOW,NSEC_PER_SEC))==0)&&ok;
+  ok=ok&&[received isEqual:payload]&&TryCursorOutput(TestCursorPacket(),atomic_load(&reconfigEpoch),^{},fd[1]);
+  NSData *tail=TestReadPacket(fd[0]);ok=ok&&[tail isEqual:TestCursorPacket()];
+  close(fd[0]);close(fd[1]);return ok;
+}
+static BOOL TestOutputFatalBoundaries(void){
+  NSData *empty=[NSData data],*one=[NSData dataWithBytes:"x" length:1];
+  for(unsigned scenario=0;scenario<3;scenario++){
+    int fd[2];if(!TestPipe(fd))return NO;close(fd[0]);
+    pid_t child=fork();
+    if(child==0){signal(SIGPIPE,SIG_IGN);OutputWithGuard(scenario==0?empty:one,^{},scenario==1?-1:fd[1]);_exit(99);}
+    close(fd[1]);int status=0;pid_t waited;do{waited=waitpid(child,&status,0);}while(waited<0&&errno==EINTR);
+    if(child<=0||waited!=child||!WIFEXITED(status)||WEXITSTATUS(status)!=1)return NO;
+  }
+  return YES;
+}
 static BOOL TestCursorGuardIsolation(void){
   int fd[2];if(!TestPipe(fd))return NO;
   dispatch_semaphore_t entered=dispatch_semaphore_create(0),release=dispatch_semaphore_create(0);
@@ -1506,6 +1572,9 @@ static int SelfTest(void){
   CHECK(StableDisplaySerial(0)==1 && StableDisplaySerial((uid_t)UINT32_MAX-1)==UINT32_MAX && StableDisplaySerial((uid_t)UINT32_MAX)==0,"display-identity-nonzero-and-invalid-user-fails-closed");
   CHECK(SameDisplayIdentity(505,0x6001,502,502) && !SameDisplayIdentity(506,0x6001,502,502) && !SameDisplayIdentity(505,0x6002,502,502) && !SameDisplayIdentity(505,0x6001,503,502) && !SameDisplayIdentity(505,0x6001,0,0),"display-identity-collision-exact-match");
   CHECK(TestDisplayIdentityLock(),"display-identity-lock-cross-process-release-symlink-hardlink-permissions");
+  CHECK(TestOutputVectorProgress(),"output-vector-progress-prefix-partial-full-and-payload-partial");
+  CHECK(TestOutputFatalBoundaries(),"output-empty-ebadf-epipe-remain-fatal");
+  CHECK(TestOutputWireConservation(),"output-exact-prefix-max-payload-partial-backpressure-cursor-competition");
   CHECK(TestCursorGuardIsolation(),"cursor-slow-guard-does-not-lock-video");
   CHECK(TestCursorBusyAndEpoch(),"cursor-busy-skips-and-stale-epoch-hides");
   CHECK(TestCursorHiddenPublicationOnce(),"cursor-hidden-published-once-after-busy-and-full-pipe-retries");
