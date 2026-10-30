@@ -1511,10 +1511,11 @@ final class Relay {
   }
   #endif
   var sessionAllowed: Bool { currentSessionBlockReason() == nil }
+  var sessionSnapshotReadForTests:(()->SessionSafetySnapshot)?
   func currentSessionBlockReason(forceRefresh: Bool = false) -> String? {
     let now = ProcessInfo.processInfo.systemUptime
     if forceRefresh || now - lastSessionPoll >= 0.02 {
-      sessionSnapshot = readSystemSessionSnapshot()
+      sessionSnapshot = sessionSnapshotReadForTests?() ?? readSystemSessionSnapshot()
 #if TC_RENDERER_HEALTH
       DevelopmentDiagnostics.shared.record(stage: "relay_session_query", fields: [
         "elapsedMs": (ProcessInfo.processInfo.systemUptime - now) * 1000,
@@ -2979,7 +2980,7 @@ final class Relay {
     let preferHID=cleanup || bounds.allSatisfy{$0.minX >= -32768 && $0.minY >= -32768 && $0.maxX <= 32768 && $0.maxY <= 32768}
     var flags=receiverModifierFlags(modifierCodes)
     flags.formUnion(event.flags.intersection([.maskAlphaShift,.maskNumericPad,.maskHelp]))
-    let result=hidInputPoster.post(event,keyboardFlags:flags,preferHID:preferHID,canPost:canPost)
+    let result=hidInputPoster.post(event,keyboardFlags:flags,preferHID:preferHID,afterOpen:{self.currentSessionBlockReason(forceRefresh:true)==nil},canPost:canPost)
     if result == .useCG {
       guard canPost() else{return .cancelled}
       postCGEvent(event,replayTapLocation(for:event.type.rawValue));return .posted
@@ -3081,7 +3082,44 @@ final class Relay {
     relay.finishReceiverActivation(token:token,generation:relay.generation,ready:true)
     return canceledFocus && relay.receiverCursorLocalOverride && relay.receiverActivationPendingToken==nil && relay.handoff.phase == .local && !relay.hasSession
   }
+  static func verifyReceiverNativeOpenSessionForTests()->Bool {
+    let safe=SessionSafetySnapshot(onConsole:true,loginDone:true,screenLocked:false)
+    let unsafe=SessionSafetySnapshot(onConsole:false,loginDone:true,screenLocked:false)
+    var state=safe,reads=0,opens=0,posts=0,closes=0,allowed=true,valid=true
+    var onOpen:()->Void={}
+    let api=RelayInputAPI(native:HIDInputAPI(permissionCheck:{allowed},open:{opens+=1;onOpen();return (0,42)},post:{_,_ in posts+=1;return 0},close:{_ in closes+=1}),postCG:{_,_ in preconditionFailure("F16 CG fallback")},warp:{_ in .success})
+    let r=Relay(inputAPI:api)
+    r.safetyObserversInstalled=true;r.desktopPhysicalInputsForTests={false}
+    r.sessionSnapshot=safe;r.lastSessionPoll=ProcessInfo.processInfo.systemUptime
+    r.sessionSnapshotReadForTests={reads+=1;return state}
+    guard let key=CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:true) else{return false}
+    onOpen={state=unsafe}
+    let blocked=r.postReceiverInput(key,modifierCodes:[],canPost:{valid})
+    guard blocked == .cancelled,posts==0,reads==1,opens==1,closes==0 else {
+      print("FAIL F16 unpublished session change during open: result=\(blocked), posts=\(posts), reads=\(reads)");r.hidInputPoster.close();return false
+    }
+    state=safe;r.sessionSnapshot=safe;r.lastSessionPoll=ProcessInfo.processInfo.systemUptime
+    let initialReads=reads
+    for _ in 0..<100 {
+      guard r.postReceiverInput(key,modifierCodes:[],canPost:{valid}) == .posted else{return false}
+    }
+    guard reads==initialReads,opens==1,posts==100 else{return false}
+    valid=false
+    guard r.postReceiverInput(key,modifierCodes:[],canPost:{valid}) == .cancelled,posts==100 else{return false}
+    valid=true;allowed=false
+    guard r.postReceiverInput(key,modifierCodes:[],canPost:{valid}) == .failed(Int32(kIOReturnNotPermitted),attempted:false),posts==100 else{return false}
+    allowed=true
+    guard r.hidInputPoster.restoreModifiers(preserving:[],canPost:{true}) == .posted,!r.hidInputPoster.hasGlobalStateToRestore else{return false}
+    r.hidInputPoster.close()
+    valid=true;onOpen={state=safe;valid=false}
+    guard r.postReceiverInput(key,modifierCodes:[],canPost:{valid}) == .cancelled,posts==101 else{return false}
+    r.hidInputPoster.close()
+    guard opens==2,closes==2 else{return false}
+    print("PASS F16 unpublished fake session change rejected; 100 retained-port inputs add zero session reads; fake API only")
+    return true
+  }
   static func verifyReceiverInputCleanupBlocksLifecycleForTests()->Bool {
+    guard verifyReceiverNativeOpenSessionForTests() else{return false}
     final class Cursor:CursorRecoveryAPI {
       func associate(_ associated:Bool)->CGError{.success}
       func hide(display:CGDirectDisplayID)->CGError{.success}
@@ -3098,6 +3136,7 @@ final class Relay {
       let api=RelayInputAPI(native:native,postCG:{_,_ in preconditionFailure("No CG fallback during cleanup")},warp:{_ in .success})
       let r=Relay(cursorResources:CursorRecoveryController(api:Cursor()),receiverCursor:CursorVisibilityController(api:Cursor()),inputAPI:api)
       r.safetyObserversInstalled=true;r.gestureTrace.setEnabled(false)
+      r.sessionSnapshotReadForTests={SessionSafetySnapshot(onConsole:true,loginDone:true,screenLocked:false)}
       r.desktopInputPermissionForTests={true};r.desktopPhysicalInputsForTests={false}
       guard let key=CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:true),
         let button=CGEvent(mouseEventSource:nil,mouseType:.leftMouseDown,mouseCursorPosition:.zero,mouseButton:.left),
@@ -3128,7 +3167,7 @@ final class Relay {
       r.stop()
       guard plans.count==completed,closes==1 else{return false}
     }
-    do {
+    for published in [false,true] {
       var afterOpen:()->Void={},opens=0,posts=0,closes=0
       let api=RelayInputAPI(native:HIDInputAPI(permissionCheck:{true},open:{opens+=1;afterOpen();return (0,42)},post:{_,_ in posts+=1;return 0},close:{_ in closes+=1}),postCG:{_,_ in preconditionFailure("No CG post after safety revocation")},warp:{_ in .success})
       let r=Relay(cursorResources:CursorRecoveryController(api:Cursor()),receiverCursor:CursorVisibilityController(api:Cursor()),inputAPI:api)
@@ -3142,13 +3181,20 @@ final class Relay {
       r.desktopInputPermissionForTests={true};r.desktopPhysicalInputsForTests={false}
       r.prepareDesktopSystemGestureForTests(map:map,point:point,token:token)
       guard let event=CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:point,mouseButton:.left),let data=event.data else{return false}
-      afterOpen={r.sessionBecameUnsafe("fake session revocation during native open")}
+      var observedSession=SessionSafetySnapshot(onConsole:true,loginDone:true,screenLocked:false)
+      var sessionReads=0,readsAtOpen=0
+      r.sessionSnapshotReadForTests={sessionReads+=1;return observedSession}
+      afterOpen={
+        readsAtOpen=sessionReads
+        if published {r.sessionBecameUnsafe("fake session revocation during native open")}
+        else {observedSession=SessionSafetySnapshot(onConsole:false,loginDone:true,screenLocked:false)}
+      }
       r.receive(Wire(kind:"event",session:r.session,sequence:1,raw:5,data:data as Data,token:token,desktopMapRevision:7,desktopGlobalX:point.x,desktopGlobalY:point.y))
       afterOpen={}
-      guard opens==1,posts==0,!r.hasSession,!r.inject else{return false}
+      guard opens==1,posts==0,sessionReads==readsAtOpen+1,!published || (!r.hasSession && !r.inject) else{return false}
       r.stop()
       guard closes==1,!r.hasUnresolvedLocalRecovery else{return false}
-      print("PASS actual Relay receive rejects a published session revocation during fake native open; no native post")
+      print("PASS actual Relay receive rejects fake native-open session change, published=\(published); no native post")
     }
     print("PASS actual Relay cleanup failure blocks normal-quit aggregate and start before setup; permitted retries retain ledger/port and restore once; record-only, no network")
     return true

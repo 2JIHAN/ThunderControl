@@ -549,28 +549,40 @@ private let displayDecodeCallback: VTDecompressionOutputCallback = { reference, 
             displayStageLog("Display decoder configuration setupMs=\((ProcessInfo.processInfo.systemUptime-configurationStarted)*1000); reconfigurationNotSteadyState=true")
         }
         guard let session, let description, let mailbox, let worker else { throw DisplayVideoError.decoderFailed }
-        var block: CMBlockBuffer?
-        let blockStatus = CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil,
-            blockLength: packet.avcc.count, blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
-            offsetToData: 0, dataLength: packet.avcc.count, flags: 0, blockBufferOut: &block)
-        guard blockStatus == noErr, let block else { logFailure(DisplayVideoError.decoderFailed, stage: "block", status: blockStatus); throw DisplayVideoError.decoderFailed }
-        let copied = packet.avcc.withUnsafeBytes {
-            CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block, offsetIntoDestination: 0, dataLength: packet.avcc.count)
-        }
-        guard copied == noErr else { logFailure(DisplayVideoError.decoderFailed, stage: "copy", status: copied); throw DisplayVideoError.decoderFailed }
-        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 30), presentationTimeStamp: CMTime(value: sequence, timescale: 30), decodeTimeStamp: .invalid)
-        var size = packet.avcc.count
-        var sample: CMSampleBuffer?
-        let sampleStatus = CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: description,
-            sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
-            sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &sample)
-        guard sampleStatus == noErr, let sample else { logFailure(DisplayVideoError.decoderFailed, stage: "sample", status: sampleStatus); throw DisplayVideoError.decoderFailed }
         guard sequence >= 0, sequence < Int64.max, mailbox.reserve(sequence: sequence, identity: DisplayFrameIdentity(sourceSequence: submission.sourceSequence, cookie: sequence, generation: traceGeneration), awaitingReturn: true) else { throw DisplayVideoError.backlog }
         let cookie = sequence
         let identity = DisplayFrameIdentity(sourceSequence: submission.sourceSequence, cookie: cookie, generation: traceGeneration)
         let epoch = admission.epoch
         let trace = self.trace
         guard worker.submit({ [weak self] queueWaitMs in
+            guard mailbox.maySubmit else { return false }
+            func preparationFailed(_ stage: String, _ status: OSStatus) -> Bool {
+                mailbox.submissionFailed()
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.admission.epoch == epoch, self.mailbox === mailbox else { return }
+                    self.logFailure(DisplayVideoError.decoderFailed, stage: stage, status: status)
+                    self.clear(); self.failure()
+                }
+                return false
+            }
+            // The job owns encoded Data and native samples until DecodeFrame returns.
+            var block: CMBlockBuffer?
+            let blockStatus = CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil,
+                blockLength: packet.avcc.count, blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
+                offsetToData: 0, dataLength: packet.avcc.count, flags: 0, blockBufferOut: &block)
+            guard blockStatus == noErr, let block else { return preparationFailed("block", blockStatus) }
+            let copied = packet.avcc.withUnsafeBytes {
+                CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block, offsetIntoDestination: 0, dataLength: packet.avcc.count)
+            }
+            guard copied == noErr else { return preparationFailed("copy", copied) }
+            var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 30), presentationTimeStamp: CMTime(value: cookie, timescale: 30), decodeTimeStamp: .invalid)
+            var size = packet.avcc.count
+            var sample: CMSampleBuffer?
+            let sampleStatus = CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: description,
+                sampleCount: 1, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+                sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &sample)
+            guard sampleStatus == noErr, let sample else { return preparationFailed("sample", sampleStatus) }
+
             guard mailbox.maySubmit else { return false }
             trace.record("decoder_call", identity: identity, fields: ["time": ProcessInfo.processInfo.systemUptime, "queueWaitMs": queueWaitMs])
             var infoFlags: VTDecodeInfoFlags = []

@@ -55,6 +55,26 @@ func runDisplayDecodeWorkerTests() -> Int {
         release.signal(); check(wait(cleaned), "retirement finished"); check(drained(w), "retirement permit release"); check(weakOwner == nil, "callback owner released after drain")
         check(state.snapshot == [0, 9], "queued calls retired before execution")
     }
+    do {
+        final class EncodedOwner { let bytes = Data(repeating: 0x5a, count: 4096) }
+        var owner: EncodedOwner? = EncodedOwner()
+        weak var held = owner
+        let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0), cleaned = DispatchSemaphore(value: 0)
+        guard let w = worker({ cleaned.signal() }) else { return 1 }
+        check(w.submit({ [encoded = owner!] _ in
+            entered.signal(); _ = release.wait(timeout: .now() + 3)
+            let intact = encoded.bytes.count == 4096 && encoded.bytes.allSatisfy { $0 == 0x5a }
+            finished.signal(); return intact
+        }), "encoded materialization accepted")
+        owner = nil
+        check(wait(entered), "encoded materialization blocked")
+        w.retire()
+        check(held != nil, "encoded owner survives reset while materialization blocked")
+        release.signal(); check(wait(finished), "encoded bytes remain intact through call")
+        check(wait(cleaned), "encoded materialization cleanup"); check(drained(w), "encoded permit released")
+        check(held == nil, "encoded owner released after worker drains")
+    }
     // Failure closes submission gate before the next queued call starts.
     do {
         let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)

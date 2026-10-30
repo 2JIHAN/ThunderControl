@@ -141,7 +141,7 @@ final class HIDInputPoster {
   init(api:HIDInputAPI = .system) { self.api=api }
   deinit { if connection != 0 { api.close(connection) } }
 
-  func post(_ event:CGEvent,keyboardFlags:CGEventFlags,preferHID:Bool,canPost:()->Bool) -> HIDInputResult {
+  func post(_ event:CGEvent,keyboardFlags:CGEventFlags,preferHID:Bool,afterOpen:()->Bool = {true},canPost:()->Bool) -> HIDInputResult {
     precondition(Thread.isMainThread)
     if backend == .cg { return .useCG }
     if !preferHID {
@@ -162,10 +162,10 @@ final class HIDInputPoster {
       backend = .hid
       capsSnapshot=api.readFlags().intersection(.maskAlphaShift)
     }
-    return postNative(plan,canPost:canPost)
+    return postNative(plan,afterOpen:afterOpen,canPost:canPost)
   }
 
-  private func postNative(_ plan:HIDInputPlan,canPost:()->Bool) -> HIDInputResult {
+  private func postNative(_ plan:HIDInputPlan,afterOpen:()->Bool = {true},canPost:()->Bool) -> HIDInputResult {
     guard api.permissionCheck() else { return .failed(Int32(kIOReturnNotPermitted),attempted:false) }
     if connection == 0 {
       let (result,port)=api.open()
@@ -174,6 +174,7 @@ final class HIDInputPoster {
         return .failed(result == 0 ? Int32(kIOReturnNotOpen):result,attempted:false)
       }
       connection=port
+      guard afterOpen() else { return .cancelled }
     }
     guard api.permissionCheck() else { return .failed(Int32(kIOReturnNotPermitted),attempted:false) }
     guard canPost() else { return .cancelled }

@@ -1598,10 +1598,107 @@ static BOOL TestSupervisorStderrLock(void){
   do{result=waitpid(child,&status,0);}while(result<0 && errno==EINTR);
   return NO;
 }
+// F05 experiment only. Production callback/admission remains unchanged.
+@interface F05CaptureProbe:NSObject {
+@public
+  pthread_mutex_t lock;
+  dispatch_queue_t worker;
+  dispatch_semaphore_t entered,release;
+  CVPixelBufferRef latest;
+  unsigned latestID,latestAt,now,callbacks,replacements,jobs,maxJobs,refs,maxRefs;
+  unsigned epoch,proofEpoch,generation,encodes,outputs,lastOutput,firstAge,queryBeforeCapture;
+  BOOL scheduled,selectAfter,sessionSafe,blockFirst,guardResult;
+}
+@end
+@implementation F05CaptureProbe
+-(instancetype)init {if((self=[super init])){pthread_mutex_init(&lock,NULL);worker=dispatch_queue_create("F05.admission",DISPATCH_QUEUE_SERIAL);entered=dispatch_semaphore_create(0);release=dispatch_semaphore_create(0);sessionSafe=YES;guardResult=YES;blockFirst=YES;}return self;}
+-(void)dealloc {if(latest)CVPixelBufferRelease(latest);pthread_mutex_destroy(&lock);}
+@end
+static void F05Drain(F05CaptureProbe *s){
+  for(;;){
+    CVPixelBufferRef selected=NULL;unsigned selectedID=0,selectedAt=0;
+    pthread_mutex_lock(&s->lock);
+    if(!s->latest){s->scheduled=NO;s->jobs--;pthread_mutex_unlock(&s->lock);return;}
+    unsigned sampledEpoch=s->epoch,sampledGeneration=s->generation,queryAt=s->now;
+    BOOL allowed=s->sessionSafe&&s->guardResult,block=s->blockFirst;s->blockFirst=NO;
+    if(!s->selectAfter){selected=s->latest;s->latest=NULL;selectedID=s->latestID;selectedAt=s->latestAt;}
+    pthread_mutex_unlock(&s->lock);
+    if(block){dispatch_semaphore_signal(s->entered);dispatch_semaphore_wait(s->release,dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC));}
+    pthread_mutex_lock(&s->lock);
+    if(s->selectAfter){selected=s->latest;s->latest=NULL;selectedID=s->latestID;selectedAt=s->latestAt;}
+    if(selected){
+      if(allowed&&s->proofEpoch==s->epoch&&sampledEpoch==s->epoch&&sampledGeneration==s->generation){
+        if(!ReserveEncoding())Fail("F05 probe reservation");
+        if(!s->encodes)s->firstAge=s->now-selectedAt;
+        s->queryBeforeCapture+=queryAt<selectedAt;s->encodes++;
+        // Separate output check, not the admission result.
+        if(s->sessionSafe&&sampledEpoch==s->epoch&&sampledGeneration==s->generation){s->outputs++;s->lastOutput=selectedID;}
+        if(atomic_fetch_sub(&inFlight,1)==0)Fail("F05 probe underflow");
+      }
+      CVPixelBufferRelease(selected);s->refs--;
+    }
+    pthread_mutex_unlock(&s->lock);
+  }
+}
+static void F05Offer(F05CaptureProbe *s,CVPixelBufferRef pixel,unsigned identifier,unsigned at){
+  pthread_mutex_lock(&s->lock);s->now=at;s->callbacks++;
+  if(s->latest){CVPixelBufferRelease(s->latest);s->refs--;s->replacements++;}
+  s->latest=CVPixelBufferRetain(pixel);s->refs++;s->maxRefs=MAX(s->maxRefs,s->refs);
+  s->latestID=identifier;s->latestAt=at;
+  if(!s->scheduled){s->scheduled=YES;s->jobs++;s->maxJobs=MAX(s->maxJobs,s->jobs);dispatch_async(s->worker,^{F05Drain(s);});}
+  pthread_mutex_unlock(&s->lock);
+}
+static BOOL TestF05CaptureProbe(BOOL selectAfter,unsigned invalidation){
+  F05CaptureProbe *s=[F05CaptureProbe new];s->selectAfter=selectAfter;
+  if(invalidation==1)s->guardResult=NO;
+  CVPixelBufferRef pixel=NULL;
+  if(CVPixelBufferCreate(NULL,1,1,kCVPixelFormatType_32BGRA,NULL,&pixel)!=kCVReturnSuccess)return NO;
+  dispatch_queue_t callbacks=dispatch_queue_create("F05.callback",DISPATCH_QUEUE_SERIAL);
+  dispatch_sync(callbacks,^{F05Offer(s,pixel,1,0);});
+  BOOL ok=dispatch_semaphore_wait(s->entered,dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC))==0;
+  for(unsigned i=2;i<=129;i++)dispatch_sync(callbacks,^{F05Offer(s,pixel,i,i-1);});
+  pthread_mutex_lock(&s->lock);
+  ok=ok&&s->callbacks==129&&s->latestID==129&&s->jobs==1&&s->maxJobs==1&&s->maxRefs<=(selectAfter?1u:2u)&&s->encodes==0;
+  if(invalidation==2)s->epoch++;
+  if(invalidation==3){s->generation++;if(s->latest){CVPixelBufferRelease(s->latest);s->latest=NULL;s->refs--;}}
+  if(invalidation==4)s->sessionSafe=NO;
+  unsigned replaced=s->replacements;
+  pthread_mutex_unlock(&s->lock);
+  dispatch_semaphore_signal(s->release);dispatch_sync(s->worker,^{});
+  if(!invalidation)ok=ok&&s->lastOutput==129&&s->outputs==(selectAfter?1u:2u)&&s->firstAge==(selectAfter?0u:128u)&&s->queryBeforeCapture==(selectAfter?1u:0u);
+  // Neither selected nor pending work may use the retired ownership proof.
+  if(invalidation==1||invalidation==3||invalidation==4)ok=ok&&s->outputs==0;
+  if(invalidation==1||invalidation==3)ok=ok&&s->encodes==0;
+  if(invalidation==2)ok=ok&&s->encodes==0&&s->outputs==0;
+  if(invalidation==4)ok=ok&&s->encodes==1; // The modeled snapshot cannot detect a later session change.
+  ok=ok&&!s->latest&&!s->refs&&!s->scheduled&&!s->jobs&&!atomic_load(&inFlight);
+  fprintf(stderr,"F05 probe shape=%s invalidation=%u callbacks=%u replaced=%u maxRefs=%u maxJobs=%u encodes=%u outputs=%u last=%u firstFakeAge=%u queryPredatesCapture=%u realCapture=no panelUnmeasured=yes\n",selectAfter?"after":"before",invalidation,s->callbacks,replaced,s->maxRefs,s->maxJobs,s->encodes,s->outputs,s->lastOutput,s->firstAge,s->queryBeforeCapture);
+  CVPixelBufferRelease(pixel);return ok;
+}
+static BOOL TestF05SerialCallbackBlock(void){
+  dispatch_queue_t q=dispatch_queue_create("F05.baseline",DISPATCH_QUEUE_SERIAL);
+  dispatch_semaphore_t entered=dispatch_semaphore_create(0),release=dispatch_semaphore_create(0);
+  __block atomic_uint callbacks;atomic_init(&callbacks,0);
+  dispatch_async(q,^{dispatch_semaphore_signal(entered);dispatch_semaphore_wait(release,dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC));});
+  BOOL ok=dispatch_semaphore_wait(entered,dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC))==0;
+  dispatch_async(q,^{atomic_fetch_add(&callbacks,1);});
+  ok=ok&&atomic_load(&callbacks)==0;
+  dispatch_semaphore_signal(release);dispatch_sync(q,^{});
+  return ok&&atomic_load(&callbacks)==1;
+}
+// End F05 experiment.
+
 static int SelfTest(void){
   int failures=0;
   #define CHECK(cond,name) do{if(!(cond)){fprintf(stderr,"FAIL %s\n",name);failures++;}else fprintf(stderr,"PASS %s\n",name);}while(0)
 
+  CHECK(TestF05SerialCallbackBlock(),"F05-same-serial-guard-blocks-callback");
+  CHECK(TestF05CaptureProbe(NO,0),"F05-before-guard-latest-replacement-bounded-final-damage-idle-flush");
+  CHECK(TestF05CaptureProbe(YES,0),"F05-after-guard-latest-age-query-predates-selection");
+  CHECK(TestF05CaptureProbe(NO,1),"F05-unsafe-guard-no-encode-output");
+  CHECK(TestF05CaptureProbe(NO,2),"F05-reconfiguration-rechecks-pending");
+  CHECK(TestF05CaptureProbe(NO,3),"F05-retired-generation-no-encode-output-release");
+  CHECK(TestF05CaptureProbe(NO,4),"F05-session-change-after-snapshot-output-recheck-blocks");
   CHECK(TestSupervisorStderrLock(),"supervisor-exits-with-stderr-file-lock-held");
   CHECK(StableDisplaySerial(501)==502 && StableDisplaySerial(501)==StableDisplaySerial(501),"display-identity-stable-across-starts");
   CHECK(StableDisplaySerial(501)!=StableDisplaySerial(502),"display-identity-separated-by-user");

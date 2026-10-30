@@ -139,6 +139,21 @@ func runHIDMouseMotionTests() -> Int {
   let revoked=HIDInputPoster(api:HIDInputAPI(permissionCheck:{permissionCalls+=1;return permissionCalls==1},open:{(0,77)},post:{_,_ in check(false,"revoked posted");return 0},close:{_ in}))
   check(revoked.post(key,keyboardFlags:[],preferHID:true,canPost:{true}) == .failed(Int32(kIOReturnNotPermitted),attempted:false),"fresh permission after open")
   revoked.close()
+  var failedOpenBoundaryCalls=0,failedOpenCloses=0
+  let failedOpen=HIDInputPoster(api:HIDInputAPI(permissionCheck:{true},open:{(-7,92)},post:{_,_ in check(false,"failed open posted");return 0},close:{_ in failedOpenCloses+=1}))
+  check(failedOpen.post(key,keyboardFlags:[],preferHID:true,afterOpen:{failedOpenBoundaryCalls+=1;return true},canPost:{true}) == .failed(-7,attempted:false),"failed open remains failure")
+  check(failedOpenBoundaryCalls==0 && failedOpenCloses==1,"failed open closes returned port without session query")
+  failedOpen.close()
+  var boundaryCalls=0,boundaryPosts=0,boundaryCloses=0,boundaryAllowed=true,finalAllowed=true
+  let boundary=HIDInputPoster(api:HIDInputAPI(permissionCheck:{boundaryAllowed},open:{(0,91)},post:{_,_ in boundaryPosts+=1;return 0},close:{_ in boundaryCloses+=1}))
+  check(boundary.post(key,keyboardFlags:[],preferHID:true,afterOpen:{boundaryCalls+=1;boundaryAllowed=false;return true},canPost:{true}) == .failed(Int32(kIOReturnNotPermitted),attempted:false),"permission callback after open boundary")
+  boundaryAllowed=true
+  check(boundary.post(key,keyboardFlags:[],preferHID:true,afterOpen:{boundaryCalls+=1;return false},canPost:{true}) == .posted,"retained port does not requery boundary")
+  check(boundaryCalls==1 && boundaryPosts==1,"one successful-open boundary only")
+  boundary.close()
+  check(boundary.post(key,keyboardFlags:[],preferHID:true,afterOpen:{boundaryCalls+=1;finalAllowed=false;return true},canPost:{finalAllowed}) == .cancelled,"final callback remains after session boundary")
+  check(boundaryPosts==1 && boundaryCalls==2 && boundaryCloses==1,"cancel retains reopened port")
+  boundary.close()
   var defaultPlans:[HIDInputPlan]=[]
   var deinitCloses=0
   do {
