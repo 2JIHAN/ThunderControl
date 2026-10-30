@@ -26,6 +26,23 @@ func runHIDMouseMotionTests() -> Int {
     check(data.mouse.eventNum==0 && data.mouse.pressure==0,"no raw delta union alias")
     check(p.options==2 && p.flags==UInt32(NX_NONCOALSESCEDMASK),"pointer flags and options")
   }
+  let coordinates:[(Double,Int16,UInt8)] = [
+    (Double(0).nextDown,-1,255),(-1e-17,-1,255),(-0.0,0,0),
+    (0,0,0),(0.25,0,64),(-0.25,-1,192),
+    (-32768, -32768, 0),(32767.75,32767,192)
+  ]
+  for type:UInt32 in [1,5] {
+    for (value,whole,fraction) in coordinates {
+      for (x,y) in [(value,0.0),(0.0,value)] {
+        guard case .plan(let p)=plan(event(type,x,y)) else {
+          check(false,"boundary stays HID type \(type) x \(x) y \(y)");continue
+        }
+        check(p.point.x == (x == value ? whole:0) && p.subx == (x == value ? fraction:0) &&
+              p.point.y == (y == value ? whole:0) && p.suby == (y == value ? fraction:0),
+              "boundary coordinates type \(type) x \(x) y \(y)")
+      }
+    }
+  }
   for type:UInt32 in [10,11,12] {
     let e=event(type);e.setIntegerValueField(.keyboardEventKeycode,value:56)
     e.setIntegerValueField(.keyboardEventAutorepeat,value:1)
