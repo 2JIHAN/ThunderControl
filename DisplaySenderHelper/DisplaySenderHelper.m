@@ -1074,7 +1074,12 @@ static void RunPooledIteration(void (NS_NOESCAPE ^body)(void)){
 static void *SuperviseOwnedValidation(void *context){
   (void)context;
   for(;;){
-    if(OwnedValidationFatal(OwnedValidationNowNS()))Fail("owned validation progress timeout");
+    if(OwnedValidationFatal(OwnedValidationNowNS())){
+      // Fail uses stdio, whose FILE lock may be held by a stalled thread.
+      static const char message[]="Display sender stopped: owned validation progress timeout\n";
+      if(diagEnabled)(void)write(STDERR_FILENO,message,sizeof(message)-1);
+      _exit(1);
+    }
     poll(NULL,0,50);
   }
   return NULL;
@@ -1563,10 +1568,42 @@ static BOOL TestDiagnosticRecords(void){
   DiagWriteResult(2,5,0);DiagWriteResult(-1,5,EINTR);
   return ok&&atomic_load(&diagPartial)==partial+1&&atomic_load(&diagFailed)==failed+1;
 }
+static void *HoldTestStderrLock(void *context){
+  int readyFD=*(int *)context;
+  flockfile(stderr);
+  char ready=1;if(write(readyFD,&ready,1)!=1)_exit(91);
+  for(;;)poll(NULL,0,-1);
+  return NULL;
+}
+static BOOL TestSupervisorStderrLock(void){
+  int ready[2];if(pipe(ready))return NO;
+  pid_t child=fork();
+  if(child==0){
+    pthread_t holder;
+    if(pthread_create(&holder,NULL,HoldTestStderrLock,&ready[1]))_exit(92);
+    char byte;if(read(ready[0],&byte,1)!=1)_exit(93);
+    atomic_store(&ownedValidationStartedNS,OwnedValidationNowNS()-BoundedOwnedValidationNS-1);
+    SuperviseOwnedValidation(NULL);
+    _exit(94);
+  }
+  close(ready[0]);close(ready[1]);if(child<0)return NO;
+  uint64_t deadline=OwnedValidationNowNS()+1000000000ULL;
+  int status=0;pid_t result;
+  do{
+    result=waitpid(child,&status,WNOHANG);
+    if(result==child)return WIFEXITED(status) && WEXITSTATUS(status)==1;
+    if(result<0 && errno!=EINTR)return NO;
+    poll(NULL,0,5);
+  }while(OwnedValidationNowNS()<deadline);
+  kill(child,SIGKILL);
+  do{result=waitpid(child,&status,0);}while(result<0 && errno==EINTR);
+  return NO;
+}
 static int SelfTest(void){
   int failures=0;
   #define CHECK(cond,name) do{if(!(cond)){fprintf(stderr,"FAIL %s\n",name);failures++;}else fprintf(stderr,"PASS %s\n",name);}while(0)
 
+  CHECK(TestSupervisorStderrLock(),"supervisor-exits-with-stderr-file-lock-held");
   CHECK(StableDisplaySerial(501)==502 && StableDisplaySerial(501)==StableDisplaySerial(501),"display-identity-stable-across-starts");
   CHECK(StableDisplaySerial(501)!=StableDisplaySerial(502),"display-identity-separated-by-user");
   CHECK(StableDisplaySerial(0)==1 && StableDisplaySerial((uid_t)UINT32_MAX-1)==UINT32_MAX && StableDisplaySerial((uid_t)UINT32_MAX)==0,"display-identity-nonzero-and-invalid-user-fails-closed");
