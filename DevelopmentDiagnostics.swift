@@ -23,6 +23,11 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
     private let clock: () -> Date
     private let monotonicClock: () -> TimeInterval
     private let beforeDrain: (() -> Void)?
+    private let beforeCloudRead: (() -> Void)?
+    private let mirrorQueue = DispatchQueue(label: "ThunderControl.DiagnosticsMirror", qos: .utility)
+    private let mirrorGroup = DispatchGroup()
+    private var mirrorInFlight = false
+    private var unverifiedEvictions: Int64 = 0, cloudEvictions: Int64 = 0, retentionFailures: Int64 = 0
     private let chunkBytes: Int, diskBytes: Int, maxAge: TimeInterval
     private let ingress = NSLock()
     private let queue = DispatchQueue(label: "ThunderControl.DevelopmentDiagnostics", qos: .utility)
@@ -49,12 +54,14 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
     init(root: URL? = nil, cloudRoot: URL? = nil, clock: @escaping () -> Date = Date.init,
          monotonicClock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
          chunkBytes: Int = 512 * 1024, diskBytes: Int = 64 * 1024 * 1024,
-         maxAge: TimeInterval = 15 * 60, beforeDrain: (() -> Void)? = nil) {
+         maxAge: TimeInterval = 15 * 60, beforeDrain: (() -> Void)? = nil,
+         beforeCloudRead: (() -> Void)? = nil) {
         self.root = root ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/ThunderControl/DevelopmentDiagnostics")
         self.cloudRoot = root == nil ? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs") : cloudRoot
         self.clock = clock; self.monotonicClock = monotonicClock; self.beforeDrain = beforeDrain
+        self.beforeCloudRead = beforeCloudRead
         self.chunkBytes = max(256, min(chunkBytes, 512 * 1024))
         self.diskBytes = max(0, min(diskBytes, 64 * 1024 * 1024)); self.maxAge = min(max(0, maxAge), 900)
     }
@@ -250,7 +257,7 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
         let result = immutable ? linkat(directory, temp, directory, name, 0) : renameat(directory, temp, directory, name)
         guard result == 0 else { throw Failure.io(errno) }
     }
-    private func chunkFiles(_ directory: Int32) throws -> [(String, Int64, Double)] {
+    private static func chunkFiles(_ directory: Int32) throws -> [(String, Int64, Double)] {
         let duplicate = dup(directory)
         guard duplicate >= 0, let listing = fdopendir(duplicate) else { if duplicate >= 0 { close(duplicate) }; throw Failure.io(errno) }
         defer { closedir(listing) }; rewinddir(listing)
@@ -265,18 +272,16 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
         entries.sort { $0.2 == $1.2 ? $0.0 < $1.0 : $0.2 < $1.2 }
         return entries
     }
-    private func retain(_ selectedDirectory: Int32? = nil) throws {
-        let directory = selectedDirectory ?? self.directory
-        let entries = try chunkFiles(directory)
+    private func retain() throws {
+        let directory = self.directory
+        let entries = try Self.chunkFiles(directory)
         var total = entries.reduce(Int64(0)) { $0 + $1.1 }
         for e in entries where clock().timeIntervalSince1970 - e.2 > maxAge || total > diskBytes {
             if unlinkat(directory, e.0, 0) == 0 {
                 total -= e.1; evictions += 1
-                if selectedDirectory == nil {
-                    if !mirrorKnown.contains(e.0) { mirrorEvictedCount += 1 }
-                    mirrorKnown.remove(e.0)
-                }
-            }
+                if !mirrorKnown.contains(e.0) { unverifiedEvictions += 1 }
+                mirrorKnown.remove(e.0)
+            } else { retentionFailures += 1 }
         }
     }
     // Exact numeric schema only. Unknown extension keys remain in ordinary
@@ -323,14 +328,17 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
         // Never advertise a prior context ring as belonging to a new stream,
         // including the short interval before its queued start is consumed.
         result["receiverPerformance"] = receiverPerformanceContext == latest && (currentContext == nil || currentContext == latest) ? receiverPerformance : []
+        result["mirrorJobsOutstanding"] = mirrorInFlight ? 1 : 0
+        result["mirrorUnverifiedEvictions"] = unverifiedEvictions
+        result["cloudRetentionEvictions"] = cloudEvictions
+        result["retentionFailures"] = retentionFailures
         if let lastCloudCopy = lastCloudCopy { result["cloudLastSuccessfulLocalCopy"] = lastCloudCopy }
         return result
     }
     private func publishStatus(forceMirror:Bool=false) {
         guard directory >= 0 else { return }
-        mirror(force:forceMirror)
-        do { try Self.atomicWrite(try JSONSerialization.data(withJSONObject: status(), options: [.sortedKeys]), directory: directory, name: "manifest.json") }
-        catch { localError = true }
+        writeLocalStatus()
+        mirror(force: forceMirror)
     }
     private static func readChunk(_ directory: Int32, _ name: String) throws -> Data {
         let fd = openat(directory, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
@@ -348,24 +356,68 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
         }
         return Data(bytes)
     }
-    private func mirror(force:Bool=false) {
-        // Local immutable retained chunks ARE the retry queue. No unbounded Data backlog.
+    private struct MirrorResult {
+        var copied: [String] = []
+        var misses: Int64 = 0, evictions: Int64 = 0, retentionFailures: Int64 = 0
+        var disabled = false, failed = false
+        var url: URL?
+    }
+    private func writeLocalStatus() {
+        guard directory >= 0 else { return }
+        do { try Self.atomicWrite(try JSONSerialization.data(withJSONObject: status(), options: [.sortedKeys]), directory: directory, name: "manifest.json") }
+        catch { localError = true }
+    }
+    private func mirror(force: Bool = false) {
+        // Local retained chunks are the retry queue. Only one bounded snapshot may leave this queue.
         let files: [(String, Int64, Double)]
-        do { files = try chunkFiles(directory) } catch { mirrorError = true; mirrorMissCount += 1; return }
+        do { files = try Self.chunkFiles(directory) } catch { mirrorError = true; mirrorMissCount += 1; return }
         mirrorKnown.formIntersection(Set(files.map { $0.0 }))
         mirrorPendingCount = files.filter { !mirrorKnown.contains($0.0) }.count
+        guard !mirrorInFlight else { return }
         let now = monotonicClock()
-        guard force || now - lastMirrorAttempt >= 5 else { return }; lastMirrorAttempt = now
+        guard force || now - lastMirrorAttempt >= 5 else { return }
+        lastMirrorAttempt = now
         guard let cloudRoot = cloudRoot, let deviceID = deviceID else {
             mirrorDisabled = true; if mirrorPendingCount > 0 { mirrorMissCount += 1 }; return
         }
-        let cloudFD: Int32
-        // Never create CloudDocs itself. A later successful probe retries retained chunks.
-        do { cloudFD = try Self.openDirectory(cloudRoot, create: false) }
-        catch {
-            mirrorDisabled = true; if mirrorPendingCount > 0 { mirrorMissCount += 1 }
-            ingress.lock(); cachedCloudDirectory = nil; ingress.unlock(); return
+        var snapshot: [(String, Data)] = [], bytes: Int64 = 4 * 1024 * 1024
+        for file in files where !mirrorKnown.contains(file.0) {
+            guard snapshot.count < 64, file.1 >= 0, file.1 <= bytes else { break }
+            do { let data = try Self.readChunk(directory, file.0); snapshot.append((file.0, data)); bytes -= Int64(data.count) }
+            catch { mirrorError = true; mirrorMissCount += 1 }
         }
+        guard let manifest = try? JSONSerialization.data(withJSONObject: status(), options: [.sortedKeys]) else { return }
+        let maxAge = self.maxAge, diskBytes = self.diskBytes, wall = clock().timeIntervalSince1970
+        let readBarrier = beforeCloudRead
+        mirrorInFlight = true; mirrorGroup.enter()
+        mirrorQueue.async {
+            let result = Self.copyMirror(snapshot, manifest: manifest, cloudRoot: cloudRoot, deviceID: deviceID,
+                                         wall: wall, maxAge: maxAge, diskBytes: diskBytes, beforeRead: readBarrier)
+            self.queue.async {
+                // Only this queue changes status. A completed old job never installs its captured context.
+                self.mirrorInFlight = false
+                self.mirrorDisabled = result.disabled; self.mirrorError = result.failed
+                self.mirrorMissCount += result.misses; self.cloudEvictions += result.evictions
+                self.retentionFailures += result.retentionFailures
+                self.mirrorKnown.formUnion(result.copied); self.mirroredCount += Int64(result.copied.count)
+                if !result.failed && !result.disabled { self.lastCloudCopy = self.clock().timeIntervalSince1970 }
+                self.ingress.lock(); self.cachedCloudDirectory = result.url; self.ingress.unlock()
+                if let retained = try? Self.chunkFiles(self.directory) {
+                    self.mirrorKnown.formIntersection(Set(retained.map { $0.0 }))
+                    self.mirrorPendingCount = retained.filter { !self.mirrorKnown.contains($0.0) }.count
+                }
+                self.writeLocalStatus()
+                self.mirrorGroup.leave()
+            }
+        }
+    }
+    private static func copyMirror(_ files: [(String, Data)], manifest: Data, cloudRoot: URL, deviceID: String,
+                                   wall: Double, maxAge: TimeInterval, diskBytes: Int,
+                                   beforeRead: (() -> Void)?) -> MirrorResult {
+        var result = MirrorResult()
+        let cloudFD: Int32
+        do { cloudFD = try openDirectory(cloudRoot, create: false) }
+        catch { result.disabled = true; result.misses = files.isEmpty ? 0 : 1; return result }
         defer { close(cloudFD) }
         do {
             var fd = dup(cloudFD); guard fd >= 0 else { throw Failure.io(errno) }; defer { close(fd) }
@@ -375,50 +427,50 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
                 guard next >= 0 else { throw Failure.unsafePath }; close(fd); fd = next
                 guard fchmod(fd, 0o700) == 0 else { throw Failure.io(errno) }
             }
-            mirrorDisabled = false
-            ingress.lock(); cachedCloudDirectory = cloudRoot.appendingPathComponent("ThunderControl-진단").appendingPathComponent(deviceID); ingress.unlock()
-            var byteBudget: Int64 = 4 * 1024 * 1024, fileBudget = 64
-            for file in files where !mirrorKnown.contains(file.0) {
-                guard fileBudget > 0, file.1 <= byteBudget else { break }
-                byteBudget -= file.1; fileBudget -= 1
+            result.url = cloudRoot.appendingPathComponent("ThunderControl-진단").appendingPathComponent(deviceID)
+            for (name, data) in files {
                 do {
-                    let data = try Self.readChunk(directory, file.0)
                     var st = stat()
-                    if fstatat(fd, file.0, &st, AT_SYMLINK_NOFOLLOW) == 0 {
-                        // Idempotent retry: an existing immutable chunk must be byte-identical.
-                        guard st.st_mode & S_IFMT == S_IFREG, st.st_size == file.1,
-                              try Self.readChunk(fd, file.0) == data else { throw Failure.unsafePath }
+                    if fstatat(fd, name, &st, AT_SYMLINK_NOFOLLOW) == 0 {
+                        guard st.st_mode & S_IFMT == S_IFREG, st.st_size == data.count else { throw Failure.unsafePath }
+                        beforeRead?()
+                        guard try readChunk(fd, name) == data else { throw Failure.unsafePath }
                     } else {
                         guard errno == ENOENT else { throw Failure.io(errno) }
-                        try Self.atomicWrite(data, directory: fd, name: file.0, immutable: true)
+                        try atomicWrite(data, directory: fd, name: name, immutable: true)
                     }
-                    mirrorKnown.insert(file.0); mirroredCount += 1
-                    lastCloudCopy = clock().timeIntervalSince1970
-                } catch { mirrorMissCount += 1; mirrorError = true }
+                    result.copied.append(name)
+                } catch { result.misses += 1; result.failed = true }
             }
-            mirrorPendingCount = files.filter { !mirrorKnown.contains($0.0) }.count
-            // Historical failures/gaps stay visible through cumulative miss/eviction counters.
-            mirrorError = mirrorPendingCount > 0
-            try retain(fd)
-            try Self.atomicWrite(try JSONSerialization.data(withJSONObject: status(), options: [.sortedKeys]), directory: fd, name: "manifest.json")
-            lastCloudCopy = clock().timeIntervalSince1970
-        } catch { mirrorError = true; mirrorMissCount += 1 }
+            let retained = try chunkFiles(fd)
+            var total = retained.reduce(Int64(0)) { $0 + $1.1 }
+            for file in retained where wall - file.2 > maxAge || total > diskBytes {
+                if unlinkat(fd, file.0, 0) == 0 { total -= file.1; result.evictions += 1 }
+                else { result.retentionFailures += 1 }
+            }
+            try atomicWrite(manifest, directory: fd, name: "manifest.json")
+        } catch { result.failed = true; result.misses += 1 }
+        return result
     }
     // Call off the UI/event-tap thread. No implicit singleton disk activity.
-    func flushForTests() throws {
+    func flushForTests(mirrorTimeout: TimeInterval = 2) throws {
         try queue.sync {
             drain()
             if latest != nil { do { try prepare(); try retain(); publishStatus() } catch { localError = true; throw error } }
             if localError { throw Failure.io(EIO) }
         }
+        let bounded = mirrorTimeout.isFinite ? max(0, min(mirrorTimeout, 30)) : 0
+        guard mirrorGroup.wait(timeout: .now() + bounded) == .success else { throw Failure.io(ETIMEDOUT) }
     }
     // Blocking only at applicationWillTerminate/tests. False means deadline/error,
     // not a claim that the background queue has finished.
     func shutdown(timeout: TimeInterval = 2) -> Bool {
         final class Result: @unchecked Sendable { var success = false }
         let result = Result(), done = DispatchSemaphore(value: 0)
+        let bounded = timeout.isFinite ? max(0, min(timeout, 30)) : 0
+        let deadline = DispatchTime.now() + bounded
+        ingress.lock(); active = nil
         queue.async {
-            self.ingress.lock(); self.active = nil; self.ingress.unlock()
             self.timer?.cancel(); self.timer = nil
             self.drain()
             do {
@@ -427,8 +479,9 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
             } catch { self.localError = true }
             done.signal()
         }
-        let bounded = timeout.isFinite ? max(0, min(timeout, 30)) : 0
-        guard done.wait(timeout: .now() + bounded) == .success else { return false }
+        ingress.unlock()
+        guard done.wait(timeout: deadline) == .success else { return false }
+        guard mirrorGroup.wait(timeout: deadline) == .success else { return false }
         return result.success
     }
     func snapshotForTests() -> [String: Any] { queue.sync { status() } }

@@ -295,6 +295,62 @@ import Darwin
         let cloudDevice = cloud.appendingPathComponent("ThunderControl-진단").appendingPathComponent(try own(mirroredRoot).lastPathComponent)
         check(try fm.contentsOfDirectory(atPath: cloudDevice.path).contains(where: { $0.hasPrefix("chunk-") }), "new chunk mirrored")
         check(mirrored.snapshotForTests()["cloudLastSuccessfulLocalCopy"] != nil, "local cloud copy timestamp, not delivery claim")
+        // Reopened immutable fake-cloud files exercise the actual byte-verification read.
+        let gatedRoot = temp.appendingPathComponent("cloud-gated-local")
+        let seed = DevelopmentDiagnostics(root: gatedRoot)
+        seed.start(role: "source", stream: stream)
+        try accepted(seed, "cloud barrier seed") { seed.record(stage: "seed") }
+        try seed.flushForTests(); check(seed.shutdown(), "cloud barrier seed shutdown")
+        let gatedDevice = cloud.appendingPathComponent("ThunderControl-진단").appendingPathComponent(try own(gatedRoot).lastPathComponent)
+        try fm.createDirectory(at: gatedDevice, withIntermediateDirectories: true)
+        let original = try chunks(gatedRoot)[0]
+        try fm.copyItem(at: original, to: gatedDevice.appendingPathComponent(original.lastPathComponent))
+        let cloudEntered = DispatchSemaphore(value: 0), cloudRelease = DispatchSemaphore(value: 0)
+        let blocked = DevelopmentDiagnostics(root: gatedRoot, cloudRoot: cloud, beforeCloudRead: {
+            cloudEntered.signal(); _ = cloudRelease.wait(timeout: .now() + 10)
+        })
+        blocked.start(role: "source", stream: stream)
+        check(cloudEntered.wait(timeout: .now() + 2) == .success, "injected cloud read entered")
+        defer { cloudRelease.signal() }
+        for _ in 0..<4 {
+            try accepted(blocked, "local record while cloud blocked") { blocked.record(stage: "while_cloud_blocked") }
+            do { try blocked.flushForTests(mirrorTimeout: 0.01); check(false, "blocked cloud flush reports deadline") }
+            catch { }
+            check(blocked.snapshotForTests()["mirrorJobsOutstanding"] as? Int == 1, "one outstanding cloud job cap")
+        }
+        let blockedManifest = try JSONSerialization.jsonObject(with: Data(contentsOf: try own(gatedRoot).appendingPathComponent("manifest.json"))) as! [String: Any]
+        check(blockedManifest["written"] as? Int == 4 && blockedManifest["accepted"] as? Int == 4,
+              "local accepted written manifest advance while cloud read blocked")
+        check(try rows(gatedRoot).count == 5, "local chunk drain continues while cloud read blocked")
+        let shutdownBegan = ProcessInfo.processInfo.systemUptime
+        check(!blocked.shutdown(timeout: 0.03), "blocked cloud shutdown reports incomplete")
+        check(ProcessInfo.processInfo.systemUptime - shutdownBegan < 1, "shutdown deadline returns while cloud read blocked")
+        blocked.start(role: "viewer", stream: second)
+        cloudRelease.signal()
+        try blocked.flushForTests()
+        check(blocked.snapshotForTests()["stream"] as? String == second, "old mirror completion cannot roll back context")
+        check(blocked.shutdown(timeout: 2), "released read permits bounded retry")
+        let mirroredRows = try fm.contentsOfDirectory(at: gatedDevice, includingPropertiesForKeys: nil).filter { $0.pathExtension == "jsonl" }
+            .flatMap { try Data(contentsOf: $0).split(separator: 10) }
+        check(mirroredRows.count == 5, "retry copies backlog without duplicate rows")
+        let copied = blocked.snapshotForTests()["mirroredCount"] as? Int64
+        check(blocked.shutdown(timeout: 2), "repeated shutdown remains bounded")
+        check(blocked.snapshotForTests()["mirroredCount"] as? Int64 == copied, "immutable verified chunks not counted twice")
+        let originalCloud = gatedDevice.appendingPathComponent(original.lastPathComponent)
+        let originalBytes = try Data(contentsOf: originalCloud)
+        var corruptBytes = originalBytes; corruptBytes[0] ^= 1
+        try corruptBytes.write(to: originalCloud)
+        let corruptRetry = DevelopmentDiagnostics(root: gatedRoot, cloudRoot: cloud)
+        corruptRetry.start(role: "source", stream: stream); try corruptRetry.flushForTests()
+        check(corruptRetry.snapshotForTests()["mirrorError"] as? Bool == true, "same-size cloud corruption is rejected")
+        check(try Data(contentsOf: originalCloud) == corruptBytes, "immutable cloud corruption is not overwritten")
+        check(corruptRetry.shutdown(), "cloud mismatch does not fail local shutdown")
+        try originalBytes.write(to: originalCloud)
+        let unverifiedRecorder = DevelopmentDiagnostics(root: gatedRoot, cloudRoot: cloud, diskBytes: 0)
+        unverifiedRecorder.start(role: "source", stream: stream); try unverifiedRecorder.flushForTests()
+        check(unverifiedRecorder.snapshotForTests()["mirrorEvictedBeforeCopy"] as? Int64 == 0, "restart eviction does not claim actual cloud loss")
+        check((unverifiedRecorder.snapshotForTests()["mirrorUnverifiedEvictions"] as? Int64 ?? 0) > 0, "restart eviction reports unverified copy status")
+        check(unverifiedRecorder.shutdown(), "unverified retention shutdown")
         // Lifecycle cannot be silently skipped when a recorder lock is momentarily busy.
         let lifecycle = DevelopmentDiagnostics(root: temp.appendingPathComponent("lifecycle"))
         lifecycle.start(role: "source", stream: stream); try lifecycle.flushForTests()
