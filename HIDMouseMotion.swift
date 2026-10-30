@@ -24,8 +24,9 @@ struct MotionPlan {
     guard let ix=Int16(exactly:x), let iy=Int16(exactly:y) else { return .useCG }
     return .motion(MotionPlan(type:type,location:location,dx:dx,dy:dy,
       point:IOGPoint(x:ix,y:iy),
-      subx:UInt8(floor((Double(location.x)-x)*256)),
-      suby:UInt8(floor((Double(location.y)-y)*256)),
+      // Floating-point rounding can turn a fraction just below one into 256.
+      subx:UInt8(min(255,floor((Double(location.x)-x)*256))),
+      suby:UInt8(min(255,floor((Double(location.y)-y)*256))),
       flags:UInt32(NX_NONCOALSESCEDMASK)))
   }
 }
