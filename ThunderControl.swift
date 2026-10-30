@@ -1241,8 +1241,7 @@ final class Relay {
   var authenticatedPeerDisplayName:String?
   var authenticated:Bool {connection != nil && key != nil}
   var hasSession: Bool { context != nil }
-  private var receiverInputRecoveryPending:Bool { receiverCleanupPending || hidInputPoster.hasGlobalStateToRestore }
-  var hasUnresolvedLocalRecovery: Bool { receiverInputRecoveryPending || ownership.blocked || cursorResources.needsRecovery || receiverCursor.needsRecovery || receiverFocusRecoveryPending?() == true }
+  var hasUnresolvedLocalRecovery: Bool { receiverCleanupPending || ownership.blocked || cursorResources.needsRecovery || receiverCursor.needsRecovery || receiverFocusRecoveryPending?() == true }
   var receiverCursorFocusOwned:(()->Bool)?
   var receiverFocusRecoveryPending:(()->Bool)?
   var cancelReceiverCursorFocus:(()->Void)?
@@ -2780,7 +2779,7 @@ final class Relay {
     removeCaptureIfClean()
     releaseInputs()
     localKeys.removeAll();localButtons.removeAll();localFlags=[]
-    if receiverInputRecoveryPending {status("Input cleanup is pending. Restore input permission and click Stop to retry.");return}
+    if receiverCleanupPending {status("Input cleanup is pending. Restore input permission and click Stop to retry.");return}
     if receiverCursor.needsRecovery {status(TCText("Waiting to restore the Receiver cursor's visibility. Click Stop to retry."));return}
     if cursorResources.needsRecovery {
       status(recoveryNotice)
@@ -2938,7 +2937,7 @@ final class Relay {
         let button=CGEvent(mouseEventSource:nil,mouseType:.leftMouseDown,mouseCursorPosition:.zero,mouseButton:.left),
         r.postReceiverInput(key,modifierCodes:[],canPost:{true}) == .posted,
         r.postReceiverInput(button,modifierCodes:[],canPost:{true}) == .posted else{return false}
-      guard !r.receiverCleanupPending,r.hasUnresolvedLocalRecovery else{return false}
+      guard !r.receiverCleanupPending,r.hidInputPoster.hasGlobalStateToRestore,!r.hasUnresolvedLocalRecovery else{return false}
       r.keys=[0];r.buttons=[0]
       failCleanup=true
       r.stop()
@@ -3007,7 +3006,7 @@ final class Relay {
     let attemptStartedAt=ProcessInfo.processInfo.systemUptime
     guard displayLease == nil,displayBarrier == nil else{throw Failure("Stop the owned display before reconnecting input")}
     stop()
-    guard !receiverInputRecoveryPending else{throw Failure("Input cleanup must finish before reconnecting; use Stop to retry recovery")}
+    guard !receiverCleanupPending else{throw Failure("Input cleanup must finish before reconnecting; use Stop to retry recovery")}
     guard expectedRoutePair==nil || automaticStart else{throw Failure("Remembered peer binding is restricted to automatic reconnect")}
     guard !fastRouteAttempt || (automaticStart && sendMode && expectedRoutePair != nil) else{throw Failure("Fast route is restricted to a bound automatic sender reconnect")}
     guard cursorResources.canAcquire,!receiverCursor.needsRecovery,receiverFocusRecoveryPending?() != true else{throw Failure("Cursor recovery must finish before starting either role; use Stop to retry recovery")}
