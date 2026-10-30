@@ -1276,6 +1276,27 @@ static BOOL TestCursorBusyAndEpoch(void){
   if(hidden.length==19)for(NSUInteger n=9;n<19;n++)ok=ok&&((const uint8_t*)hidden.bytes)[n]==0;
   close(fd[0]);close(fd[1]);return ok;
 }
+static BOOL TestCursorHiddenPublicationOnce(void){
+  int fd[2];if(!TestPipe(fd))return NO;
+  int savedFD=outputFD;BOOL savedSynthetic=synthetic;outputFD=fd[1];synthetic=YES;
+  unsigned busy=atomic_load(&cursorBusyDropped),blocked=atomic_load(&cursorPipeDropped);
+  pthread_mutex_lock(&writeMutex);PublishCursor();pthread_mutex_unlock(&writeMutex);
+  uint8_t filler[512]={0};ssize_t count=read(fd[0],filler,sizeof(filler));
+  BOOL ok=count<0&&(errno==EAGAIN||errno==EWOULDBLOCK)&&atomic_load(&cursorBusyDropped)==busy+1;
+  size_t filled=0;for(;;){count=write(fd[1],filler,sizeof(filler));if(count>0){filled+=(size_t)count;continue;}if(count<0&&errno==EINTR)continue;break;}
+  ok=ok&&filled>0&&count<0&&(errno==EAGAIN||errno==EWOULDBLOCK);
+  usleep(18000);PublishCursor();ok=ok&&atomic_load(&cursorPipeDropped)==blocked+1;
+  while(filled){size_t n=MIN(filled,sizeof(filler));if(!TestReadExact(fd[0],filler,n)){ok=NO;break;}filled-=n;}
+  usleep(18000);PublishCursor();NSData *packet=TestReadPacket(fd[0]);
+  ok=ok&&packet.length==19;
+  if(packet.length==19){const uint8_t *bytes=packet.bytes;uint64_t sequence;memcpy(&sequence,bytes+1,8);
+    ok=ok&&bytes[0]==7&&CFSwapInt64BigToHost(sequence)==2;
+    for(NSUInteger n=9;n<19;n++)ok=ok&&bytes[n]==0;
+  }
+  usleep(20000);PublishCursor();for(unsigned n=0;n<1024;n++)PublishCursor();
+  count=read(fd[0],filler,sizeof(filler));ok=ok&&count<0&&(errno==EAGAIN||errno==EWOULDBLOCK);
+  outputFD=savedFD;synthetic=savedSynthetic;close(fd[0]);close(fd[1]);return ok;
+}
 static BOOL TestWriterBackpressureOrdering(void){
   int fd[2];if(!TestPipe(fd))return NO;
   uint8_t filler[512]={0};size_t filled=0;for(;;){ssize_t n=write(fd[1],filler,sizeof(filler));if(n>0){filled+=(size_t)n;continue;}if(n<0&&errno==EINTR)continue;break;}
@@ -1447,6 +1468,7 @@ static int SelfTest(void){
   CHECK(TestDisplayIdentityLock(),"display-identity-lock-cross-process-release-symlink-hardlink-permissions");
   CHECK(TestCursorGuardIsolation(),"cursor-slow-guard-does-not-lock-video");
   CHECK(TestCursorBusyAndEpoch(),"cursor-busy-skips-and-stale-epoch-hides");
+  CHECK(TestCursorHiddenPublicationOnce(),"cursor-hidden-published-once-after-busy-and-full-pipe-retries");
   CHECK(DiagReasonCode("")==2166136261u && DiagReasonCode("a")==0xe40c292cu && DiagReasonCode("foobar")==0xbf9cf968u && DiagReasonCode("output stalled")==DiagReasonCode("output stalled"),"diagnostics-failure-fnv1a32-known-stable");
   CHECK(TestDiagnosticRecords(),"diagnostics-bounds-identifiers-numeric-parser-nonblocking-loss-visibility");
   CHECK(TestWriterBackpressureOrdering(),"writer-backpressure-callbacks-return-two-slot-bound-and-order");
