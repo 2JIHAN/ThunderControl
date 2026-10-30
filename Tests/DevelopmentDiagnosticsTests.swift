@@ -64,7 +64,7 @@ import Darwin
             throw FixtureError.acceptanceTimedOut("missing stale rejection: " + label)
         }
         // Manifest summaries use only the existing async renderer_metrics path.
-        check(DevelopmentDiagnostics.receiverPerformanceFields.count == 24 && DevelopmentDiagnostics.receiverPerformanceFields.contains("targetGaps") && !DevelopmentDiagnostics.receiverPerformanceFields.contains("pending") && DevelopmentDiagnostics.receiverPerformanceFields.allSatisfy { $0.utf8.count <= 32 }, "performance numeric schema respects event bounds")
+        check(DevelopmentDiagnostics.receiverPerformanceFields.count == 25 && DevelopmentDiagnostics.receiverPerformanceFields.contains("targetGaps") && !DevelopmentDiagnostics.receiverPerformanceFields.contains("pending") && DevelopmentDiagnostics.receiverPerformanceFields.allSatisfy { $0.utf8.count <= 32 }, "performance numeric schema respects event bounds")
         let performanceRoot = temp.appendingPathComponent("receiver-performance")
         let performance = DevelopmentDiagnostics(root: performanceRoot, diskBytes: 0)
         performance.start(role: "viewer", stream: stream); try performance.flushForTests()
@@ -396,5 +396,72 @@ import Darwin
 #if DEVELOPMENT_DIAGNOSTICS_TEST_MAIN
 @main private struct DevelopmentDiagnosticsTestMain {
     static func main() { exit(Int32(runDevelopmentDiagnosticsTests() == 0 ? 0 : 1)) }
+}
+#endif
+
+#if RENDERER_DIAGNOSTICS_TEST_MAIN
+@main private struct RendererDiagnosticsTestMain {
+    static func main() throws {
+        var failures = 0, checks = 0
+        func check(_ condition: Bool, _ label: String) {
+            checks += 1
+            if !condition { failures += 1; print("Renderer FAIL: \(label)") }
+        }
+        let root = URL(fileURLWithPath: CommandLine.arguments[1])
+        let recorder = DevelopmentDiagnostics(root: root, cloudRoot: nil)
+        let stream = String(repeating: "0123456789abcdef", count: 4)
+        recorder.start(role: "viewer", stream: stream)
+        try recorder.flushForTests()
+        // Matches requestRendererMetrics' quality-tier, renderer-health snapshot.
+        var full: [String: Double] = [
+            "available": 1, "sampleTime": 100, "totalNumberOfFrames": 60,
+            "numberOfDroppedFrames": 1, "numberOfCorruptedFrames": 0,
+            "totalAccumulatedFrameDelay": 0.1, "presentationMode": 0,
+            "counterSampleTime": 100.001, "generation": 2, "displayLinkTicks": 61,
+            "submitted": 60, "pacerOffered": 61, "pacerSelected": 60,
+            "pacerOverflow": 1, "pacerSuperseded": 0, "pacerEmpty": 0,
+            "pacerWaiting": 0, "pacerInvalid": 0, "targetDuplicate": 0,
+            "targetExpired": 0, "targetLimited": 0, "pacerRateLimited": 0,
+            "targetGaps": 0, "readinessDeferrals": 0, "lastSourceSequence": 99
+        ]
+        check(full.count == 25, "producer snapshot has 25 fields")
+        func record(_ fields: [String: Double], stage: String = "renderer_metrics", sequence: UInt64? = nil) throws {
+            for _ in 0..<32 {
+                let before = recorder.snapshotForTests()
+                recorder.record(stage: stage, sequence: sequence, fields: fields, stream: stream)
+                try recorder.flushForTests()
+                let after = recorder.snapshotForTests()
+                if after["accepted"] as? Int64 != before["accepted"] as? Int64 || after["invalid"] as? Int64 != before["invalid"] as? Int64 { return }
+            }
+            check(false, "record made no progress")
+        }
+        try record(full, sequence: 99)
+        full.removeValue(forKey: "lastSourceSequence")
+        try record(full)
+        for key in ["totalNumberOfFrames", "numberOfDroppedFrames", "numberOfCorruptedFrames", "totalAccumulatedFrameDelay"] { full.removeValue(forKey: key) }
+        full["available"] = 0
+        try record(full)
+        full["lastSourceSequence"] = 100
+        try record(full, sequence: 100)
+        var status = recorder.snapshotForTests()
+        let ring = status["receiverPerformance"] as? [[String: Any]] ?? []
+        check(status["accepted"] as? Int64 == 4, "nil/nonnil AV metrics with/without source sequence accepted")
+        check(ring.count == 4, "all four producer shapes retained")
+        if ring.count == 4 {
+            check((ring[0]["fields"] as? [String: Double])?.count == 25, "complete snapshot retained")
+            check((ring[0]["fields"] as? [String: Double])?["presentationMode"] == 0, "mode not silently dropped")
+            check((ring[0]["seq"] as? NSNumber)?.uint64Value == 99 && ring[1]["seq"] == nil, "event sequence preserved")
+        }
+        var oversized = Dictionary(uniqueKeysWithValues: (0..<26).map { ("field\($0)", Double($0)) })
+        try record(oversized)
+        oversized.removeValue(forKey: "field25")
+        try record(oversized, stage: "capture")
+        status = recorder.snapshotForTests()
+        check(status["invalid"] as? Int64 == 2, "renderer 26 and other-stage 25 rejected")
+        check(status["accepted"] as? Int64 == 4, "oversized events not accepted")
+        check(recorder.shutdown(), "bounded shutdown")
+        print("Renderer diagnostics: \(checks) checks, \(failures) failures")
+        exit(failures == 0 ? 0 : 1)
+    }
 }
 #endif

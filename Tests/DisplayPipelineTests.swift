@@ -8,6 +8,7 @@ private enum DisplayPipelineTestError: Error { case failed }
 /// Offline generated-pattern integration only. No window, socket, event construction,
 /// event capture/posting, Keychain, or user desktop. A zero helper identity is REQUIRED
 /// and replaced with fixture ID1 before passing the real production wire validators.
+#if !DISPLAY_PIPELINE_PIXEL_TEST_MAIN
 @MainActor func runDisplayPipelineTests(path: String, format: DisplayVideoFormat = .standard) throws {
     func require(_ value: Bool) throws { if !value { throw DisplayPipelineTestError.failed } }
     try require(format.valid)
@@ -40,24 +41,7 @@ private enum DisplayPipelineTestError: Error { case failed }
     var firstVideo: Data?, firstEncrypted: Data?
     var startupFrames: [Data] = []
     let decoder = DisplayH264Decoder(format: format, output: { pixel in
-        guard CVPixelBufferGetWidth(pixel) == format.pixelWidth, CVPixelBufferGetHeight(pixel) == format.pixelHeight,
-              CVPixelBufferGetPixelFormatType(pixel) == kCVPixelFormatType_32BGRA,
-              CVPixelBufferLockBaseAddress(pixel, .readOnly) == kCVReturnSuccess else { decoderFailed = true; return }
-        defer { CVPixelBufferUnlockBaseAddress(pixel, .readOnly) }
-        guard let base = CVPixelBufferGetBaseAddress(pixel) else { decoderFailed = true; return }
-        let strideBytes = CVPixelBufferGetBytesPerRow(pixel)
-        guard strideBytes >= format.pixelWidth * 4 else { decoderFailed = true; return }
-        let source = base.assumingMemoryBound(to: UInt8.self)
-        var minimum: UInt8 = 255, maximum: UInt8 = 0, sum: UInt64 = 0
-        for y in stride(from: 20, to: format.pixelHeight - 20, by: 80) {
-            for x in stride(from: 20, to: format.pixelWidth - 20, by: 80) {
-                for color in 0..<3 {
-                    let value = source[y * strideBytes + x * 4 + color]
-                    minimum = min(minimum, value); maximum = max(maximum, value); sum += UInt64(value)
-                }
-            }
-        }
-        guard sum > 0, maximum > minimum else { decoderFailed = true; return }
+        guard displayPipelineHasContent(pixel, width: format.pixelWidth, height: format.pixelHeight) else { decoderFailed = true; return }
         delivered += 1
     }, failure: { decoderFailed = true })
     defer { decoder.clear() }
@@ -136,3 +120,77 @@ private enum DisplayPipelineTestError: Error { case failed }
     try require(staleCallbacks == 0 && ProcessInfo.processInfo.systemUptime < deadline)
     print("PASS display offline pipeline: helper H264 -> stamped v6 metadata -> AEAD -> negotiated-size decoder startup burst 8/8 completed with nonempty latest-only output; legacy input denied by v5 for both roles; codec memory-only 2/2; replay/tamper/direction rejected 6/6; stale callbacks=0; no real network/window/capture/input posting")
 }
+
+#endif
+
+private func displayPipelineHasContent(_ pixel: CVPixelBuffer, width: Int, height: Int) -> Bool {
+    guard CVPixelBufferGetWidth(pixel) == width, CVPixelBufferGetHeight(pixel) == height,
+          CVPixelBufferGetPixelFormatType(pixel) == kCVPixelFormatType_32BGRA,
+          CVPixelBufferLockBaseAddress(pixel, .readOnly) == kCVReturnSuccess else { return false }
+    defer { CVPixelBufferUnlockBaseAddress(pixel, .readOnly) }
+    guard let base = CVPixelBufferGetBaseAddress(pixel) else { return false }
+    let strideBytes = CVPixelBufferGetBytesPerRow(pixel)
+    guard strideBytes >= width * 4 else { return false }
+    let source = base.assumingMemoryBound(to: UInt8.self)
+    var minimum: UInt8 = 255, maximum: UInt8 = 0, sum: UInt64 = 0
+    for y in stride(from: 20, to: height - 20, by: 80) {
+        for x in stride(from: 20, to: width - 20, by: 80) {
+            for color in 0..<3 {
+                let value = source[y * strideBytes + x * 4 + color]
+                minimum = min(minimum, value); maximum = max(maximum, value); sum += UInt64(value)
+            }
+        }
+    }
+    guard sum > 0, maximum > minimum else { return false }
+    return true
+}
+
+#if DISPLAY_PIPELINE_PIXEL_TEST_MAIN
+@main private struct DisplayPipelinePixelTestMain {
+    static func main() {
+        var checks = 0, failures = 0
+        func check(_ condition: Bool, _ label: String) {
+            checks += 1
+            if !condition { failures += 1; print("Pixel FAIL: \(label)") }
+        }
+        let width = 256, height = 256
+        for format in [kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVPixelFormatType_422YpCbCr8, kCVPixelFormatType_OneComponent8] {
+            var pixel: CVPixelBuffer?
+            let result = CVPixelBufferCreate(nil, width, height, format, nil, &pixel)
+            check(result == kCVReturnSuccess && pixel != nil, "allocate real buffer \(format)")
+            guard let pixel else { continue }
+            let supported = format != kCVPixelFormatType_OneComponent8
+            for patterned in [false, true] {
+                CVPixelBufferLockBaseAddress(pixel, [])
+                let planar = CVPixelBufferIsPlanar(pixel)
+                for plane in 0..<(planar ? CVPixelBufferGetPlaneCount(pixel) : 1) {
+                    let base = planar ? CVPixelBufferGetBaseAddressOfPlane(pixel, plane) : CVPixelBufferGetBaseAddress(pixel)
+                    let strideBytes = planar ? CVPixelBufferGetBytesPerRowOfPlane(pixel, plane) : CVPixelBufferGetBytesPerRow(pixel)
+                    let rows = planar ? CVPixelBufferGetHeightOfPlane(pixel, plane) : height
+                    if let base {
+                        memset(base, plane == 0 ? 0 : 128, strideBytes * rows)
+                        let bytes = base.assumingMemoryBound(to: UInt8.self)
+                        for y in 0..<rows {
+                            for x in 0..<width {
+                                let value: UInt8 = patterned && x >= 128 ? 200 : (format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || format == kCVPixelFormatType_422YpCbCr8 ? 16 : 0)
+                                if format == kCVPixelFormatType_32BGRA {
+                                    for c in 0..<3 { bytes[y * strideBytes + x * 4 + c] = patterned && x >= 128 ? 200 : 0 }
+                                } else if format == kCVPixelFormatType_422YpCbCr8 {
+                                    bytes[y * strideBytes + x * 2] = 128
+                                    bytes[y * strideBytes + x * 2 + 1] = value
+                                } else if plane == 0 { bytes[y * strideBytes + x] = value }
+                            }
+                        }
+                    }
+                }
+                CVPixelBufferUnlockBaseAddress(pixel, [])
+                check(displayPipelineHasContent(pixel, width: width, height: height) == (supported && patterned), "format \(format) patterned=\(patterned)")
+                check(!displayPipelineHasContent(pixel, width: width + 1, height: height), "bad width \(format)")
+                check(!displayPipelineHasContent(pixel, width: width, height: height + 1), "bad height \(format)")
+            }
+        }
+        print("Display pipeline pixels: \(checks) checks, \(failures) failures")
+        exit(failures == 0 ? 0 : 1)
+    }
+}
+#endif
