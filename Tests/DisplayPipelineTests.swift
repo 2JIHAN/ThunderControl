@@ -124,25 +124,50 @@ private enum DisplayPipelineTestError: Error { case failed }
 #endif
 
 private func displayPipelineHasContent(_ pixel: CVPixelBuffer, width: Int, height: Int) -> Bool {
-    guard CVPixelBufferGetWidth(pixel) == width, CVPixelBufferGetHeight(pixel) == height,
-          CVPixelBufferGetPixelFormatType(pixel) == kCVPixelFormatType_32BGRA,
+    guard width > 40, height > 40,
+          CVPixelBufferGetWidth(pixel) == width, CVPixelBufferGetHeight(pixel) == height,
           CVPixelBufferLockBaseAddress(pixel, .readOnly) == kCVReturnSuccess else { return false }
     defer { CVPixelBufferUnlockBaseAddress(pixel, .readOnly) }
-    guard let base = CVPixelBufferGetBaseAddress(pixel) else { return false }
-    let strideBytes = CVPixelBufferGetBytesPerRow(pixel)
-    guard strideBytes >= width * 4 else { return false }
+    let base: UnsafeMutableRawPointer?
+    let strideBytes: Int, pixelBytes: Int, offset: Int, channels: Int
+    switch CVPixelBufferGetPixelFormatType(pixel) {
+    case kCVPixelFormatType_32BGRA:
+        guard !CVPixelBufferIsPlanar(pixel) else { return false }
+        base = CVPixelBufferGetBaseAddress(pixel)
+        strideBytes = CVPixelBufferGetBytesPerRow(pixel)
+        pixelBytes = 4; offset = 0; channels = 3
+    case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+        guard CVPixelBufferGetPlaneCount(pixel) == 2,
+              CVPixelBufferGetWidthOfPlane(pixel, 0) == width,
+              CVPixelBufferGetHeightOfPlane(pixel, 0) == height,
+              CVPixelBufferGetWidthOfPlane(pixel, 1) >= (width + 1) / 2,
+              CVPixelBufferGetHeightOfPlane(pixel, 1) >= (height + 1) / 2,
+              CVPixelBufferGetBytesPerRowOfPlane(pixel, 1) >= ((width + 1) / 2) * 2,
+              CVPixelBufferGetBaseAddressOfPlane(pixel, 1) != nil else { return false }
+        base = CVPixelBufferGetBaseAddressOfPlane(pixel, 0)
+        strideBytes = CVPixelBufferGetBytesPerRowOfPlane(pixel, 0)
+        pixelBytes = 1; offset = 0; channels = 1
+    case kCVPixelFormatType_422YpCbCr8:
+        guard !CVPixelBufferIsPlanar(pixel), width.isMultiple(of: 2) else { return false }
+        base = CVPixelBufferGetBaseAddress(pixel)
+        strideBytes = CVPixelBufferGetBytesPerRow(pixel)
+        pixelBytes = 2; offset = 1; channels = 1
+    default:
+        return false
+    }
+    guard let base, strideBytes >= width * pixelBytes else { return false }
     let source = base.assumingMemoryBound(to: UInt8.self)
     var minimum: UInt8 = 255, maximum: UInt8 = 0, sum: UInt64 = 0
+    // YUV chroma is nonzero even for black. Test luma variation, not chroma bytes.
     for y in stride(from: 20, to: height - 20, by: 80) {
         for x in stride(from: 20, to: width - 20, by: 80) {
-            for color in 0..<3 {
-                let value = source[y * strideBytes + x * 4 + color]
+            for color in 0..<channels {
+                let value = source[y * strideBytes + x * pixelBytes + offset + color]
                 minimum = min(minimum, value); maximum = max(maximum, value); sum += UInt64(value)
             }
         }
     }
-    guard sum > 0, maximum > minimum else { return false }
-    return true
+    return sum > 0 && maximum > minimum
 }
 
 #if DISPLAY_PIPELINE_PIXEL_TEST_MAIN

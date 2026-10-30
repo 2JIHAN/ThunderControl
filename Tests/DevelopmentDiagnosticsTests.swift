@@ -413,7 +413,7 @@ import Darwin
         recorder.start(role: "viewer", stream: stream)
         try recorder.flushForTests()
         // Matches requestRendererMetrics' quality-tier, renderer-health snapshot.
-        var full: [String: Double] = [
+        let producer: [String: Double] = [
             "available": 1, "sampleTime": 100, "totalNumberOfFrames": 60,
             "numberOfDroppedFrames": 1, "numberOfCorruptedFrames": 0,
             "totalAccumulatedFrameDelay": 0.1, "presentationMode": 0,
@@ -424,6 +424,7 @@ import Darwin
             "targetExpired": 0, "targetLimited": 0, "pacerRateLimited": 0,
             "targetGaps": 0, "readinessDeferrals": 0, "lastSourceSequence": 99
         ]
+        var full = producer
         check(full.count == 25, "producer snapshot has 25 fields")
         func record(_ fields: [String: Double], stage: String = "renderer_metrics", sequence: UInt64? = nil) throws {
             for _ in 0..<32 {
@@ -452,13 +453,18 @@ import Darwin
             check((ring[0]["fields"] as? [String: Double])?["presentationMode"] == 0, "mode not silently dropped")
             check((ring[0]["seq"] as? NSNumber)?.uint64Value == 99 && ring[1]["seq"] == nil, "event sequence preserved")
         }
-        var oversized = Dictionary(uniqueKeysWithValues: (0..<26).map { ("field\($0)", Double($0)) })
+        var oversized = producer
+        oversized["extraField"] = 1
         try record(oversized)
-        oversized.removeValue(forKey: "field25")
+        oversized.removeValue(forKey: "extraField")
         try record(oversized, stage: "capture")
         status = recorder.snapshotForTests()
         check(status["invalid"] as? Int64 == 2, "renderer 26 and other-stage 25 rejected")
         check(status["accepted"] as? Int64 == 4, "oversized events not accepted")
+        oversized.removeValue(forKey: "presentationMode")
+        try record(oversized, stage: "capture")
+        check(recorder.snapshotForTests()["accepted"] as? Int64 == 5, "other-stage 24 remains accepted")
+        check(DevelopmentDiagnostics.receiverPerformanceFields.count == 25 && DevelopmentDiagnostics.receiverPerformanceFields.contains("presentationMode"), "explicit bounded mode schema")
         check(recorder.shutdown(), "bounded shutdown")
         print("Renderer diagnostics: \(checks) checks, \(failures) failures")
         exit(failures == 0 ? 0 : 1)

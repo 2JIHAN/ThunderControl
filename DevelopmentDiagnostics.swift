@@ -90,7 +90,7 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
         queue.async { self.drain(); self.publishStatus() }
     }
     func record(stage: String, sequence: UInt64? = nil, fields: [String: Double] = [:], stream: String? = nil) {
-        guard Self.identifier(stage, limit: 48), fields.count <= 24,
+        guard Self.identifier(stage, limit: 48), fields.count <= (stage == "renderer_metrics" ? 25 : 24),
               fields.keys.allSatisfy({ Self.identifier($0, limit: 32) }) else { invalid.add(); return }
         guard fields.values.allSatisfy({ $0.isFinite }) else { nonfinite.add(); return }
         guard ingress.try() else { contention.add(); return }
@@ -283,7 +283,7 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
     // structured event logs but never enter the performance manifest summary.
     static let receiverPerformanceFields: Set<String> = {
         let common: Set<String> = [
-            "available", "sampleTime", "totalNumberOfFrames", "numberOfDroppedFrames",
+            "available", "sampleTime", "presentationMode", "totalNumberOfFrames", "numberOfDroppedFrames",
             "numberOfCorruptedFrames", "totalAccumulatedFrameDelay", "generation",
             "displayLinkTicks", "submitted", "pacerOffered", "pacerSelected",
             "pacerOverflow", "pacerSuperseded", "pacerEmpty", "pacerWaiting",
