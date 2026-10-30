@@ -1234,6 +1234,19 @@ static bool MockOnlineExact(const uint32_t *baseIDs,uint32_t baseCount,uint32_t 
   for(uint32_t j=0;j<onlineCount;j++){bool k=online[j]==owned;for(uint32_t i=0;!k&&i<baseCount;i++)if(online[j]==baseIDs[i])k=true;if(!k)return false;}
   return true;
 }
+static BOOL RunOwnedValidation(BOOL (*reader)(void),uint64_t startedNS){
+  (void)startedNS;return reader();
+}
+static BOOL OwnedValidationFatal(uint64_t nowNS){
+  return BoundedInvalidFatal(atomic_load(&ownedInvalidSinceNS),nowNS);
+}
+static dispatch_semaphore_t validationTestEntered,validationTestRelease;
+static BOOL BlockedOwnedReader(void){
+  dispatch_semaphore_signal(validationTestEntered);
+  dispatch_semaphore_wait(validationTestRelease,DISPATCH_TIME_FOREVER);
+  return YES;
+}
+
 // --selftest: pure, offline validation of the bounded-helper state machine.
 // Touches NO displays, NO CoreGraphics mutations, NO network, NO encoder.
 // Exercises BoundedInvalidFatal / BoundedHeartbeatFatal + Reconfigured
@@ -1677,6 +1690,26 @@ static int SelfTest(void){
   CHECK(!BoundedHeartbeatFatal(0,4.9),"heartbeat-non-fatal-under-5s");
   CHECK(!BoundedHeartbeatFatal(0,5),"heartbeat-non-fatal-at-5s-boundary");
   CHECK(BoundedHeartbeatFatal(0,5.001),"heartbeat-fatal-just-past-5s");
+
+  // Parent map remains valid; only the native reader is blocked. No CG or wall-clock wait.
+  validationTestEntered=dispatch_semaphore_create(0);validationTestRelease=dispatch_semaphore_create(0);
+  dispatch_semaphore_t validationDone=dispatch_semaphore_create(0);
+  const uint64_t queryStart=1000000000ULL;
+  atomic_store(&ownedValid,true);atomic_store(&ownedInvalidSinceNS,0);
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT,0),^{
+    RunOwnedValidation(BlockedOwnedReader,queryStart);
+    dispatch_semaphore_signal(validationDone);
+  });
+  dispatch_semaphore_wait(validationTestEntered,DISPATCH_TIME_FOREVER);
+  CHECK(atomic_load(&ownedValid) && !atomic_load(&ownedInvalidSinceNS),"blocked-reader-valid-parent-map-no-invalid-stamp");
+  CHECK(!BoundedInvalidFatal(atomic_load(&ownedInvalidSinceNS),queryStart+6000000000ULL),"blocked-reader-old-invalid-timeout-does-not-fire");
+  CHECK(!OwnedValidationFatal(queryStart-1),"validation-reverse-clock-not-fatal");
+  CHECK(!OwnedValidationFatal(queryStart+5000000000ULL),"validation-at-declared-5s-limit-not-fatal");
+  CHECK(OwnedValidationFatal(queryStart+5000000001ULL),"blocked-reader-independent-supervisor-fatal-after-5s");
+  dispatch_semaphore_signal(validationTestRelease);
+  dispatch_semaphore_wait(validationDone,DISPATCH_TIME_FOREVER);
+  CHECK(!OwnedValidationFatal(queryStart+60000000000ULL),"completed-validation-idle-not-fatal");
+  validationTestEntered=nil;validationTestRelease=nil;
 
   // CanSubmitFrame transitions in armed state (epoch-bound proof).
   atomic_store(&topologyArmed,false);
