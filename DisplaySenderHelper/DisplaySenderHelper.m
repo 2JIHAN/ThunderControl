@@ -104,11 +104,13 @@
 static const size_t MaxPayload=4*1024*1024;
 static const uint64_t BoundedOwnedInvalidNS=5000000000ULL; // 5s
 static const uint64_t BoundedProofStaleNS=250000000ULL;    // 250ms owned proof freshness (stale proof only pauses submit; no need to relax)
+static const uint64_t BoundedOwnedValidationNS=5000000000ULL; // A single owned-only query has a declared 5s progress limit.
 static const double   BoundedHeartbeatSec=5.0;             // parent sends 0.5s heartbeats through pauses; keep tight hung-parent cutoff
 static atomic_uint inFlight=0,maximumInFlight=0;
 static atomic_bool topologyArmed=false,ownedValid=false;
 static atomic_uint emitted=0,encoderDropped=0,capturesSuspended=0,reconfigEpoch=0,proofEpoch=0;
 static atomic_ullong ownedValidatedNS=0,ownedInvalidSinceNS=0;
+static atomic_ullong ownedValidationStartedNS=0;
 // Serializes the OS-reconfiguration callback's epoch bump + invalid-stamp
 // against the watchdog's post-OwnedSafe publication (epoch recheck + proof
 // publish + bounded-invalid timer clear). The mutex is NEVER held across any
@@ -493,6 +495,22 @@ static void OwnedHiDPIDiagnostic(const char *phase,BOOL enumerate){
 // Pure, injectable predicate for bounded-time failure (unit-testable).
 static inline BOOL BoundedInvalidFatal(uint64_t sinceNS,uint64_t nowNS){
   return sinceNS!=0 && nowNS>sinceNS && (nowNS-sinceNS)>BoundedOwnedInvalidNS;
+}
+static uint64_t OwnedValidationNowNS(void){
+  struct timespec now;
+  if(clock_gettime(CLOCK_MONOTONIC,&now))Fail("owned validation clock");
+  return (uint64_t)now.tv_sec*1000000000ULL+(uint64_t)now.tv_nsec;
+}
+// The supervisor reads only this progress boundary, never CG or publishMutex.
+static BOOL OwnedValidationFatal(uint64_t nowNS){
+  uint64_t startedNS=atomic_load(&ownedValidationStartedNS);
+  return startedNS && nowNS>startedNS && nowNS-startedNS>BoundedOwnedValidationNS;
+}
+static BOOL RunOwnedValidation(BOOL (*reader)(void),uint64_t startedNS){
+  atomic_store(&ownedValidationStartedNS,startedNS);
+  BOOL safe=reader();
+  atomic_store(&ownedValidationStartedNS,0);
+  return safe;
 }
 static inline BOOL BoundedHeartbeatFatal(double lastSec,double nowSec){
   return (nowSec-lastSec)>BoundedHeartbeatSec;
@@ -1043,8 +1061,21 @@ static void Pump(double t){@autoreleasepool {
 static void RunPooledIteration(void (NS_NOESCAPE ^body)(void)){
   @autoreleasepool {body();}
 }
+static void *SuperviseOwnedValidation(void *context){
+  (void)context;
+  for(;;){
+    if(OwnedValidationFatal(OwnedValidationNowNS()))Fail("owned validation progress timeout");
+    poll(NULL,0,50);
+  }
+  return NULL;
+}
 static void StartWatchdog(void){
   pid_t parent=getppid();parentPID=parent;if(parent<=1)Fail("parent unavailable");
+  // A synchronous CG reader cannot enforce its own progress deadline. This
+  // independent loop has no display/session queries and remains active at idle.
+  pthread_t supervisor;
+  if(pthread_create(&supervisor,NULL,SuperviseOwnedValidation,NULL))Fail("owned validation supervisor");
+  pthread_detach(supervisor);
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE,0),^{@autoreleasepool {
     double heartbeat=Now();uint8_t buf[128];
     for(;;){@autoreleasepool {
@@ -1061,7 +1092,7 @@ static void StartWatchdog(void){
         // CAS), the under-lock recheck forces the else-branch and the bounded
         // invalid timer is never falsely cleared.
         unsigned beforeEpoch=atomic_load(&reconfigEpoch);
-        BOOL safe=OwnedSafe(); // Lock-free: never hold publishMutex across CG reads.
+        BOOL safe=RunOwnedValidation(OwnedSafe,OwnedValidationNowNS()); // No publishMutex across CG reads.
         uint64_t stamp=(uint64_t)(now*1e9);BOOL fatal=NO;
         pthread_mutex_lock(&publishMutex);
         unsigned afterEpoch=atomic_load(&reconfigEpoch);
@@ -1233,12 +1264,6 @@ static bool MockOnlineExact(const uint32_t *baseIDs,uint32_t baseCount,uint32_t 
   for(uint32_t i=0;i<baseCount;i++){bool p=false;for(uint32_t j=0;j<onlineCount;j++)if(online[j]==baseIDs[i]){p=true;break;}if(!p)return false;}
   for(uint32_t j=0;j<onlineCount;j++){bool k=online[j]==owned;for(uint32_t i=0;!k&&i<baseCount;i++)if(online[j]==baseIDs[i])k=true;if(!k)return false;}
   return true;
-}
-static BOOL RunOwnedValidation(BOOL (*reader)(void),uint64_t startedNS){
-  (void)startedNS;return reader();
-}
-static BOOL OwnedValidationFatal(uint64_t nowNS){
-  return BoundedInvalidFatal(atomic_load(&ownedInvalidSinceNS),nowNS);
 }
 static dispatch_semaphore_t validationTestEntered,validationTestRelease;
 static BOOL BlockedOwnedReader(void){
@@ -1703,12 +1728,14 @@ static int SelfTest(void){
   dispatch_semaphore_wait(validationTestEntered,DISPATCH_TIME_FOREVER);
   CHECK(atomic_load(&ownedValid) && !atomic_load(&ownedInvalidSinceNS),"blocked-reader-valid-parent-map-no-invalid-stamp");
   CHECK(!BoundedInvalidFatal(atomic_load(&ownedInvalidSinceNS),queryStart+6000000000ULL),"blocked-reader-old-invalid-timeout-does-not-fire");
+  CHECK(!OwnedValidationFatal(queryStart+4999999999ULL),"validation-long-query-under-declared-limit-not-fatal");
   CHECK(!OwnedValidationFatal(queryStart-1),"validation-reverse-clock-not-fatal");
   CHECK(!OwnedValidationFatal(queryStart+5000000000ULL),"validation-at-declared-5s-limit-not-fatal");
   CHECK(OwnedValidationFatal(queryStart+5000000001ULL),"blocked-reader-independent-supervisor-fatal-after-5s");
   dispatch_semaphore_signal(validationTestRelease);
   dispatch_semaphore_wait(validationDone,DISPATCH_TIME_FOREVER);
   CHECK(!OwnedValidationFatal(queryStart+60000000000ULL),"completed-validation-idle-not-fatal");
+  CHECK(!OwnedValidationFatal(queryStart+600000000000ULL),"healthy-idle-no-capture-progress-required");
   validationTestEntered=nil;validationTestRelease=nil;
 
   // CanSubmitFrame transitions in armed state (epoch-bound proof).
