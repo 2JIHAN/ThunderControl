@@ -304,6 +304,7 @@ private final class LocalTCPFixture {
         let cursor = LocalTCPMockCursorRecoveryAPI()
         sender = Relay(cursorResources: CursorRecoveryController(api: cursor), receiverCursor: CursorVisibilityController(api: cursor), layoutStore: SavedScreenLayoutStore(defaults: defaults), desktopPlacementStore: SavedDesktopPlacementStore(defaults: defaults), inputAPI: recorder.api)
         receiver = Relay(cursorResources: CursorRecoveryController(api: cursor), receiverCursor: CursorVisibilityController(api: cursor), layoutStore: SavedScreenLayoutStore(defaults: defaults), desktopPlacementStore: SavedDesktopPlacementStore(defaults: defaults), inputAPI: inputAPIOverride ?? recorder.api)
+        if inputAPIOverride == nil { receiver.desktopPhysicalInputsForTests = { false } }
         sender.prepareLocalTCPSafetyForTests(); receiver.prepareLocalTCPSafetyForTests()
         connection = try localTCPRunPairing(sides: sides, senderSession: sender.sessionForTests, receiverSession: receiver.sessionForTests, allowNewTrust: enrollment, pin: enrollment ? "4837" : nil, expectEnrollment: enrollment)
         context = SessionContext(connection.receiver)
@@ -495,7 +496,7 @@ func runLocalTCPRelayIntegrationTests() throws {
         try failed.send(failed.packet(type: 10)); try failed.send(failed.packet(type: 1))
         failed.input.nativePostResult = Int32(kIOReturnError)
         failed.receiver.stop()
-        try localTCPRequire(failed.input.closes == 0 && failed.input.cg.isEmpty, "failed HID cleanup retains port without CG fallback")
+        try localTCPRequire(failed.receiver.hasUnresolvedLocalRecovery && failed.input.closes == 0 && failed.input.cg.isEmpty, "failed HID cleanup retains port without CG fallback")
         let attempted = failed.input.plans.count
         failed.input.nativePostResult = 0
         failed.receiver.stop()
@@ -503,7 +504,7 @@ func runLocalTCPRelayIntegrationTests() throws {
         try localTCPRequire(retried.contains { $0.type == 11 && $0.keyCode == 0 } && retried.contains { $0.type == 2 && $0.button == 0 } && failed.input.closes == 1, "failed HID cleanup retains owned inputs for retry")
         let completed = failed.input.totalPosts
         failed.receiver.stop()
-        try localTCPRequire(failed.input.totalPosts == completed && failed.input.closes == 1, "successful cleanup retry is idempotent")
+        try localTCPRequire(!failed.receiver.hasUnresolvedLocalRecovery && failed.input.totalPosts == completed && failed.input.closes == 1, "successful cleanup retry is idempotent")
         try failed.finish()
     }
     print("PASS local TCP HID cleanup failure retained and retried without CG fallback")

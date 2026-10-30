@@ -1241,7 +1241,8 @@ final class Relay {
   var authenticatedPeerDisplayName:String?
   var authenticated:Bool {connection != nil && key != nil}
   var hasSession: Bool { context != nil }
-  var hasUnresolvedLocalRecovery: Bool { ownership.blocked || cursorResources.needsRecovery || receiverCursor.needsRecovery || receiverFocusRecoveryPending?() == true }
+  private var receiverInputRecoveryPending:Bool { receiverCleanupPending || hidInputPoster.hasGlobalStateToRestore }
+  var hasUnresolvedLocalRecovery: Bool { receiverInputRecoveryPending || ownership.blocked || cursorResources.needsRecovery || receiverCursor.needsRecovery || receiverFocusRecoveryPending?() == true }
   var receiverCursorFocusOwned:(()->Bool)?
   var receiverFocusRecoveryPending:(()->Bool)?
   var cancelReceiverCursorFocus:(()->Void)?
@@ -2779,7 +2780,7 @@ final class Relay {
     removeCaptureIfClean()
     releaseInputs()
     localKeys.removeAll();localButtons.removeAll();localFlags=[]
-    if receiverCleanupPending {status("Input cleanup is pending. Restore input permission and click Stop to retry.");return}
+    if receiverInputRecoveryPending {status("Input cleanup is pending. Restore input permission and click Stop to retry.");return}
     if receiverCursor.needsRecovery {status(TCText("Waiting to restore the Receiver cursor's visibility. Click Stop to retry."));return}
     if cursorResources.needsRecovery {
       status(recoveryNotice)
@@ -2915,6 +2916,79 @@ final class Relay {
     relay.finishReceiverActivation(token:token,generation:relay.generation,ready:true)
     return canceledFocus && relay.receiverCursorLocalOverride && relay.receiverActivationPendingToken==nil && relay.handoff.phase == .local && !relay.hasSession
   }
+  static func verifyReceiverInputCleanupBlocksLifecycleForTests()->Bool {
+    final class Cursor:CursorRecoveryAPI {
+      func associate(_ associated:Bool)->CGError{.success}
+      func hide(display:CGDirectDisplayID)->CGError{.success}
+      func show(display:CGDirectDisplayID)->CGError{.success}
+      func warp(to point:CGPoint)->CGError{.success}
+    }
+    for restoreOnly in [false,true] {
+      var opens=0,closes=0,plans=[HIDInputPlan](),failCleanup=false
+      let native=HIDInputAPI(permissionCheck:{true},open:{opens+=1;return (0,42)},post:{port,plan in
+        precondition(port==42)
+        plans.append(plan)
+        return failCleanup && (!restoreOnly || plan.type==12) ? Int32(kIOReturnError):0
+      },close:{port in precondition(port==42);closes+=1},readFlags:{.maskAlphaShift})
+      let api=RelayInputAPI(native:native,postCG:{_,_ in preconditionFailure("No CG fallback during cleanup")},warp:{_ in .success})
+      let r=Relay(cursorResources:CursorRecoveryController(api:Cursor()),receiverCursor:CursorVisibilityController(api:Cursor()),inputAPI:api)
+      r.safetyObserversInstalled=true;r.gestureTrace.setEnabled(false)
+      r.desktopInputPermissionForTests={true};r.desktopPhysicalInputsForTests={false}
+      guard let key=CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:true),
+        let button=CGEvent(mouseEventSource:nil,mouseType:.leftMouseDown,mouseCursorPosition:.zero,mouseButton:.left),
+        r.postReceiverInput(key,modifierCodes:[],canPost:{true}) == .posted,
+        r.postReceiverInput(button,modifierCodes:[],canPost:{true}) == .posted else{return false}
+      guard !r.receiverCleanupPending,r.hasUnresolvedLocalRecovery else{return false}
+      r.keys=[0];r.buttons=[0]
+      failCleanup=true
+      r.stop()
+      // This is the same aggregate used by applicationShouldTerminate, without NSApp.
+      guard r.hasUnresolvedLocalRecovery,r.receiverCleanupPending,opens==1,closes==0,
+        r.hidInputPoster.hasGlobalStateToRestore,
+        restoreOnly ? (r.keys.isEmpty && r.buttons.isEmpty) : (r.keys==[0] && r.buttons==[0]) else{return false}
+      do {
+        try r.start(name:"not-a-real-interface",peer:"",pass:"0000",port:49177,sendMode:true)
+        return false
+      } catch {
+        guard String(describing:error).contains("Input cleanup must finish"),r.hasUnresolvedLocalRecovery,
+          !r.hasSession,r.context==nil,r.connection==nil,opens==1,closes==0 else{return false}
+      }
+      let beforeRetry=plans.count
+      failCleanup=false;r.stop()
+      let retried=Array(plans.dropFirst(beforeRetry))
+      guard !r.hasUnresolvedLocalRecovery,!r.receiverCleanupPending,r.keys.isEmpty,r.buttons.isEmpty,
+        !r.hidInputPoster.hasGlobalStateToRestore,opens==1,closes==1,
+        retried.last?.type==12,retried.last?.flags==UInt32(CGEventFlags.maskAlphaShift.rawValue),
+        restoreOnly || (retried.contains{$0.type==11 && $0.keyCode==0} && retried.contains{$0.type==2 && $0.button==0}) else{return false}
+      let completed=plans.count
+      r.stop()
+      guard plans.count==completed,closes==1 else{return false}
+    }
+    do {
+      var afterOpen:()->Void={},opens=0,posts=0,closes=0
+      let api=RelayInputAPI(native:HIDInputAPI(permissionCheck:{true},open:{opens+=1;afterOpen();return (0,42)},post:{_,_ in posts+=1;return 0},close:{_ in closes+=1}),postCG:{_,_ in preconditionFailure("No CG post after safety revocation")},warp:{_ in .success})
+      let r=Relay(cursorResources:CursorRecoveryController(api:Cursor()),receiverCursor:CursorVisibilityController(api:Cursor()),inputAPI:api)
+      let map=ReceiverDesktop(revision:7,mainID:11,displays:[ReceiverDisplay(id:11,bounds:CGRect(x:0,y:0,width:1920,height:1080))])
+      let token=UUID().uuidString,point=CGPoint(x:500,y:200)
+      r.context=SessionContext(OwnedSocket(-1));r.connection=OwnedSocket(-1);r.key=SymmetricKey(size:.bits256)
+      r.safetyObserversInstalled=true;r.gestureTrace.setEnabled(false)
+      r.sessionSnapshot=SessionSafetySnapshot(onConsole:true,loginDone:true,screenLocked:false)
+      r.lastSessionPoll=ProcessInfo.processInfo.systemUptime
+      r.desktopMapReadForTests={_,_ in map};r.desktopEpochForTests={0}
+      r.desktopInputPermissionForTests={true};r.desktopPhysicalInputsForTests={false}
+      r.prepareDesktopSystemGestureForTests(map:map,point:point,token:token)
+      guard let event=CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:point,mouseButton:.left),let data=event.data else{return false}
+      afterOpen={r.sessionBecameUnsafe("fake session revocation during native open")}
+      r.receive(Wire(kind:"event",session:r.session,sequence:1,raw:5,data:data as Data,token:token,desktopMapRevision:7,desktopGlobalX:point.x,desktopGlobalY:point.y))
+      afterOpen={}
+      guard opens==1,posts==0,!r.hasSession,!r.inject else{return false}
+      r.stop()
+      guard closes==1,!r.hasUnresolvedLocalRecovery else{return false}
+      print("PASS actual Relay receive rejects a published session revocation during fake native open; no native post")
+    }
+    print("PASS actual Relay cleanup failure blocks normal-quit aggregate and start before setup; permitted retries retain ledger/port and restore once; record-only, no network")
+    return true
+  }
   static func verifyReceiverRecoveryBlocksStartForTests()->Bool {
     final class FailingShow:CursorRecoveryAPI {
       var touchesRealCursor=false
@@ -2933,6 +3007,7 @@ final class Relay {
     let attemptStartedAt=ProcessInfo.processInfo.systemUptime
     guard displayLease == nil,displayBarrier == nil else{throw Failure("Stop the owned display before reconnecting input")}
     stop()
+    guard !receiverInputRecoveryPending else{throw Failure("Input cleanup must finish before reconnecting; use Stop to retry recovery")}
     guard expectedRoutePair==nil || automaticStart else{throw Failure("Remembered peer binding is restricted to automatic reconnect")}
     guard !fastRouteAttempt || (automaticStart && sendMode && expectedRoutePair != nil) else{throw Failure("Fast route is restricted to a bound automatic sender reconnect")}
     guard cursorResources.canAcquire,!receiverCursor.needsRecovery,receiverFocusRecoveryPending?() != true else{throw Failure("Cursor recovery must finish before starting either role; use Stop to retry recovery")}
@@ -5967,7 +6042,7 @@ struct ThunderControlMain {
       check(runDisplayRuntimePresentationTests()==0)
       check(runDisplayRuntimeViewerModeTests()==0)
       #endif
-      do { try tests();check(runLocalizationTests()==0);check(runConcurrentDisplayTests()==0);check(runReceiverDesktopRelayTests()==0);check(runReceiverDesktopTests()==0);check(runSavedDesktopPlacementTests()==0);check(runReceiverDesktopUITests()==0);check(runDesktopMapTransitionTests()==0);check(runDesktopHandoffRoutingTests()==0);check(runDesktopEntryPolicyTests()==0);check(runDisplayHeartbeatTests()==0);check(runDisplayTrustTests()==0);check(runDisplayRemoteInputTests()==0);check(runDisplayTransportTests()==0);check(runDisplayCadenceTests()==0);check(runDisplayFramePacingTests()==0);check(runDisplayVideoFormatTests()==0);check(runSavedSharingStateTests()==0);check(runAutomaticSharingResumeTests()==0);check(runSharingLifecycleIntegrationTests()==0);check(runDisplayPreferenceTests()==0);check(runUpdateReleaseTests()==0);check(runSavedVirtualDisplayPlacementTests()==0);check(runVirtualDisplayPlacementSessionTests()==0);check(runDisplayVideoDecoderTests()==0);check(runDisplayDecodeWorkerTests()==0);check(runScrollReplayTests()==0);check(runDiscoveryRecoveryPolicyTests()==0);check(runNativeGestureTests()==0);check((runDockTransferStateTests()+runDesktopSystemGestureTests())==0);check(runTransitionMotionTests()==0);check(runGestureTraceTests()==0);check(runCursorVisibilityTests()==0);check(runConnectedLayoutTests()==0);check(runCursorModeProtocolTests()==0);ReceiverCursorFocusTests.run();check(runAutomaticConnectionPolicyTests()==0);check(runBridgeLinkRecoveryTests()==0);check(runCableReconnectPolicyTests()==0);check(runReceiverFocusRetryTests()==0);check(runReturnWarpResumeTests()==0);check(runDiagnosticStoreTests()==0);check(runDevelopmentDiagnosticsTests()==0);check(runDevelopmentFrameTraceTests()==0);check(runDisplayDiagnosticLinesTests()==0);check(runTrustedPairingTests()==0);check(runConnectionNotificationTests()==0);check(runSingleConnectionNotificationTests()==0);check(runAppAppearancePreferencesTests()==0);check(runSourcePreferencesConnectionTests()==0);check(runAppWindowPresentationPolicyTests()==0);check(runConnectedWindowVisibilityTests()==0);check(runSavedScreenLayoutTests()==0);check(Relay.verifyDeviceLayoutPersistenceForTests());check(runSessionAutoResumeTests()==0);check(runSessionSuspensionOriginTests()==0);check(Relay.verifySessionSuspensionOriginsForTests());check(runAutomaticReconnectBackoffTests()==0);check(runBridgeRecoverySchedulingTests()==0);check(runLockedTransportPolicyTests()==0);check(runAuthenticatedRouteHintTests()==0);check(runFastReconnectPolicyTests()==0);check(Relay.verifyLockedTransportInputBarrierForTests());check(!Relay().receiverWantsCursorHidden);ScreenArrangementDragTests.run();check(Relay.verifyReceiverRecoveryBlocksStartForTests());check(Relay.verifyReceiverPhysicalInputCancelsActivationForTests());try dockProtocolTests();try appGesturePacketTests();print("PASS gesture memory classification and system stream ordering; no posting") } catch {
+      do { try tests();check(runLocalizationTests()==0);check(runConcurrentDisplayTests()==0);check(runReceiverDesktopRelayTests()==0);check(runReceiverDesktopTests()==0);check(runSavedDesktopPlacementTests()==0);check(runReceiverDesktopUITests()==0);check(runDesktopMapTransitionTests()==0);check(runDesktopHandoffRoutingTests()==0);check(runDesktopEntryPolicyTests()==0);check(runDisplayHeartbeatTests()==0);check(runDisplayTrustTests()==0);check(runDisplayRemoteInputTests()==0);check(runDisplayTransportTests()==0);check(runDisplayCadenceTests()==0);check(runDisplayFramePacingTests()==0);check(runDisplayVideoFormatTests()==0);check(runSavedSharingStateTests()==0);check(runAutomaticSharingResumeTests()==0);check(runSharingLifecycleIntegrationTests()==0);check(runDisplayPreferenceTests()==0);check(runUpdateReleaseTests()==0);check(runSavedVirtualDisplayPlacementTests()==0);check(runVirtualDisplayPlacementSessionTests()==0);check(runDisplayVideoDecoderTests()==0);check(runDisplayDecodeWorkerTests()==0);check(runScrollReplayTests()==0);check(runDiscoveryRecoveryPolicyTests()==0);check(runNativeGestureTests()==0);check((runDockTransferStateTests()+runDesktopSystemGestureTests())==0);check(runTransitionMotionTests()==0);check(runGestureTraceTests()==0);check(runCursorVisibilityTests()==0);check(runConnectedLayoutTests()==0);check(runCursorModeProtocolTests()==0);ReceiverCursorFocusTests.run();check(runAutomaticConnectionPolicyTests()==0);check(runBridgeLinkRecoveryTests()==0);check(runCableReconnectPolicyTests()==0);check(runReceiverFocusRetryTests()==0);check(runReturnWarpResumeTests()==0);check(runDiagnosticStoreTests()==0);check(runDevelopmentDiagnosticsTests()==0);check(runDevelopmentFrameTraceTests()==0);check(runDisplayDiagnosticLinesTests()==0);check(runTrustedPairingTests()==0);check(runConnectionNotificationTests()==0);check(runSingleConnectionNotificationTests()==0);check(runAppAppearancePreferencesTests()==0);check(runSourcePreferencesConnectionTests()==0);check(runAppWindowPresentationPolicyTests()==0);check(runConnectedWindowVisibilityTests()==0);check(runSavedScreenLayoutTests()==0);check(Relay.verifyDeviceLayoutPersistenceForTests());check(runSessionAutoResumeTests()==0);check(runSessionSuspensionOriginTests()==0);check(Relay.verifySessionSuspensionOriginsForTests());check(runAutomaticReconnectBackoffTests()==0);check(runBridgeRecoverySchedulingTests()==0);check(runLockedTransportPolicyTests()==0);check(runAuthenticatedRouteHintTests()==0);check(runFastReconnectPolicyTests()==0);check(Relay.verifyLockedTransportInputBarrierForTests());check(!Relay().receiverWantsCursorHidden);ScreenArrangementDragTests.run();check(Relay.verifyReceiverRecoveryBlocksStartForTests());check(Relay.verifyReceiverInputCleanupBlocksLifecycleForTests());check(Relay.verifyReceiverPhysicalInputCancelsActivationForTests());try dockProtocolTests();try appGesturePacketTests();print("PASS gesture memory classification and system stream ordering; no posting") } catch {
         fputs("FAIL \(error)\n", stderr)
         exit(1)
       }
