@@ -11,11 +11,14 @@ if [ -z "$SLOT" ]; then echo 'Both compiler slots occupied; retry after another 
 trap 'rmdir "$SLOT"' EXIT
 mkdir -p "$SCRATCH"
 GENERATED="$SCRATCH/TransitionMotionOverloadMain.swift"
+SOURCE="$SCRATCH/ThunderControl-baseline.swift"
+# This negative control intentionally characterizes .36; current replay is covered by --self-test.
+git -C "$ROOT" show d33ca488d60e180a6d52ea836395a9306b4a3760:ThunderControl.swift > "$SOURCE"
 BINARY="$SCRATCH/transition-motion-overload"
-grep -Fq 'private let pending = DispatchSemaphore(value: 128)' "$ROOT/ThunderControl.swift"
+grep -Fq 'private let pending = DispatchSemaphore(value: 128)' "$SOURCE"
 cat "$ROOT/Tests/TransitionMotionOverloadRegression.swift.inc" > "$GENERATED"
-sed -n '/^  func enqueue(_ input: Wire) -> Bool {$/,/^  @discardableResult$/p' "$ROOT/ThunderControl.swift" | sed '$d' >> "$GENERATED"
-sed -n '/^  private func flushEntryMotion(token:String)->Bool {$/,/^  private func handleSourceGesture(/p' "$ROOT/ThunderControl.swift" | sed '$d' >> "$GENERATED"
+sed -n '/^  func enqueue(_ input: Wire) -> Bool {$/,/^  @discardableResult$/p' "$SOURCE" | sed '$d' >> "$GENERATED"
+sed -n '/^  private func flushEntryMotion(token:String)->Bool {$/,/^  private func handleSourceGesture(/p' "$SOURCE" | sed '$d' >> "$GENERATED"
 cat >> "$GENERATED" <<'SWIFT'
 }
 @main struct Run {

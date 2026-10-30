@@ -570,6 +570,7 @@ func runLocalTCPRelayIntegrationTests() throws {
     try runLocalTCPRemainingRecovery(sides: sides)
     try runLocalTCPLeaseKinds(sides: sides)
     try runLocalTCPOutboundCancellation(sides: sides)
+    try runLocalTCPReplayReleaseEOF(sides: sides)
     try runLocalTCPOutboundReconnect(sides: sides)
     print("PASS local TCP Relay integration. Primed legacy and negotiated lifecycle suites completed; discovery and physical Thunderbolt remain outside this fixture. All input and cursor effects are injected record-only APIs.")
 }
@@ -910,4 +911,24 @@ private func runLocalTCPLeaseKinds(sides: LocalTCPSides) throws {
         try f.finish()
         print("PASS local TCP freshness lease rejects current-sequence \(kind) before native input")
     }
+}
+
+private func runLocalTCPReplayReleaseEOF(sides:LocalTCPSides) throws {
+    let f=try LocalTCPFixture(sides:sides,enrollment:false)
+    defer {try? f.finish()}
+    try f.send(f.packet(type:10))
+    let before=f.input.plans.count
+    try localTCPRequire(f.input.plans.last?.type==10,"admitted keydown reached actual record-only HID receiver")
+    let release=try f.packet(type:11)
+    try localTCPRequire(f.sender.stageReplayReleaseForLocalTCPTests(map:f.map,point:f.point,token:f.token,release:release),"matching keyup source-owned in bounded replay capture stage")
+    f.sender.forceLocal()
+    try localTCPRequire(f.senderContext.cancelled,"forceLocal cancels replay context before discarding staged up")
+    try localTCPPump(until:{f.result.done},"receiver observed replay cancellation EOF")
+    f.receiver.stop(reason:"local TCP EOF cleanup")
+    let cleanup=Array(f.input.plans.dropFirst(before))
+    try localTCPRequire(cleanup.filter{$0.type==11 && $0.keyCode==0}.count==1,"actual EOF stop cleanup releases admitted key exactly once after staged up discard")
+    let posts=f.input.totalPosts
+    f.receiver.stop()
+    try localTCPRequire(f.input.totalPosts==posts,"repeated receiver EOF cleanup is idempotent")
+    print("PASS local TCP actual receiver EOF cleanup admitted-down/staged-up; captured up discarded only after context cancellation")
 }

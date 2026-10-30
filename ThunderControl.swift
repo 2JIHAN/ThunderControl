@@ -1290,6 +1290,155 @@ final class Relay {
   private var lastSessionPoll = 0.0
   private var pendingForegroundToken: String?
   private var entryMotion=EntryMotionBuffer()
+  private final class ReplayWake {
+    private let bits:UnsafeMutablePointer<Int32>
+    init(){bits = .allocate(capacity:1);bits.initialize(to:0)}
+    deinit{bits.deinitialize(count:1);bits.deallocate()}
+    func setActive(_ value:Bool) {
+      while true {
+        let old=OSAtomicAdd32Barrier(0,bits)
+        let next=value ? old | 1:old & ~1
+        if OSAtomicCompareAndSwap32Barrier(old,next,bits) {return}
+      }
+    }
+    func request()->Bool {
+      while true {
+        let old=OSAtomicAdd32Barrier(0,bits)
+        guard old & 1 != 0,old & 2 == 0 else{return false}
+        if OSAtomicCompareAndSwap32Barrier(old,old | 2,bits) {return true}
+      }
+    }
+    func consume() {
+      while true {
+        let old=OSAtomicAdd32Barrier(0,bits)
+        if OSAtomicCompareAndSwap32Barrier(old,old & ~2,bits) {return}
+      }
+    }
+  }
+  private final class DesktopReplay {
+    struct Live {var frame:Wire;let delta:CGVector}
+    let token:String
+    let generation:UUID
+    let context:SessionContext
+    let revision:UInt64
+    let flags:CGEventFlags
+    let deadline:Double
+    let moves:[(dx:Double,dy:Double)]
+    var next=0
+    var live:[Live]=[]
+    var liveNext=0
+    var bytes=0
+    init(token:String,generation:UUID,context:SessionContext,revision:UInt64,flags:CGEventFlags,moves:[(dx:Double,dy:Double)]) {
+      self.token=token;self.generation=generation;self.context=context;self.revision=revision;self.flags=flags;self.moves=moves
+      deadline=ProcessInfo.processInfo.systemUptime+1
+    }
+    var empty:Bool {next==moves.count && liveNext==live.count}
+  }
+  private var desktopReplay:DesktopReplay?
+  private let replayWake=ReplayWake()
+  private var replayRecordWriterForTests:((Wire)->Void)?
+  private func hintReplayCapacity() {
+    guard replayWake.request() else{return}
+    DispatchQueue.main.async { [weak self] in
+      guard let self else{return}
+      self.replayWake.consume()
+      self.pumpDesktopReplay()
+    }
+  }
+  private func abortDesktopReplay() {
+    guard let replay=desktopReplay else{return}
+    desktopReplay=nil
+    replayWake.setActive(false)
+    replay.context.cancel(reason:"Desktop replay cancelled")
+  }
+  private func replayAnchorMatches(_ replay:DesktopReplay)->Bool {
+    desktopReplay === replay && generation==replay.generation && context === replay.context && !replay.context.cancelled &&
+      handoff.phase == .remote && handoff.token==replay.token && desktopHandoffRevision==replay.revision &&
+      receiverDesktop?.revision==replay.revision && multiDisplayDesktopCompatible && !bridgeInputSuspended &&
+      displayBarrier==nil && !lockedTransportOnly &&
+      (!bridgeRecoveryCompatible || bridgeLease.sourceFresh(now:ProcessInfo.processInfo.systemUptime))
+  }
+  private func replayValid(_ replay:DesktopReplay)->Bool {
+    replayAnchorMatches(replay) && desktopFocusSafety && replayAnchorMatches(replay)
+  }
+  private func acceptCapturedDesktopInput(_ frame:Wire,delta:CGVector)->Bool {
+    if let replay=desktopReplay {
+      guard replayValid(replay),ProcessInfo.processInfo.systemUptime<replay.deadline,
+        let data=frame.data,data.count<=4096,replay.live.count<64,replay.bytes+data.count<=65536,
+        frame.kind=="event",let raw=frame.raw,standard.contains(raw) else{return false}
+      replay.live.append(.init(frame:frame,delta:delta));replay.bytes+=data.count
+      return true
+    }
+    guard let desktop=receiverDesktop,let previous=desktopGlobalPointer else{return false}
+    let point=DesktopHandoffRouting.moved(previous,delta:delta,desktop:desktop)
+    var outgoing=frame;outgoing.desktopGlobalX=point.x;outgoing.desktopGlobalY=point.y
+    switch nativeAdmission(outgoing) {
+    case .admitted:desktopGlobalPointer=point;return true
+    case .suppressed:return true
+    case .capacity,.rejected:return false
+    }
+  }
+  private func pumpDesktopReplay() {
+    guard let replay=desktopReplay else{return}
+    guard replayValid(replay) else{stop(reason:"Desktop replay authority changed");return}
+    if replay.empty && !ownership.ready(handoff.token,held:!localKeys.isEmpty || !localButtons.isEmpty || !localFlags.isEmpty || dockSource.active || sourceGesture.remoteActive) {
+      desktopReplay=nil;replayWake.setActive(false);finishReturnIfDrained();return
+    }
+    guard ProcessInfo.processInfo.systemUptime<replay.deadline else{stop(reason:"Desktop replay deadline expired");return}
+    var visited=0
+    while visited<128 {
+      guard replayAnchorMatches(replay),ProcessInfo.processInfo.systemUptime<replay.deadline,let desktop=receiverDesktop,let previous=desktopGlobalPointer else{stop(reason:"Desktop replay authority or deadline changed");return}
+      if replay.empty {
+        if ownership.ready(handoff.token,held:!localKeys.isEmpty || !localButtons.isEmpty || !localFlags.isEmpty || dockSource.active || sourceGesture.remoteActive) {
+          guard pending.wait(timeout:.now()) == .success else{return}
+          pending.signal()
+        }
+        desktopReplay=nil;replayWake.setActive(false);finishReturnIfDrained();return
+      }
+      visited+=1
+      var frame:Wire
+      let point:CGPoint
+      let prefix=replay.next<replay.moves.count
+      if prefix {
+        let move=replay.moves[replay.next]
+        if move.dx==0 && move.dy==0 {replay.next+=1;continue}
+        point=DesktopHandoffRouting.moved(previous,delta:CGVector(dx:move.dx,dy:move.dy),desktop:desktop)
+        if let flush=desktopFocusFlushForTests {
+          let accepted=flush()
+          guard desktopReplay === replay else{return}
+          guard accepted else{stop(reason:"Desktop replay test flush rejected");return}
+          desktopGlobalPointer=point;replay.next+=1;continue
+        }
+        guard let event=CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:point,mouseButton:.left) else{stop(reason:"Cannot construct desktop replay");return}
+        event.flags=replay.flags
+        event.setDoubleValueField(.mouseEventDeltaX,value:move.dx);event.setDoubleValueField(.mouseEventDeltaY,value:move.dy)
+        guard let data=event.data else{stop(reason:"Cannot encode desktop replay");return}
+        frame=Wire(kind:"event",session:session,sequence:0,raw:5,data:data as Data,token:replay.token,desktopMapRevision:replay.revision,desktopGlobalX:point.x,desktopGlobalY:point.y)
+      } else {
+        let live=replay.live[replay.liveNext]
+        point=DesktopHandoffRouting.moved(previous,delta:live.delta,desktop:desktop)
+        frame=live.frame;frame.desktopGlobalX=point.x;frame.desktopGlobalY=point.y
+      }
+      guard ProcessInfo.processInfo.systemUptime<replay.deadline else{stop(reason:"Desktop replay deadline expired before admission");return}
+      let result=nativeAdmission(frame)
+      guard desktopReplay === replay else{return}
+      switch result {
+      case .admitted:
+        desktopGlobalPointer=point
+        if prefix {replay.next+=1} else {replay.liveNext+=1}
+      case .capacity:return
+      case .suppressed,.rejected:stop(reason:"Desktop replay admission rejected");return
+      }
+    }
+    if replay.empty {
+      if ownership.ready(handoff.token,held:!localKeys.isEmpty || !localButtons.isEmpty || !localFlags.isEmpty || dockSource.active || sourceGesture.remoteActive) {
+        guard pending.wait(timeout:.now()) == .success else{return}
+        pending.signal()
+      }
+      desktopReplay=nil;replayWake.setActive(false);finishReturnIfDrained()
+    } else {hintReplayCapacity()}
+  }
+
   private var returnMotion=ReturnMotionCarry()
   private var activationRestorePending=false
   private var returnStartedAt:Double?
@@ -1597,6 +1746,18 @@ final class Relay {
     sessionSnapshot=SessionSafetySnapshot(onConsole:true,loginDone:true,screenLocked:false)
     lastSessionPoll=ProcessInfo.processInfo.systemUptime
     if session.isEmpty { session=UUID().uuidString }
+  }
+  func stageReplayReleaseForLocalTCPTests(map:ReceiverDesktop,point:CGPoint,token:String,release:Wire)->Bool {
+    prepareLocalTCPSafetyForTests()
+    guard let ctx=context else{return false}
+    multiDisplayDesktopCompatible=true;receiverDesktop=map;desktopHandoffRevision=map.revision;desktopGlobalPointer=point
+    handoff.phase = .remote;handoff.token=token;auto=true;desktopFocusSafetyForTests={true}
+    desktopReplay=DesktopReplay(token:token,generation:generation,context:ctx,revision:map.revision,flags:[],moves:[(dx:1,dy:0)])
+    replayWake.setActive(true)
+    ownership.accepted(.key(0),down:true,suppressed:true)
+    guard acceptCapturedDesktopInput(release,delta:.zero) else{return false}
+    ownership.accepted(.key(0),down:false,suppressed:true)
+    return true
   }
   func holdLocalTCPWriterForTests(entered:DispatchSemaphore,released:DispatchSemaphore) {
     prepareLocalTCPSafetyForTests()
@@ -2309,6 +2470,7 @@ final class Relay {
   }
   @discardableResult
   func restoreLocal(deferActivation:Bool=false,useReturnCarry:Bool=false) -> Bool {
+    if desktopReplay != nil {abortDesktopReplay();ownership.force();sourceSystemKeys=SystemControlKeyState()}
     let wasTransferred = handoff.phase != .local
     recoveryNonce = UUID()
     let nonce = recoveryNonce
@@ -2347,6 +2509,7 @@ final class Relay {
     return result.recovered && visibilityRecovered
   }
   func forceLocal() {
+    abortDesktopReplay()
     cancelDesktopFocusRestore()
     ownership.force()
     sourceSystemKeys=SystemControlKeyState()
@@ -2361,6 +2524,7 @@ final class Relay {
     tap = nil
   }
   func finishReturnIfDrained() {
+    if desktopReplay != nil {return}
     guard
       ownership.ready(
         handoff.token, held: !localKeys.isEmpty || !localButtons.isEmpty || !localFlags.isEmpty || dockSource.active || sourceGesture.remoteActive),
@@ -2385,6 +2549,7 @@ final class Relay {
     }
   }
   func configureAuto(_ enabled: Bool, edge: Edge) {
+    if desktopReplay != nil {forceLocal()}
     guard !bridgeInputSuspended else{auto=false;forward=false;return}
     guard displayBarrier == nil else{if !enabled {cancelDesktopFocusRestore();_ = restoreLocal()};auto=false;forward=false;return}
     guard !lockedTransportOnly else{auto=false;forward=false;return}
@@ -2737,6 +2902,7 @@ final class Relay {
     return sawCancellationBeforeCallback && !recovery.needsRecovery && context.cancelled
   }
   func stop(reason:String="Local Stop") {
+    abortDesktopReplay()
     bridgeRecovery=BridgeInputRecovery();bridgeGrace=BridgeLinkGrace();bridgeRecoveryCompatible=false;bridgeResetTokens.removeAll();bridgeLease=BridgeInputLease();lastLeaseSent=0
     if desktopObserverActive {DesktopInjectionEpoch.shared.release();desktopObserverActive=false}
     desktopValidatedEpoch=nil
@@ -3076,6 +3242,7 @@ final class Relay {
         self.pauseSourceForForegroundLoss()
         return
       }
+      if self.desktopReplay != nil {self.pumpDesktopReplay();guard self.generation==g else{return}}
       _ = self.detectReceiverMapTransition()
       self.tickDisplayTopologyTransition()
       guard self.generation==g else{return}
@@ -3497,24 +3664,28 @@ final class Relay {
     CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
     CGEvent.tapEnable(tap: t, enable: true)
   }
+  private enum NativeAdmission {case admitted, capacity, suppressed, rejected}
   @discardableResult
-  func enqueue(_ input: Wire) -> Bool {
+  func enqueue(_ input:Wire)->Bool {
+    switch nativeAdmission(input) {case .admitted,.suppressed:return true;case .capacity,.rejected:return false}
+  }
+  private func nativeAdmission(_ input: Wire) -> NativeAdmission {
     // No sequence is allocated for suppressed input; queued frames remain in
     // order ahead of linkReset/linkReady and are discarded by the peer gate.
-    if bridgeInputSuspended,!["ping","available","linkReset","linkReady","inputLease","displayPreference"].contains(input.kind) {return true}
-    if displayBarrier != nil,["event","dock","appGesture","begin","ready","commit","active","return","returnAck"].contains(input.kind) {return false}
+    if bridgeInputSuspended,!["ping","available","linkReset","linkReady","inputLease","displayPreference"].contains(input.kind) {return .suppressed}
+    if displayBarrier != nil,["event","dock","appGesture","begin","ready","commit","active","return","returnAck"].contains(input.kind) {return .rejected}
     if lockedTransportOnly {
-      guard lockedTransportEligible,lockedTransportOutgoingAllowed(input) else{return false}
+      guard lockedTransportEligible,lockedTransportOutgoingAllowed(input) else{return .rejected}
     } else if let reason = currentSessionBlockReason() {
       sessionBecameUnsafe(reason,origin:polledSessionSuspensionOrigin)
-      return false
+      return .rejected
     }
-    guard let k=key,let socket=connection,let ctx=context else {lastEnqueueFailure="No authenticated transport";return false}
-    guard !ctx.cancelled else {lastEnqueueFailure=ctx.terminalReason ?? "Transport already cancelled";connectionLog("TX rejected: \(self.lastEnqueueFailure)");return false}
-    guard pending.wait(timeout:.now()) == .success else {lastEnqueueFailure="Output queue full";connectionLog("TX rejected: output queue full");return false}
+    guard let k=key,let socket=connection,let ctx=context else {lastEnqueueFailure="No authenticated transport";return .rejected}
+    guard !ctx.cancelled else {lastEnqueueFailure=ctx.terminalReason ?? "Transport already cancelled";connectionLog("TX rejected: \(self.lastEnqueueFailure)");return .rejected}
+    guard pending.wait(timeout:.now()) == .success else {lastEnqueueFailure="Output queue full";connectionLog("TX rejected: output queue full");return .capacity}
     var w = input
     if bridgeRecoveryCompatible,sender,BridgeInputLease.inputKinds.contains(w.kind) {
-      guard bridgeLease.sourceFresh(now:ProcessInfo.processInfo.systemUptime),let lease=bridgeLease.latest else{pending.signal();lastEnqueueFailure="Input freshness expired during dispatch";return false}
+      guard bridgeLease.sourceFresh(now:ProcessInfo.processInfo.systemUptime),let lease=bridgeLease.latest else{pending.signal();lastEnqueueFailure="Input freshness expired during dispatch";return .rejected}
       w.inputLease=lease
     }
     w.sequence = seq
@@ -3523,10 +3694,14 @@ final class Relay {
       precondition(CommandLine.arguments.contains("--self-test") && CommandLine.arguments.contains("--local-tcp-relay-integration-test"))
       w=transform(w)
     }
+    if let record=replayRecordWriterForTests {
+      precondition(CommandLine.arguments.contains("--self-test"))
+      record(w);return .admitted
+    }
     traceGesture(stage:.txQueued,packet:w)
     let g = generation
     out.async {
-      defer { self.pending.signal() }
+      defer { self.pending.signal(); self.hintReplayCapacity() }
       guard !ctx.cancelled else { return }
       do { try sendFrame(socket.fd, seal(w, k));self.traceGesture(stage:.txWritten,packet:w) } catch {
         let reason = safeConnectionError(error)
@@ -3539,7 +3714,7 @@ final class Relay {
         }
       }
     }
-    return true
+    return .admitted
   }
   @discardableResult
   func control(
@@ -3846,13 +4021,10 @@ final class Relay {
       (allowed(type.rawValue, !auto && experimental && gestureCompatible) || (systemControlKeysCompatible && systemKey != nil)),
       validFields(e, type.rawValue), let d = e.data as Data?
     else { return false }
-    if remote && multiDisplayDesktopCompatible {
-      guard let desktop=receiverDesktop,let revision=desktopHandoffRevision,revision==desktop.revision,let previous=desktopGlobalPointer,let portal=desktopPortal else{forceLocal();return ownership.filter(input,down:down,repeatKey:e.getIntegerValueField(.keyboardEventAutorepeat) != 0)}
-      if [5,6,7,27].contains(type.rawValue) {
-        let delta=CGVector(dx:e.getDoubleValueField(.mouseEventDeltaX),dy:e.getDoubleValueField(.mouseEventDeltaY))
-        _ = portal // Return point and portal are supplied only by authenticated receiver return.
-        desktopGlobalPointer=DesktopHandoffRouting.moved(previous,delta:delta,desktop:desktop)
-      }
+    let desktopInput=remote && multiDisplayDesktopCompatible
+    let desktopDelta=[UInt32(5),6,7,27].contains(type.rawValue) ? CGVector(dx:e.getDoubleValueField(.mouseEventDeltaX),dy:e.getDoubleValueField(.mouseEventDeltaY)):CGVector.zero
+    if desktopInput {
+      guard let desktop=receiverDesktop,let revision=desktopHandoffRevision,revision==desktop.revision,desktopGlobalPointer != nil,desktopPortal != nil else{forceLocal();return ownership.filter(input,down:down,repeatKey:e.getIntegerValueField(.keyboardEventAutorepeat) != 0)}
     } else if remote && [5, 6, 7, 27].contains(type.rawValue) {
       returnMotion.observe(edge:selectedEdge,x:handoff.x,width:handoff.width,dx:e.getDoubleValueField(.mouseEventDeltaX),now:ProcessInfo.processInfo.systemUptime,held:held || type != .mouseMoved)
       handoff.relative(
@@ -3866,7 +4038,7 @@ final class Relay {
       y: remote ? handoff.y / (handoff.height - 1) : (e.location.y - b.minY) / b.height,
       token: remote ? handoff.token : nil)
     if multiDisplayDesktopCompatible {w.x=nil;w.y=nil;w.desktopGlobalX=desktopGlobalPointer.map{Double($0.x)};w.desktopGlobalY=desktopGlobalPointer.map{Double($0.y)};w.desktopMapRevision=desktopHandoffRevision}
-    guard enqueue(w) else {
+    guard (desktopInput ? acceptCapturedDesktopInput(w,delta:desktopDelta):enqueue(w)) else {
       stop()
       status("Output backpressure: local restored")
       // The failed frame was not accepted. A previously owned release still must not leak locally.
@@ -3878,25 +4050,92 @@ final class Relay {
     if remote { finishReturnIfDrained() }
     return remote
   }
+  static func verifyDesktopReplayForTests()->Bool {
+    precondition(CommandLine.arguments.contains("--self-test"))
+    final class Cursor:CursorRecoveryAPI {
+      func associate(_ value:Bool)->CGError {.success}
+      func hide(display:CGDirectDisplayID)->CGError {.success}
+      func show(display:CGDirectDisplayID)->CGError {.success}
+      func warp(to:CGPoint)->CGError {.success}
+    }
+    let map=ReceiverDesktop(revision:7,mainID:1,displays:[ReceiverDisplay(id:1,bounds:CGRect(x:0,y:0,width:400,height:400))])
+    func make()->Relay {
+      let r=Relay(cursorResources:CursorRecoveryController(api:Cursor()),receiverCursor:CursorVisibilityController(api:Cursor()))
+      let socket=OwnedSocket(-1)
+      r.sender=true;r.context=SessionContext(socket);r.connection=socket;r.key=SymmetricKey(size:.bits256)
+      r.safetyObserversInstalled=true;r.gestureTrace.setEnabled(false)
+      r.sessionSnapshot=SessionSafetySnapshot(onConsole:true,loginDone:true,screenLocked:false);r.lastSessionPoll=Double.greatestFiniteMagnitude
+      r.desktopFocusSafetyForTests={true};r.multiDisplayDesktopCompatible=true;r.receiverDesktop=map;r.desktopHandoffRevision=7
+      r.desktopGlobalPointer=CGPoint(x:1,y:10);r.auto=true;r.handoff.phase = .remote;r.handoff.token="replay"
+      r.desktopReplay=DesktopReplay(token:"replay",generation:r.generation,context:r.context!,revision:7,flags:.maskShift,moves:(0..<2048).map{(dx:1,dy:$0.isMultiple(of:2) ? -30:30)})
+      r.replayWake.setActive(true)
+      return r
+    }
+    let r=make();var frames=[Wire]();r.replayRecordWriterForTests={frames.append($0)}
+    var focusChecks=0;r.desktopFocusSafetyForTests={focusChecks+=1;return true}
+    var released=0
+    r.pumpDesktopReplay()
+    guard frames.count==128,r.desktopReplay?.next==128,!r.context!.cancelled,focusChecks==1 else{return false}
+    let original=r.desktopGlobalPointer
+    let live=Wire(kind:"event",session:r.session,sequence:0,raw:5,data:Data([1]),token:"replay",desktopMapRevision:7)
+    guard r.acceptCapturedDesktopInput(live,delta:CGVector(dx:-200,dy:50)),r.desktopGlobalPointer==original else{return false}
+    r.ownership.accepted(.key(12),down:true,suppressed:true)
+    r.ownership.accepted(.key(12),down:false,suppressed:true)
+    var expected=CGPoint(x:1,y:10)
+    var expectedTrace=[CGPoint]()
+    for i in 0..<2048 {expected=DesktopHandoffRouting.moved(expected,delta:CGVector(dx:1,dy:i.isMultiple(of:2) ? -30:30),desktop:map);expectedTrace.append(expected)}
+    expected=DesktopHandoffRouting.moved(expected,delta:CGVector(dx:-200,dy:50),desktop:map)
+    for _ in 0..<32 {for _ in 0..<128 {r.pending.signal();released+=1};r.pumpDesktopReplay();if r.desktopReplay==nil {break}}
+    guard frames.count==2049,r.desktopReplay==nil,r.desktopGlobalPointer==expected,
+      frames.enumerated().allSatisfy({$0.element.sequence==UInt64($0.offset+1)}),
+      expectedTrace.enumerated().allSatisfy({frames[$0.offset].desktopGlobalX==$0.element.x && frames[$0.offset].desktopGlobalY==$0.element.y}) else{return false}
+    for _ in released..<frames.count {r.pending.signal()}
+    for _ in 0..<128 {guard r.pending.wait(timeout:.now()) == .success else{return false}}
+    guard r.pending.wait(timeout:.now()) == .timedOut else{return false}
+    for _ in 0..<128 {r.pending.signal()}
+    for input in [RemoteInputOwnership.Input.key(12),.modifier(56),.button(0)] {
+      var owned=RemoteInputOwnership();owned.accepted(input,down:true,suppressed:true);owned.force()
+      guard owned.filter(input,down:false,repeatKey:false) else{return false}
+      owned.accepted(input,down:true,suppressed:true);owned.accepted(input,down:false,suppressed:true);owned.force()
+      guard !owned.blocked else{return false}
+    }
+    let cancelled=make()
+    let actual=cancelled.context!
+    cancelled.replayRecordWriterForTests={_ in cancelled.abortDesktopReplay()}
+    cancelled.pumpDesktopReplay();cancelled.pending.signal();cancelled.replayRecordWriterForTests=nil
+    guard cancelled.desktopReplay==nil,actual.cancelled,cancelled.desktopGlobalPointer==CGPoint(x:1,y:10) else{return false}
+    let fresh=make();let freshContext=fresh.context!;var freshFocus=true;var freshSubmitted=0
+    fresh.desktopFocusSafetyForTests={freshFocus};fresh.replayRecordWriterForTests={_ in freshSubmitted+=1}
+    defer {for _ in 0..<freshSubmitted {fresh.pending.signal()}}
+    fresh.pumpDesktopReplay();freshFocus=false;fresh.pumpDesktopReplay()
+    guard freshContext.cancelled,fresh.context==nil,fresh.desktopReplay==nil else{return false}
+    let bounded=make()
+    for _ in 0..<64 {guard bounded.acceptCapturedDesktopInput(live,delta:.zero) else{return false}}
+    guard !bounded.acceptCapturedDesktopInput(live,delta:.zero),bounded.desktopReplay?.live.count==64 else{return false}
+    bounded.abortDesktopReplay()
+    let bytes=make();var large=live;large.data=Data(repeating:0,count:4096)
+    for _ in 0..<16 {guard bytes.acceptCapturedDesktopInput(large,delta:.zero) else{return false}}
+    guard !bytes.acceptCapturedDesktopInput(large,delta:.zero),bytes.desktopReplay?.bytes==65536 else{return false}
+    bytes.abortDesktopReplay()
+    let wake=ReplayWake();wake.setActive(true);guard wake.request() else{return false}
+    for _ in 0..<1000 {wake.setActive(false);wake.setActive(true);guard !wake.request() else{return false}}
+    wake.consume();guard wake.request() else{return false}
+    print("PASS actual Relay bounded replay, ordered live pointer, sequences, ownership, reentrant abort and lifetime wake; record-only writer, no receiver EOF proof")
+    return true
+  }
   private func boundsForEntry()->CGRect {topology?.bounds ?? CGDisplayBounds(CGMainDisplayID())}
   private func flushEntryMotion(token:String)->Bool {
     guard let moves=entryMotion.takeMoves(token:token) else{return true}
-    guard let lastMove=moves.last(where:{$0.dx != 0 || $0.dy != 0}) else{return true}
-    guard handoff.phase == .remote,handoff.token==token,desktopFocusSafety else{stop(reason:"Transition motion ownership invalid");return false}
+    guard handoff.phase == .remote,handoff.token==token else{stop(reason:"Transition motion ownership invalid");return false}
     if multiDisplayDesktopCompatible {
-      guard let desktop=receiverDesktop,desktop.revision==desktopHandoffRevision,var p=desktopGlobalPointer else{stop(reason:"Desktop transition map unavailable");return false}
-      for move in moves where move.dx != 0 || move.dy != 0 {
-        let delta=CGVector(dx:move.dx,dy:move.dy)
-        // Do not cache speculative crossings: receiver-local held input can block them.
-        p=DesktopHandoffRouting.moved(p,delta:delta,desktop:desktop)
-        if let flush=desktopFocusFlushForTests {guard flush() else{return false};continue}
-        guard let event=CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:p,mouseButton:.left) else{stop(reason:"Cannot construct desktop transition motion");return false}
-        event.flags=CGEventSource.flagsState(.hidSystemState).subtracting(heldModifierMask)
-        event.setDoubleValueField(.mouseEventDeltaX,value:move.dx);event.setDoubleValueField(.mouseEventDeltaY,value:move.dy)
-        guard let data=event.data,enqueue(Wire(kind:"event",session:session,sequence:0,raw:5,data:data as Data,token:token,desktopMapRevision:desktopHandoffRevision,desktopGlobalX:p.x,desktopGlobalY:p.y)) else{stop(reason:"Desktop transition flush failed");return false}
-      }
-      desktopGlobalPointer=p;return true
+      guard desktopReplay==nil,let desktop=receiverDesktop,desktop.revision==desktopHandoffRevision,desktopGlobalPointer != nil,let ctx=context,!ctx.cancelled else{stop(reason:"Desktop transition map unavailable");return false}
+      desktopReplay=DesktopReplay(token:token,generation:generation,context:ctx,revision:desktop.revision,flags:CGEventSource.flagsState(.hidSystemState).subtracting(heldModifierMask),moves:moves)
+      replayWake.setActive(true)
+      pumpDesktopReplay()
+      return !ctx.cancelled
     }
+    guard desktopFocusSafety else{stop(reason:"Transition motion ownership invalid");return false}
+    guard let lastMove=moves.last(where:{$0.dx != 0 || $0.dy != 0}) else{return true}
     for move in moves {handoff.relative(move.dx,move.dy)}
     guard let event=CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:.zero,mouseButton:.left) else{stop(reason:"Cannot construct transition motion frame");return false}
     event.flags=CGEventSource.flagsState(.hidSystemState).subtracting(heldModifierMask)
@@ -6040,7 +6279,7 @@ struct ThunderControlMain {
       check(runDisplayRuntimePresentationTests()==0)
       check(runDisplayRuntimeViewerModeTests()==0)
       #endif
-      do { try tests();check(runLocalizationTests()==0);check(runConcurrentDisplayTests()==0);check(runReceiverDesktopRelayTests()==0);check(runReceiverDesktopTests()==0);check(runSavedDesktopPlacementTests()==0);check(runReceiverDesktopUITests()==0);check(runDesktopMapTransitionTests()==0);check(runDesktopHandoffRoutingTests()==0);check(runDesktopEntryPolicyTests()==0);check(runDisplayHeartbeatTests()==0);check(runDisplayTrustTests()==0);check(runDisplayRemoteInputTests()==0);check(runDisplayTransportTests()==0);check(runDisplayCadenceTests()==0);check(runDisplayFramePacingTests()==0);check(runDisplayVideoFormatTests()==0);check(runSavedSharingStateTests()==0);check(runAutomaticSharingResumeTests()==0);check(runSharingLifecycleIntegrationTests()==0);check(runDisplayPreferenceTests()==0);check(runUpdateReleaseTests()==0);check(runSavedVirtualDisplayPlacementTests()==0);check(runVirtualDisplayPlacementSessionTests()==0);check(runDisplayVideoDecoderTests()==0);check(runDisplayDecodeWorkerTests()==0);check(runScrollReplayTests()==0);check(runDiscoveryRecoveryPolicyTests()==0);check(runNativeGestureTests()==0);check((runDockTransferStateTests()+runDesktopSystemGestureTests())==0);check(runTransitionMotionTests()==0);check(runGestureTraceTests()==0);check(runCursorVisibilityTests()==0);check(runConnectedLayoutTests()==0);check(runCursorModeProtocolTests()==0);ReceiverCursorFocusTests.run();check(runAutomaticConnectionPolicyTests()==0);check(runBridgeLinkRecoveryTests()==0);check(runCableReconnectPolicyTests()==0);check(runReceiverFocusRetryTests()==0);check(runReturnWarpResumeTests()==0);check(runDiagnosticStoreTests()==0);check(runDevelopmentDiagnosticsTests()==0);check(runDevelopmentFrameTraceTests()==0);check(runDisplayDiagnosticLinesTests()==0);check(runTrustedPairingTests()==0);check(runConnectionNotificationTests()==0);check(runSingleConnectionNotificationTests()==0);check(runAppAppearancePreferencesTests()==0);check(runSourcePreferencesConnectionTests()==0);check(runAppWindowPresentationPolicyTests()==0);check(runConnectedWindowVisibilityTests()==0);check(runSavedScreenLayoutTests()==0);check(Relay.verifyDeviceLayoutPersistenceForTests());check(runSessionAutoResumeTests()==0);check(runSessionSuspensionOriginTests()==0);check(Relay.verifySessionSuspensionOriginsForTests());check(runAutomaticReconnectBackoffTests()==0);check(runBridgeRecoverySchedulingTests()==0);check(runLockedTransportPolicyTests()==0);check(runAuthenticatedRouteHintTests()==0);check(runFastReconnectPolicyTests()==0);check(Relay.verifyLockedTransportInputBarrierForTests());check(!Relay().receiverWantsCursorHidden);ScreenArrangementDragTests.run();check(Relay.verifyReceiverRecoveryBlocksStartForTests());check(Relay.verifyReceiverInputCleanupBlocksLifecycleForTests());check(Relay.verifyReceiverPhysicalInputCancelsActivationForTests());try dockProtocolTests();try appGesturePacketTests();print("PASS gesture memory classification and system stream ordering; no posting") } catch {
+      do { try tests();check(runLocalizationTests()==0);check(runConcurrentDisplayTests()==0);check(runReceiverDesktopRelayTests()==0);check(runReceiverDesktopTests()==0);check(runSavedDesktopPlacementTests()==0);check(runReceiverDesktopUITests()==0);check(runDesktopMapTransitionTests()==0);check(runDesktopHandoffRoutingTests()==0);check(runDesktopEntryPolicyTests()==0);check(runDisplayHeartbeatTests()==0);check(runDisplayTrustTests()==0);check(runDisplayRemoteInputTests()==0);check(runDisplayTransportTests()==0);check(runDisplayCadenceTests()==0);check(runDisplayFramePacingTests()==0);check(runDisplayVideoFormatTests()==0);check(runSavedSharingStateTests()==0);check(runAutomaticSharingResumeTests()==0);check(runSharingLifecycleIntegrationTests()==0);check(runDisplayPreferenceTests()==0);check(runUpdateReleaseTests()==0);check(runSavedVirtualDisplayPlacementTests()==0);check(runVirtualDisplayPlacementSessionTests()==0);check(runDisplayVideoDecoderTests()==0);check(runDisplayDecodeWorkerTests()==0);check(runScrollReplayTests()==0);check(runDiscoveryRecoveryPolicyTests()==0);check(runNativeGestureTests()==0);check((runDockTransferStateTests()+runDesktopSystemGestureTests())==0);check(runTransitionMotionTests()==0);check(Relay.verifyDesktopReplayForTests());check(runGestureTraceTests()==0);check(runCursorVisibilityTests()==0);check(runConnectedLayoutTests()==0);check(runCursorModeProtocolTests()==0);ReceiverCursorFocusTests.run();check(runAutomaticConnectionPolicyTests()==0);check(runBridgeLinkRecoveryTests()==0);check(runCableReconnectPolicyTests()==0);check(runReceiverFocusRetryTests()==0);check(runReturnWarpResumeTests()==0);check(runDiagnosticStoreTests()==0);check(runDevelopmentDiagnosticsTests()==0);check(runDevelopmentFrameTraceTests()==0);check(runDisplayDiagnosticLinesTests()==0);check(runTrustedPairingTests()==0);check(runConnectionNotificationTests()==0);check(runSingleConnectionNotificationTests()==0);check(runAppAppearancePreferencesTests()==0);check(runSourcePreferencesConnectionTests()==0);check(runAppWindowPresentationPolicyTests()==0);check(runConnectedWindowVisibilityTests()==0);check(runSavedScreenLayoutTests()==0);check(Relay.verifyDeviceLayoutPersistenceForTests());check(runSessionAutoResumeTests()==0);check(runSessionSuspensionOriginTests()==0);check(Relay.verifySessionSuspensionOriginsForTests());check(runAutomaticReconnectBackoffTests()==0);check(runBridgeRecoverySchedulingTests()==0);check(runLockedTransportPolicyTests()==0);check(runAuthenticatedRouteHintTests()==0);check(runFastReconnectPolicyTests()==0);check(Relay.verifyLockedTransportInputBarrierForTests());check(!Relay().receiverWantsCursorHidden);ScreenArrangementDragTests.run();check(Relay.verifyReceiverRecoveryBlocksStartForTests());check(Relay.verifyReceiverInputCleanupBlocksLifecycleForTests());check(Relay.verifyReceiverPhysicalInputCancelsActivationForTests());try dockProtocolTests();try appGesturePacketTests();print("PASS gesture memory classification and system stream ordering; no posting") } catch {
         fputs("FAIL \(error)\n", stderr)
         exit(1)
       }
