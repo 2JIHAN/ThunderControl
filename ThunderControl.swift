@@ -2941,7 +2941,6 @@ final class Relay {
       r.keys=[0];r.buttons=[0]
       failCleanup=true
       r.stop()
-      // This is the same aggregate used by applicationShouldTerminate, without NSApp.
       guard r.hasUnresolvedLocalRecovery,r.receiverCleanupPending,opens==1,closes==0,
         r.hidInputPoster.hasGlobalStateToRestore,
         restoreOnly ? (r.keys.isEmpty && r.buttons.isEmpty) : (r.keys==[0] && r.buttons==[0]) else{return false}

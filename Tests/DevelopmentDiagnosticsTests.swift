@@ -295,7 +295,6 @@ import Darwin
         let cloudDevice = cloud.appendingPathComponent("ThunderControl-진단").appendingPathComponent(try own(mirroredRoot).lastPathComponent)
         check(try fm.contentsOfDirectory(atPath: cloudDevice.path).contains(where: { $0.hasPrefix("chunk-") }), "new chunk mirrored")
         check(mirrored.snapshotForTests()["cloudLastSuccessfulLocalCopy"] != nil, "local cloud copy timestamp, not delivery claim")
-        // Reopened immutable fake-cloud files exercise the actual byte-verification read.
         let gatedRoot = temp.appendingPathComponent("cloud-gated-local")
         let seed = DevelopmentDiagnostics(root: gatedRoot)
         seed.start(role: "source", stream: stream)
@@ -468,7 +467,6 @@ import Darwin
         let stream = String(repeating: "0123456789abcdef", count: 4)
         recorder.start(role: "viewer", stream: stream)
         try recorder.flushForTests()
-        // Matches requestRendererMetrics' quality-tier, renderer-health snapshot.
         let producer: [String: Double] = [
             "available": 1, "sampleTime": 100, "totalNumberOfFrames": 60,
             "numberOfDroppedFrames": 1, "numberOfCorruptedFrames": 0,

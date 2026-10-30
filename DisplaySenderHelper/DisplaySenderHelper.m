@@ -105,7 +105,7 @@
 static const size_t MaxPayload=4*1024*1024;
 static const uint64_t BoundedOwnedInvalidNS=5000000000ULL; // 5s
 static const uint64_t BoundedProofStaleNS=250000000ULL;    // 250ms owned proof freshness (stale proof only pauses submit; no need to relax)
-static const uint64_t BoundedOwnedValidationNS=5000000000ULL; // A single owned-only query has a declared 5s progress limit.
+static const uint64_t BoundedOwnedValidationNS=5000000000ULL;
 static const double   BoundedHeartbeatSec=5.0;             // parent sends 0.5s heartbeats through pauses; keep tight hung-parent cutoff
 static atomic_uint inFlight=0,maximumInFlight=0;
 static atomic_bool topologyArmed=false,ownedValid=false;
@@ -502,7 +502,6 @@ static uint64_t OwnedValidationNowNS(void){
   if(clock_gettime(CLOCK_MONOTONIC,&now))Fail("owned validation clock");
   return (uint64_t)now.tv_sec*1000000000ULL+(uint64_t)now.tv_nsec;
 }
-// The supervisor reads only this progress boundary, never CG or publishMutex.
 static BOOL OwnedValidationFatal(uint64_t nowNS){
   uint64_t startedNS=atomic_load(&ownedValidationStartedNS);
   return startedNS && nowNS>startedNS && nowNS-startedNS>BoundedOwnedValidationNS;
@@ -1822,7 +1821,6 @@ static int SelfTest(void){
   CHECK(!BoundedHeartbeatFatal(0,5),"heartbeat-non-fatal-at-5s-boundary");
   CHECK(BoundedHeartbeatFatal(0,5.001),"heartbeat-fatal-just-past-5s");
 
-  // Parent map remains valid; only the native reader is blocked. No CG or wall-clock wait.
   validationTestEntered=dispatch_semaphore_create(0);validationTestRelease=dispatch_semaphore_create(0);
   dispatch_semaphore_t validationDone=dispatch_semaphore_create(0);
   const uint64_t queryStart=1000000000ULL;

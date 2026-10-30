@@ -1,6 +1,5 @@
 import Foundation
 
-// These stand-ins record production flush/enqueue calls without querying or posting OS input.
 enum Edge { case left, right
   func outward(_ dx: Double) -> Bool { self == .right ? dx > 0 : dx < 0 }
 }

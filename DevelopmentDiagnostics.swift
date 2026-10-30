@@ -368,7 +368,6 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
         catch { localError = true }
     }
     private func mirror(force: Bool = false) {
-        // Local retained chunks are the retry queue. Only one bounded snapshot may leave this queue.
         let files: [(String, Int64, Double)]
         do { files = try Self.chunkFiles(directory) } catch { mirrorError = true; mirrorMissCount += 1; return }
         mirrorKnown.formIntersection(Set(files.map { $0.0 }))
@@ -394,7 +393,6 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
             let result = Self.copyMirror(snapshot, manifest: manifest, cloudRoot: cloudRoot, deviceID: deviceID,
                                          wall: wall, maxAge: maxAge, diskBytes: diskBytes, beforeRead: readBarrier)
             self.queue.async {
-                // Only this queue changes status. A completed old job never installs its captured context.
                 self.mirrorInFlight = false
                 self.mirrorDisabled = result.disabled; self.mirrorError = result.failed
                 self.mirrorMissCount += result.misses; self.cloudEvictions += result.evictions
