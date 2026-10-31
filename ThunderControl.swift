@@ -3900,13 +3900,15 @@ final class Relay {
     guard e.getIntegerValueField(.eventSourceUserData) != marker,
       e.getIntegerValueField(.eventSourceUnixProcessID) != Int64(getpid())
     else { return false }
+    let code=CGKeyCode(truncatingIfNeeded:e.getIntegerValueField(.keyboardEventKeycode))
+    // System UI flag synchronization has no modifier key and must not revoke remote ownership.
+    let isLocalInput = type != .flagsChanged || code == 57 || modifierDescriptors[code] != nil
     if !sender {
-      let code=CGKeyCode(truncatingIfNeeded:e.getIntegerValueField(.keyboardEventKeycode))
       if type == .flagsChanged,let down=modifierDown(code,flags:e.flags) {
         if down {receiverPhysicalModifiers.insert(code)} else {receiverPhysicalModifiers.remove(code)}
       }
       if type == .flagsChanged,code == 57 {hidInputPoster.preserveLocalCaps(e.flags)}
-      if hidInputPoster.isSelected && (type == .keyDown || type == .keyUp || type == .flagsChanged || [1,2,3,4,25,26].contains(type.rawValue)) {
+      if hidInputPoster.isSelected && isLocalInput && (type == .keyDown || type == .keyUp || type == .flagsChanged || [1,2,3,4,25,26].contains(type.rawValue)) {
         if type == .keyDown {localKeys.insert(code)}
         if type == .keyUp {localKeys.remove(code)}
         let button=e.getIntegerValueField(.mouseEventButtonNumber)
@@ -3926,7 +3928,7 @@ final class Relay {
       let elapsed=ProcessInfo.processInfo.systemUptime-started
       if elapsed>=0 && elapsed<2 {connectionLog("Source return first unmarked move ms=\(elapsed*1000)")}
     }
-    if !sender,cursorVisibilityCompatible,sourceAutoCursorMode,(standard.contains(type.rawValue) || systemKey != nil) {
+    if !sender,isLocalInput,cursorVisibilityCompatible,sourceAutoCursorMode,(standard.contains(type.rawValue) || systemKey != nil) {
       let wasHidden=receiverCursor.isHidden
       receiverLocalCursorOverride(reason:"physical-input")
       guard !receiverCursor.needsRecovery else{safetyStop("Receiver local input cursor recovery failed");return false}
@@ -3940,7 +3942,6 @@ final class Relay {
     if let handled=handleSourceGesture(e) {return handled}
     if let handled=handleDockGesture(e) {return handled}
     if sender,context != nil,[UInt32(29),30].contains(type.rawValue) {gestureTrace.recordNative(stage:.txRejected,event:e)}
-    let code = CGKeyCode(truncatingIfNeeded: e.getIntegerValueField(.keyboardEventKeycode))
     if sender, type == .flagsChanged, modifierDescriptors[code] != nil,
       modifierDown(code, flags: e.flags) == nil
     {
