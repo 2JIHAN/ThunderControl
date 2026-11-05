@@ -113,7 +113,16 @@ final class DiagnosticStore: @unchecked Sendable {
   }
   // destination is an existing selected folder. Publish one unique child directory
   // by rename, so readers never observe a partially written export. No overwrite.
-  func export(to directory: URL) throws {
+  func export(to directory: URL, additionalFiles: [String: Data] = [:]) throws {
+    var extraChunkBytes = 0
+    for (name, data) in additionalFiles {
+      guard name == "development-manifest.json" || name.range(of: "^development-chunk-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-[0-9]{8}\\.jsonl$", options: .regularExpression) != nil,
+        data.count <= 512 * 1024, !name.contains("\n"), !name.contains("\r") else { throw StoreError.unsafePath }
+      if name != "development-manifest.json" {
+        guard data.count <= 64 * 1024 * 1024 - extraChunkBytes else { throw StoreError.unsafePath }
+        extraChunkBytes += data.count
+      }
+    }
     try queue.sync {
       try drainPending()
       let snapshot = try snapshotLocked()
@@ -131,6 +140,7 @@ final class DiagnosticStore: @unchecked Sendable {
         for name in ["connection", "gesture"] {
           try Self.writeNew(fd, name + ".log", snapshot[name]!)
         }
+        for (name, data) in additionalFiles { try Self.writeNew(fd, name, data) }
         let health = self.health
         let manifest: [String: Any] = ["formatVersion": 1, "createdAt": ISO8601DateFormatter().string(from: Date()),
           "segmentBytes": segmentBytes, "channelCapBytes": segmentBytes * 2,
@@ -145,7 +155,7 @@ final class DiagnosticStore: @unchecked Sendable {
         guard renameatx_np(parent, staging, parent, final, UInt32(RENAME_EXCL)) == 0 else { throw StoreError.io(errno) }
       } catch {
         // Only files this export created in its exclusive private staging directory.
-        for name in ["connection.log", "gesture.log", "manifest.json"] { _ = unlinkat(fd, name, 0) }
+        for name in ["connection.log", "gesture.log", "manifest.json"] + Array(additionalFiles.keys) { _ = unlinkat(fd, name, 0) }
         _ = unlinkat(parent, staging, AT_REMOVEDIR)
         throw error
       }

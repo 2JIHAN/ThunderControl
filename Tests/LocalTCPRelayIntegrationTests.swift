@@ -196,7 +196,7 @@ private func localTCPRunPairing(sides: LocalTCPSides, senderSession: String, rec
         try localTCPRequire(approvalCount == 0, "no PIN approval on reconnect")
     }
     for (socket, session, kind) in [(a, senderSession, "sender-hello-v5"), (b, receiverSession, "receiver-hello-v5")] {
-        try sendFrame(socket.fd, seal(Wire(concurrentDisplayCodec: 1, kind: kind, session: session, sequence: 0, multiDisplayDesktopCodec: 1, desktopGestureCodec: 1, bridgeRecoveryCodec: 1), senderKey.value!))
+        try sendFrame(socket.fd, seal(Wire(concurrentDisplayCodec: 1, kind: kind, session: session, sequence: 0, osBuild: systemBuildIdentifier(), appGestureCodec: 1, multiDisplayDesktopCodec: 1, desktopGestureCodec: 1, bridgeRecoveryCodec: 1, desktopAppGestureCodec: 1), senderKey.value!))
     }
     let atSender = try unseal(readFrame(a.fd), senderKey.value!)
     let atReceiver = try unseal(readFrame(b.fd), receiverKey.value!)
@@ -363,7 +363,7 @@ private final class LocalTCPFixture {
         }
         let relay = receiver, conn = connection, ctx = context, output = result, generation = receiver.generation
         DispatchQueue.global(qos: .userInitiated).async {
-            var validator = PeerValidator(senderPeer: true, session: conn.senderSession, concurrentDisplaySupported: true, multiDisplayDesktopSupported: true, desktopGesturesSupported: mode == .negotiated, bridgeRecoverySupported: mode == .negotiated)
+            var validator = PeerValidator(senderPeer: true, session: conn.senderSession, concurrentDisplaySupported: true, multiDisplayDesktopSupported: true, desktopGesturesSupported: mode == .negotiated, desktopAppGesturesSupported: mode == .negotiated && conn.senderHello.desktopAppGestureCodec == 1 && AppGestureCodec.compatible(build: conn.senderHello.osBuild, codec: conn.senderHello.appGestureCodec), bridgeRecoverySupported: mode == .negotiated)
             do {
                 try relay.runAuthenticatedStream(fd: conn.receiver.fd, incomingKey: conn.outgoing, validator: &validator, context: ctx, generation: generation)
                 output.complete(nil)
@@ -901,7 +901,7 @@ private func runLocalTCPLeaseKinds(sides: LocalTCPSides) throws {
                 event.setIntegerValueField(CGEventField(rawValue: 110)!, value: 8)
                 event.setIntegerValueField(CGEventField(rawValue: 132)!, value: 1)
                 event.setDoubleValueField(CGEventField(rawValue: 113)!, value: 0)
-                wire = Wire(kind: kind, session: f.connection.senderSession, sequence: 0, raw: 29, data: event.data! as Data, x: 0.1, y: 0.4, token: f.token, appGesture: NativeGestureDescriptor(kind: .pinch, phase: .began), appGestureID: UUID().uuidString, appGestureCodec: 1)
+                wire = Wire(kind: kind, session: f.connection.senderSession, sequence: 0, raw: 29, data: event.data! as Data, token: f.token, appGesture: NativeGestureDescriptor(kind: .pinch, phase: .began), appGestureID: UUID().uuidString, appGestureCodec: 1, desktopMapRevision: map.revision, desktopGlobalX: f.point.x, desktopGlobalY: f.point.y, desktopGestureTargetID: 11)
                 try localTCPRequire(AppGestureCodec.decode(wire) != nil, "valid synthetic app gesture before lease mutation")
             }
             try localTCPRequire(f.sender.enqueue(wire), "lease-kind frame enqueued")

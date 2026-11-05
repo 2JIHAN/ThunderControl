@@ -29,6 +29,11 @@ import Darwin
                 try Data(contentsOf: url).split(separator: 10).map { try JSONSerialization.jsonObject(with: Data($0)) as! [String: Any] }
             }
         }
+        check(DevelopmentDiagnostics().cloudRoot == nil, "production default has no cloud root")
+        check(DevelopmentDiagnostics(cloudRoot: temp).cloudRoot == nil, "production root cannot enable cloud mirroring")
+        let unused = DevelopmentDiagnostics(root: temp.appendingPathComponent("unused"))
+        check(try unused.exportSnapshot().isEmpty, "unused local logger exports nothing without creating files")
+        check(!fm.fileExists(atPath: temp.appendingPathComponent("unused").path), "unused export creates no diagnostic data")
         // record() deliberately drops rather than waiting for ingress.try(). A
         // fixture requiring a persisted row must first establish acceptance, unlike
         // load, overflow and explicit contention tests whose attempts stay exact.
@@ -249,6 +254,15 @@ import Darwin
         var bytes = 0
         for url in files { let n = try Data(contentsOf: url).count; bytes += n; check(n <= 900, "chunk byte cap") }
         check(bytes <= 2200 && (rotation.snapshotForTests()["retentionEvictions"] as? Int64 ?? 0) > 0, "device disk budget enforced")
+        let localExport = try rotation.exportSnapshot()
+        check(localExport["development-manifest.json"] != nil, "local export includes fresh development manifest")
+        let exportedChunks = localExport.filter { $0.key.hasSuffix(".jsonl") }
+        check(!exportedChunks.isEmpty && exportedChunks.values.reduce(0) { $0 + $1.count } <= 2200, "export preserves retained chunks within local byte cap")
+
+        let restarted = DevelopmentDiagnostics(root: rotationRoot, diskBytes: 2200)
+        let restartExport = try restarted.exportSnapshot()
+        check(restartExport.filter { $0.key.hasSuffix(".jsonl") } == exportedChunks, "restarted unused logger exports prior-run chunks before start")
+        check(restarted.cloudRoot == nil && restarted.snapshotForTests()["mirrorMissCount"] as? Int64 == 0, "local-only mode records no cloud failures")
         let unknown = try own(rotationRoot).appendingPathComponent("user-notes.jsonl")
         try Data("preserve me".utf8).write(to: unknown)
         date = date.addingTimeInterval(901)

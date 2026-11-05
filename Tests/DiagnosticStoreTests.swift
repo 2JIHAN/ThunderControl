@@ -36,11 +36,33 @@ func runDiagnosticStoreTests() -> Int {
     }
     let attrs = try fm.attributesOfItem(atPath: logs.path)
     check((attrs[.posixPermissions] as! NSNumber).intValue == 0o700, "directory mode 0700")
+    let development = DevelopmentDiagnostics(root: root.appendingPathComponent("development"), diskBytes: 2048)
+    let developmentStream = String(repeating: "0123456789abcdef", count: 4)
+    development.start(role: "viewer", stream: developmentStream)
+    try development.flushForTests()
+    for _ in 0..<32 {
+      development.record(stage: "frame", sequence: 42, stream: developmentStream)
+      try development.flushForTests()
+      if (development.snapshotForTests()["written"] as? Int64 ?? 0) > 0 { break }
+    }
+    let developmentFiles = try development.exportSnapshot()
+    check(developmentFiles.keys.contains(where: { $0.hasSuffix(".jsonl") }), "development snapshot contains event chunks")
+    check(developmentFiles.filter { $0.key.hasSuffix(".jsonl") }.values.reduce(0) { $0 + $1.count } <= 2048, "development snapshot retains configured cap")
+    defer { _ = development.shutdown() }
     let output = root.appendingPathComponent("exports")
     try fm.createDirectory(at: output, withIntermediateDirectories: false)
-    try store.export(to: output)
+    try store.export(to: output, additionalFiles: developmentFiles)
     let published = try fm.contentsOfDirectory(at: output, includingPropertiesForKeys: nil)
     check(published.count == 1 && !published[0].lastPathComponent.hasPrefix("."), "one atomic published export")
+    for (name, data) in developmentFiles {
+      check(try Data(contentsOf: published[0].appendingPathComponent(name)) == data, "combined export includes exact development snapshot")
+    }
+    for unsafeName in ["../escape", "/escape", "manifest.json", "development-chunk-invalid.jsonl", "development-manifest.json/escape"] {
+      do { try store.export(to: output, additionalFiles: [unsafeName: Data()]); check(false, "unsafe additional path rejected") } catch { }
+    }
+    do { try store.export(to: output, additionalFiles: ["development-manifest.json": Data(repeating: 0, count: 512 * 1024 + 1)]); check(false, "oversized extra file rejected") } catch { }
+    check(try fm.contentsOfDirectory(at: output, includingPropertiesForKeys: nil).count == 1, "invalid exports create no staging or output")
+
     let exportedConnection = try Data(contentsOf: published[0].appendingPathComponent("connection.log"))
     let exportedGesture = try Data(contentsOf: published[0].appendingPathComponent("gesture.log"))
     check(exportedConnection == snap["connection"] && exportedGesture == unicode, "export matches queue-consistent snapshot")

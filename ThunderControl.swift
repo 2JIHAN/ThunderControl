@@ -167,17 +167,18 @@ struct Wire: Codable {
   var displayPreferenceCodec:Int? = nil
   var displayPreference:Bool? = nil
   var desktopGestureTargetID:UInt32? = nil
+  var desktopAppGestureCodec:Int? = nil
 }
 struct DesktopSystemGestureTarget:Equatable {
   let revision:UInt64
   let displayID:UInt32
   static func attach(_ input:Wire,desktop:ReceiverDesktop,revision:UInt64,point:CGPoint)->Wire? {
-    guard input.kind=="dock",desktop.valid,desktop.revision==revision,revision>0,
+    guard (input.kind=="dock" || (input.kind=="appGesture" && input.appGesture?.kind == .pinch)),desktop.valid,desktop.revision==revision,revision>0,
       let display=desktop.displays.first(where:{ReceiverDesktop.has($0.bounds,point)}) else{return nil}
     var w=input;w.desktopMapRevision=revision;w.desktopGlobalX=Double(point.x);w.desktopGlobalY=Double(point.y);w.desktopGestureTargetID=display.id;return w
   }
   static func resolve(_ w:Wire,desktop:ReceiverDesktop,revision:UInt64,previous:CGPoint)->Self? {
-    guard w.kind=="dock",let point=DesktopHandoffRouting.point(w,desktop:desktop,revision:revision),point==previous,
+    guard (w.kind=="dock" || (w.kind=="appGesture" && w.appGesture?.kind == .pinch)),let point=DesktopHandoffRouting.point(w,desktop:desktop,revision:revision),point==previous,
       let id=w.desktopGestureTargetID,let display=desktop.displays.first(where:{$0.id==id}),ReceiverDesktop.has(display.bounds,point) else{return nil}
     return Self(revision:revision,displayID:id)
   }
@@ -268,12 +269,25 @@ enum AppGestureCodec {
   static func compatible(build:String?,codec:Int?)->Bool {
     supported && codec == 1 && build != nil && build == systemBuildIdentifier()
   }
+  static func validCoordinates(_ w:Wire)->Bool {
+    guard w.desktopPortalSide==nil,w.desktopPortalTargetID==nil,w.desktopPortalIntervalStart==nil,w.desktopPortalIntervalEnd==nil,
+      w.desktopPortalSourceOriginX==nil,w.desktopPortalSourceOriginY==nil,w.desktopPortalSourceWidth==nil,w.desktopPortalSourceHeight==nil,
+      w.desktopPortalTargetOriginX==nil,w.desktopPortalTargetOriginY==nil,w.desktopPortalTargetWidth==nil,w.desktopPortalTargetHeight==nil else{return false}
+    if w.desktopGestureTargetID != nil || w.desktopMapRevision != nil || w.desktopGlobalX != nil || w.desktopGlobalY != nil {
+      guard w.appGesture?.kind == .pinch,w.x==nil,w.y==nil,
+        let id=w.desktopGestureTargetID,id != 0,let revision=w.desktopMapRevision,revision>0,
+        let x=w.desktopGlobalX,let y=w.desktopGlobalY else{return false}
+      return x.isFinite && y.isFinite && abs(x)<=ReceiverDesktop.coordinateLimit && abs(y)<=ReceiverDesktop.coordinateLimit
+    }
+    guard let x=w.x,let y=w.y else{return false}
+    return x.isFinite && y.isFinite && (0...1).contains(x) && (0...1).contains(y)
+  }
   static func decode(_ w:Wire)->CGEvent? {
     guard w.kind == "appGesture",w.appGestureCodec == 1,
       let descriptor=w.appGesture,descriptor.valid,
       let id=w.appGestureID,UUID(uuidString:id)?.uuidString == id,
       let token=w.token,UUID(uuidString:token)?.uuidString == token,
-      let x=w.x,let y=w.y,x.isFinite,y.isFinite,(0...1).contains(x),(0...1).contains(y),
+      validCoordinates(w),
       let raw=w.raw,[UInt32(29),30].contains(raw),
       let data=w.data,!data.isEmpty,data.count <= maximumDataSize,
       let event=CGEvent(withDataAllocator:nil,data:data as CFData),
@@ -348,7 +362,8 @@ struct Validator {
   mutating func accept(_ w: Wire) throws {
     if session == nil {
       guard w.kind == "hello", w.sequence == 0, let id = UUID(uuidString: w.session),
-        id.uuidString == w.session, w.data == nil
+        id.uuidString == w.session, w.data == nil,
+        (w.desktopAppGestureCodec==nil || w.desktopAppGestureCodec==0 || w.desktopAppGestureCodec==1)
       else { throw Failure("Invalid hello") }
       session = w.session
       next = 1
@@ -526,6 +541,7 @@ struct PeerValidator {
   var concurrentDisplaySupported=false
   var multiDisplayDesktopSupported=false
   var desktopGesturesSupported=false
+  var desktopAppGesturesSupported=false
   var displayPreferenceSupported=false
   var systemControlKeysSupported=false
   var bridgeRecoverySupported=false
@@ -533,6 +549,7 @@ struct PeerValidator {
     guard w.session == session, w.sequence == next, next < UInt64.max else {
       throw Failure("Replay or sequence mismatch")
     }
+    guard w.desktopAppGestureCodec==nil else{throw Failure("Unexpected desktop app gesture capability")}
     guard w.bridgeRecoveryCodec==nil else{throw Failure("Unexpected bridge recovery capability")}
     if ["linkReset","linkReady","inputLease"].contains(w.kind) {
       guard bridgeRecoverySupported,(w.kind != "inputLease" || !senderPeer),BridgeInputRecovery.validEnvelope(w) else{throw Failure("Invalid bridge recovery envelope")}
@@ -556,7 +573,7 @@ struct PeerValidator {
     guard w.videoQualityCodec == nil else{throw Failure("Unexpected video quality capability")}
     guard w.concurrentDisplayCodec == nil else{throw Failure("Unexpected display capability")}
     guard w.multiDisplayDesktopCodec == nil,w.desktopGestureCodec==nil else{throw Failure("Unexpected desktop coordinate capability")}
-    if w.desktopGestureTargetID != nil {guard w.kind=="dock",senderPeer,multiDisplayDesktopSupported,desktopGesturesSupported,w.desktopGestureTargetID != 0 else{throw Failure("Unexpected system gesture target")}}
+    if w.desktopGestureTargetID != nil {guard ((w.kind=="dock" && desktopGesturesSupported) || (w.kind=="appGesture" && desktopAppGesturesSupported)),senderPeer,multiDisplayDesktopSupported,w.desktopGestureTargetID != 0 else{throw Failure("Unexpected system gesture target")}}
     if w.kind=="dock",multiDisplayDesktopSupported {guard desktopGesturesSupported,w.desktopGestureTargetID != nil,w.desktopMapRevision != nil,w.desktopGlobalX != nil,w.desktopGlobalY != nil else{throw Failure("System gesture target capability required")}}
     // Collect new 4-edge handoff fields; they are only valid on begin and
     // event packets when the new capability was negotiated. On any other
@@ -571,7 +588,7 @@ struct PeerValidator {
     let hasDesktopRevision:Bool = w.desktopMapRevision != nil
     if hasDesktopPortalFields || hasDesktopGlobal || hasDesktopRevision {
       guard multiDisplayDesktopSupported else { throw Failure("Desktop portal fields without capability") }
-      guard w.kind == "begin" || w.kind == "event" || (w.kind == "dock" && desktopGesturesSupported) || (w.kind == "return" && !senderPeer) else { throw Failure("Desktop fields on invalid kind") }
+      guard w.kind == "begin" || w.kind == "event" || ((w.kind == "dock" && desktopGesturesSupported) || (w.kind == "appGesture" && desktopAppGesturesSupported)) || (w.kind == "return" && !senderPeer) else { throw Failure("Desktop fields on invalid kind") }
     }
     if hasDesktopPortalFields {
       // Begin-only full portal attestation. All eight portal + two interval +
@@ -595,7 +612,7 @@ struct PeerValidator {
       _ = (side,tid,gx,gy)
     } else if hasDesktopGlobal || hasDesktopRevision {
       // Event path: both coords present, revision present.
-      guard (w.kind == "event" || (w.kind == "dock" && desktopGesturesSupported)),
+      guard (w.kind == "event" || ((w.kind == "dock" && desktopGesturesSupported) || (w.kind == "appGesture" && desktopAppGesturesSupported))),
         let gx = w.desktopGlobalX, gx.isFinite,
         let gy = w.desktopGlobalY, gy.isFinite,
         w.desktopMapRevision != nil else { throw Failure("Incomplete desktop global coord") }
@@ -624,6 +641,7 @@ struct PeerValidator {
     }
     guard w.appGestureCodec == nil || w.appGestureCodec == 0 || w.appGestureCodec == 1 else{throw Failure("Invalid app codec")}
     if w.kind == "appGesture" {
+      if multiDisplayDesktopSupported {guard desktopAppGesturesSupported,w.desktopGestureTargetID != nil else{throw Failure("Desktop app gesture capability required")}}
       guard AppGestureCodec.decode(w) != nil,w.dock == nil,w.dockID == nil else{throw Failure("Invalid app gesture envelope")}
     } else if w.kind == "event" {
       guard w.raw != nil, let d = w.data, !d.isEmpty,
@@ -1037,6 +1055,16 @@ final class Relay {
   private var receiverAppGestureAvailable = false
   private var sourceGesture = SourceGestureState()
   private var receiverAppGesture = ReceiverGestureState()
+  private struct AppDesktopBinding:Equatable {
+    let id:String
+    let target:DesktopSystemGestureTarget
+    func continues(_ descriptor:NativeGestureDescriptor,current:Self?)->Bool {
+      if let current {return current==self}
+      return descriptor.phase == .mayBegin || descriptor.phase == .began
+    }
+  }
+  private var appSourceDesktopBinding:AppDesktopBinding?
+  private var appReceiverDesktopBinding:AppDesktopBinding?
   func configureAppGestures(_ enabled:Bool) {
     if enabled != appGestureExperimental && (sourceGesture.remoteActive || receiverAppGesture.active) {
       stop(reason:"App gesture consent revoked; lift fingers before reconnecting")
@@ -2122,12 +2150,23 @@ final class Relay {
     desktopPortal=map.portals(sourceRect:CGRect(x:-1200,y:0,width:1200,height:800)).first
     dockReceiver.reset();dockReceiverDesktopTarget=nil;receiverCursorLocalOverride=false
   }
+  func prepareSourceDesktopAppGestureForTests(map:ReceiverDesktop,point:CGPoint,token:String,negotiated:Bool=true) {
+    sender=true;auto=true;multiDisplayDesktopCompatible=true;desktopAppGestureCompatible=negotiated
+    appGestureCompatible=true;appGestureExperimental=true;receiverAppGestureAvailable=true
+    handoff.phase = .remote;handoff.token=token
+    receiverDesktop=map;desktopHandoffRevision=map.revision;desktopGlobalPointer=point
+    sourceGesture=SourceGestureState();appSourceDesktopBinding=nil
+  }
+  func handleSourceAppGestureForTests(_ event:CGEvent)->Bool? {handleSourceGesture(event)}
+  func updateDesktopAppGesturePointerForTests(_ point:CGPoint) {
+    desktopGlobalPointer=point;desktopReceiverPreviousPointer=point
+  }
   var appGesturePermissionForTests:(()->Bool)?
   var appGesturePostForTests:((CGEvent)->Void)?
   func prepareDesktopAppGestureForTests(map:ReceiverDesktop,point:CGPoint,token:String,negotiated:Bool=true) {
     prepareDesktopSystemGestureForTests(map:map,point:point,token:token)
     desktopAppGestureCompatible=negotiated;appGestureCompatible=true;appGestureExperimental=true
-    receiverAppGesture.reset()
+    receiverAppGesture.reset();appReceiverDesktopBinding=nil
   }
   private var dockLocalActive=false
   private var dockOrphanMotion:Int?
@@ -2500,7 +2539,7 @@ final class Relay {
     noteRecovery(result)
     if dockSource.active {dockOrphanMotion=dockSource.motion}
     dockSource.reset();dockReceiver.reset();dockSourceDesktopTarget=nil;dockReceiverDesktopTarget=nil;postedDockStream=nil
-    sourceGesture.forceLocal();receiverAppGesture.reset()
+    sourceGesture.forceLocal();receiverAppGesture.reset();appSourceDesktopBinding=nil;appReceiverDesktopBinding=nil
     _ = handoff.reset()
     releaseInputs()
     if sender && (wasTransferred || activationRestorePending) && result.recovered {
@@ -2917,7 +2956,7 @@ final class Relay {
     desktopValidatedEpoch=nil
     let barrierCompletion=displayBarrierCompletion;displayBarrierCompletion=nil;displayBarrier=nil
     receiverOwnsMapTransition=false;receiverMapPublicationCandidate=nil
-    authenticatedDevicePair=nil;authenticatedSharingPeerHost=nil;peerVideoQualityCompatible=false;systemControlKeysCompatible=false;displayPreferenceCompatible=false;peerDisplayPreference=nil;concurrentDisplayCompatible=false;multiDisplayDesktopCompatible=false;desktopSystemGestureCompatible=false;displayBarrierTokens.removeAll();displayRemoteGeometryTemporary=false;displayRemoteOriginalLayout=nil
+    authenticatedDevicePair=nil;authenticatedSharingPeerHost=nil;peerVideoQualityCompatible=false;systemControlKeysCompatible=false;displayPreferenceCompatible=false;peerDisplayPreference=nil;concurrentDisplayCompatible=false;multiDisplayDesktopCompatible=false;desktopSystemGestureCompatible=false;desktopAppGestureCompatible=false;displayBarrierTokens.removeAll();displayRemoteGeometryTemporary=false;displayRemoteOriginalLayout=nil
     receiverDesktop=nil;sourceOrigin=nil;receiverDesktopAdoptedRevision=0;receiverDesktopAdoptedFingerprint=nil;receiverDesktopPublishRevision=0;receiverDesktopPublishedFingerprint=nil;pendingInitialSourceOriginRestore=false
     // Preserve portal projection until forceLocal consumes it.
     onReceiverDesktopChanged?()
@@ -2944,7 +2983,7 @@ final class Relay {
     receiverGestureAvailable=false
     receiverAppGestureAvailable=false
     appGestureCompatible=false
-    sourceGesture.reset();receiverAppGesture.reset()
+    sourceGesture.reset();receiverAppGesture.reset();appSourceDesktopBinding=nil;appReceiverDesktopBinding=nil
     remoteDisplaySize = nil
     displayGeometryChanged?(nil)
     bridgeCheckInFlight = false
@@ -3484,7 +3523,7 @@ final class Relay {
           seal(
             Wire(
               concurrentDisplayCodec:1,kind: sendMode ? "sender-hello-v5" : "receiver-hello-v5", session: localSession,
-              sequence: 0, os: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,osBuild:systemBuildIdentifier(),gestureCodec:DockGestureCodec.supported ? 1 : 0,appGestureCodec:AppGestureCodec.supported ? 1 : 0,cursorVisibilityCodec:1,peerDisplayName:ConnectionNotificationTracker.displayName(Host.current().localizedName ?? "ThunderControl Mac"),multiDisplayDesktopCodec:1,desktopGestureCodec:DockGestureCodec.supported ? 1:0,systemControlKeyCodec:1,videoQualityCodec:localVideoQualityCodec,bridgeRecoveryCodec:1,displayPreferenceCodec:1), k))
+              sequence: 0, os: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,osBuild:systemBuildIdentifier(),gestureCodec:DockGestureCodec.supported ? 1 : 0,appGestureCodec:AppGestureCodec.supported ? 1 : 0,cursorVisibilityCodec:1,peerDisplayName:ConnectionNotificationTracker.displayName(Host.current().localizedName ?? "ThunderControl Mac"),multiDisplayDesktopCodec:1,desktopGestureCodec:DockGestureCodec.supported ? 1:0,systemControlKeyCodec:1,videoQualityCodec:localVideoQualityCodec,bridgeRecoveryCodec:1,displayPreferenceCodec:1,desktopAppGestureCodec:AppGestureCodec.supported ? 1:0), k))
         var remoteHello = try unseal(readFrame(c), k)
         guard (sendMode || remoteHello.session==pairingScope),remoteHello.kind == (sendMode ? "receiver-hello-v5" : "sender-hello-v5") else {
           throw Failure("Handshake role mismatch")
@@ -3500,6 +3539,7 @@ final class Relay {
         let bridgeRecoveryNegotiated=remoteHello.bridgeRecoveryCodec==1
         let visibilityCompatible=remoteHello.cursorVisibilityCodec==1
         let appCompatible=AppGestureCodec.compatible(build:remoteHello.osBuild,codec:remoteHello.appGestureCodec)
+        let desktopAppGestureNegotiated=multiDisplayDesktopCompatibleNegotiated && appCompatible && remoteHello.desktopAppGestureCodec==1
         remoteHello.kind = "hello"
         var v = Validator()
         try v.accept(remoteHello)
@@ -3511,7 +3551,7 @@ final class Relay {
           k, sender: senderNonce, receiver: receiverNonce, reverse: !sendMode)
         let incomingKey = connectionKey(
           k, sender: senderNonce, receiver: receiverNonce, reverse: sendMode)
-        var peerValidator = PeerValidator(senderPeer: !sendMode, session: remoteHello.session,cursorVisibilitySupported:visibilityCompatible,concurrentDisplaySupported:displayCompatible,multiDisplayDesktopSupported:multiDisplayDesktopCompatibleNegotiated,desktopGesturesSupported:desktopSystemGestureNegotiated,displayPreferenceSupported:displayPreferenceNegotiated,systemControlKeysSupported:systemControlKeysNegotiated,bridgeRecoverySupported:bridgeRecoveryNegotiated)
+        var peerValidator = PeerValidator(senderPeer: !sendMode, session: remoteHello.session,cursorVisibilitySupported:visibilityCompatible,concurrentDisplaySupported:displayCompatible,multiDisplayDesktopSupported:multiDisplayDesktopCompatibleNegotiated,desktopGesturesSupported:desktopSystemGestureNegotiated,desktopAppGesturesSupported:desktopAppGestureNegotiated,displayPreferenceSupported:displayPreferenceNegotiated,systemControlKeysSupported:systemControlKeysNegotiated,bridgeRecoverySupported:bridgeRecoveryNegotiated)
         timeout.tv_sec = 0
         setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         DispatchQueue.main.async {
@@ -3522,7 +3562,7 @@ final class Relay {
           if sendMode,let hint=AuthenticatedRouteHint(pair:confirmedLayoutPair,ipv4:peer,port:port) {_ = AuthenticatedRouteHintStore().save(hint)}
           DisplayPeerRoute.rememberAuthenticatedSocket(c)
           self.authenticatedDevicePair=confirmedLayoutPair;self.authenticatedSharingPeerHost=DisplayPeerRoute.authenticatedSocketHost(c);self.concurrentDisplayCompatible=displayCompatible
-          self.multiDisplayDesktopCompatible=multiDisplayDesktopCompatibleNegotiated;self.desktopSystemGestureCompatible=desktopSystemGestureNegotiated
+          self.multiDisplayDesktopCompatible=multiDisplayDesktopCompatibleNegotiated;self.desktopSystemGestureCompatible=desktopSystemGestureNegotiated;self.desktopAppGestureCompatible=desktopAppGestureNegotiated
           self.systemControlKeysCompatible=systemControlKeysNegotiated
           self.bridgeRecoveryCompatible=bridgeRecoveryNegotiated
           self.peerVideoQualityCompatible=videoQualityNegotiated
@@ -4264,51 +4304,76 @@ final class Relay {
     let route=sourceGesture.route(descriptor,remote:remote,now:ProcessInfo.processInfo.systemUptime)
     if context == nil {removeCaptureIfClean();return route.suppress}
     guard route.forward else{return route.suppress}
-    // Off or unsupported still owns/suppresses the whole stream, never leaks locally.
-    guard !multiDisplayDesktopCompatible,appGestureExperimental,appGestureCompatible,receiverAppGestureAvailable else {
+    guard appGestureExperimental,appGestureCompatible,receiverAppGestureAvailable,
+      !multiDisplayDesktopCompatible || (desktopAppGestureCompatible && descriptor.kind == .pinch) else {
       if descriptor.terminal {finishReturnIfDrained()}
       return true
+    }
+    if multiDisplayDesktopCompatible {
+      guard desktopFocusSafety else{pauseSourceForForegroundLoss();return true}
+      guard desktopReplay==nil else{stop(reason:"App gesture cannot overtake desktop replay");return true}
+    } else {
+      guard NSApp.isActive,sourceOwnershipConfirmed?()==true,currentSessionBlockReason()==nil,
+        AXIsProcessTrusted(),topologyUnchanged(),handoff.width>1,handoff.height>1 else {
+        stop(reason:"App gesture source ownership unavailable");return true
+      }
     }
     guard let outgoing=event.copy() else{stop(reason:"Cannot copy app gesture frame");return true}
     let orphanCodes=Set(ownership.orphans.compactMap{input -> CGKeyCode? in if case .modifier(let key)=input{return key};return nil})
     outgoing.flags=filteredModifierFlags(event.flags,orphanCodes:orphanCodes,ambiguous:ownership.ambiguousModifiers)
-    guard NSApp.isActive,sourceOwnershipConfirmed?()==true,currentSessionBlockReason()==nil,
-      AXIsProcessTrusted(),topologyUnchanged(),
-      let token=handoff.token,let id=route.id,
-      let data=outgoing.data as Data?,!data.isEmpty,data.count<=AppGestureCodec.maximumDataSize,
-      handoff.width>1,handoff.height>1 else {
-      stop(reason:"App gesture source ownership or serialization unavailable");return true
+    guard let token=handoff.token,let id=route.id,
+      let data=outgoing.data as Data?,!data.isEmpty,data.count<=AppGestureCodec.maximumDataSize else {
+      stop(reason:"App gesture serialization unavailable");return true
     }
-    let packet=Wire(kind:"appGesture",session:session,sequence:0,raw:event.type.rawValue,data:data,
-      x:handoff.x/(handoff.width-1),y:handoff.y/(handoff.height-1),token:token,
+    var packet=Wire(kind:"appGesture",session:session,sequence:0,raw:event.type.rawValue,data:data,token:token,
       appGesture:descriptor,appGestureID:id,appGestureCodec:1)
-    guard AppGestureCodec.decode(packet) != nil,enqueue(packet) else {
-      // A failed begin/terminal must not release an unfinished physical gesture locally.
-      if !descriptor.atomic && !descriptor.terminal {
-        sourceGesture.forceLocal()
+    var binding:AppDesktopBinding?
+    if multiDisplayDesktopCompatible {
+      guard let desktop=receiverDesktop,let revision=desktopHandoffRevision,let point=desktopGlobalPointer,
+        let bound=DesktopSystemGestureTarget.attach(packet,desktop:desktop,revision:revision,point:point),
+        let target=DesktopSystemGestureTarget.resolve(bound,desktop:desktop,revision:revision,previous:point) else {
+        stop(reason:"App gesture desktop target unavailable");return true
       }
+      let next=AppDesktopBinding(id:id,target:target)
+      guard next.continues(descriptor,current:appSourceDesktopBinding) else{stop(reason:"App gesture desktop target changed");return true}
+      packet=bound;binding=next
+    } else {packet.x=handoff.x/(handoff.width-1);packet.y=handoff.y/(handoff.height-1)}
+    guard AppGestureCodec.decode(packet) != nil,(desktopEnqueueForTests ?? enqueue)(packet) else {
+      if !descriptor.atomic && !descriptor.terminal {sourceGesture.forceLocal();appSourceDesktopBinding=nil}
       stop(reason:"App gesture frame rejected; lift fingers before reconnecting");return true
     }
+    appSourceDesktopBinding=descriptor.terminal ? nil:binding
     if descriptor.terminal {finishReturnIfDrained()}
     return true
   }
   private func receiveAppGesture(_ packet:Wire) {
-    guard !multiDisplayDesktopCompatible else{return}
-    guard receiverActivationPendingToken == nil,!sender,inject,appGestureExperimental,appGestureCompatible,
-      AXIsProcessTrusted(),currentSessionBlockReason()==nil,topologyUnchanged(),
+    guard !receiverCleanupPending,receiverActivationPendingToken == nil,!sender,inject,appGestureExperimental,appGestureCompatible,
+      (appGesturePermissionForTests?() ?? AXIsProcessTrusted()),currentSessionBlockReason()==nil,
       let token=packet.token,acceptsToken(handoff,token),
       let descriptor=packet.appGesture,let id=packet.appGestureID,
-      let event=AppGestureCodec.decode(packet),let x=packet.x,let y=packet.y,
-      let bounds=topology?.bounds else{traceGesture(stage:.rxRejected,packet:packet);return}
-    guard receiverAppGesture.accept(descriptor,id:id) else {
-      stop(reason:"Invalid app gesture stream ordering");return
+      let event=AppGestureCodec.decode(packet) else{traceGesture(stage:.rxRejected,packet:packet);return}
+    let destination:CGPoint
+    var binding:AppDesktopBinding?
+    if multiDisplayDesktopCompatible {
+      guard desktopAppGestureCompatible,descriptor.kind == .pinch,!receiverCursorLocalOverride,
+        let desktop=currentRoutingDesktop(),let revision=desktopHandoffRevision,
+        let previous=desktopReceiverPreviousPointer,desktopPortal != nil,
+        let target=DesktopSystemGestureTarget.resolve(packet,desktop:desktop,revision:revision,previous:previous) else{traceGesture(stage:.rxRejected,packet:packet);return}
+      let next=AppDesktopBinding(id:id,target:target)
+      guard next.continues(descriptor,current:appReceiverDesktopBinding) else{traceGesture(stage:.rxRejected,packet:packet);return}
+      binding=next;destination=previous
+    } else {
+      guard topologyUnchanged(),let x=packet.x,let y=packet.y,let bounds=topology?.bounds else{return}
+      destination=CGPoint(x:bounds.minX+x*(bounds.width-1),y:bounds.minY+y*(bounds.height-1))
     }
-    // Only public routing metadata is changed; preserve opaque event payload.
-    event.location=CGPoint(x:bounds.minX+x*(bounds.width-1),y:bounds.minY+y*(bounds.height-1))
+    guard finalDesktopInjectionGate() else{return}
+    guard receiverAppGesture.accept(descriptor,id:id) else {stop(reason:"Invalid app gesture stream ordering");return}
+    appReceiverDesktopBinding=descriptor.terminal ? nil:binding
+    event.location=destination
     event.timestamp=DispatchTime.now().uptimeNanoseconds
     event.setIntegerValueField(.eventSourceUserData,value:marker)
     gestureTrace.recordApp(stage:.rxBuilt,descriptor:descriptor,event:event,sequence:packet.sequence,stream:id)
-    event.post(tap:.cgSessionEventTap)
+    if let post=appGesturePostForTests {post(event)} else {event.post(tap:.cgSessionEventTap)}
     gestureTrace.recordApp(stage:.rxPosted,descriptor:descriptor,event:event,sequence:packet.sequence,stream:id)
   }
 
@@ -4636,7 +4701,6 @@ final class Relay {
     if displayBarrier != nil,["event","dock","appGesture"].contains(w.kind) {return}
     if !multiDisplayDesktopCompatible && displayLease != nil && displayBarrier == nil && !topologyUnchanged() {safetyStop("Owned display topology changed before input");return}
     if w.kind == "dock" || w.kind == "appGesture" {traceGesture(stage:.rxDecoded,packet:w)}
-    if multiDisplayDesktopCompatible,w.kind=="appGesture" {return}
     if w.kind == "appGesture" {receiveAppGesture(w);return}
     if w.kind == "dock" {receiveDockGesture(w);return}
     if w.kind != "event" {
@@ -5043,9 +5107,8 @@ final class PasteCommandProbe: NSResponder {
     connectionNotifications.permissionStateChanged = {[weak self] needed in self?.notificationPermissionButton.isHidden = !needed}
     permissionStack.addArrangedSubview(notificationPermissionButton)
     permissionStack.addArrangedSubview(NSButton(title:TCText("Export Diagnostics..."),target:self,action:#selector(exportDiagnostics)))
-    permissionStack.addArrangedSubview(NSTextField(wrappingLabelWithString:TCText("Development video diagnostics start with the authenticated screen connection. Numeric frame stages are saved locally and copied to iCloud when available. No video pixels, typed text, or credentials are recorded.")))
+    permissionStack.addArrangedSubview(NSTextField(wrappingLabelWithString:TCText("Development video diagnostics start with the authenticated screen connection. Numeric frame stages are saved locally with capped retention. Export the diagnostics folder to share them. No video pixels, typed text, or credentials are recorded.")))
     permissionStack.addArrangedSubview(NSButton(title:TCText("Open Development Diagnostics"),target:self,action:#selector(openDevelopmentDiagnostics)))
-    permissionStack.addArrangedSubview(NSButton(title:TCText("Open iCloud Diagnostics"),target:self,action:#selector(openCloudDevelopmentDiagnostics)))
     let stack = NSStackView()
     stack.orientation = .vertical
     stack.alignment = .leading

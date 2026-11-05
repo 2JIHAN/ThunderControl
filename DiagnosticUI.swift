@@ -60,11 +60,6 @@ import ApplicationServices
       let alert=NSAlert();alert.messageText=TCText("Development diagnostics start after the screen connection is authenticated.");alert.beginSheetModal(for:window)
     }
   }
-  @objc func openCloudDevelopmentDiagnostics() {
-    if let url=DevelopmentDiagnostics.shared.cloudDirectoryURL{NSWorkspace.shared.open(url)}else{
-      let alert=NSAlert();alert.messageText=TCText("iCloud diagnostics are not available yet. Local diagnostics remain available; cloud copying retries automatically.");alert.beginSheetModal(for:window)
-    }
-  }
   @objc func exportDiagnostics() {
     let panel=NSOpenPanel();panel.canChooseDirectories=true;panel.canChooseFiles=false
     panel.allowsMultipleSelection=false;panel.canCreateDirectories=true
@@ -73,7 +68,7 @@ import ApplicationServices
       guard result == .OK,let directory=panel.url else{return}
       DispatchQueue.global(qos:.utility).async {
         do {
-          try DiagnosticStore.shared.export(to:directory)
+          try DiagnosticStore.shared.export(to:directory, additionalFiles:DevelopmentDiagnostics.shared.exportSnapshot())
           DispatchQueue.main.async {NSWorkspace.shared.open(directory)}
         } catch {
           DispatchQueue.main.async {

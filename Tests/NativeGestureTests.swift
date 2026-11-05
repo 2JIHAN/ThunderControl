@@ -147,6 +147,63 @@ func runNativeGestureTests() -> Int {
     w.desktopMapRevision=7;w.desktopGlobalX=Double(point.x);w.desktopGlobalY=Double(point.y);w.desktopGestureTargetID=99
     return w
   }
+  func accepts(_ w:Wire,mapMode:Bool=true,negotiated:Bool=true,sender:Bool=true)->Bool {
+    var validator=PeerValidator(senderPeer:sender,session:session,multiDisplayDesktopSupported:mapMode,desktopAppGesturesSupported:negotiated)
+    do{try validator.accept(w);return true}catch{return false}
+  }
+  let envelope=packet(1,0.25,UUID().uuidString)
+  check(AppGestureCodec.decode(envelope) != nil && accepts(envelope),"negotiated complete desktop envelope")
+  check(!accepts(envelope,negotiated:false) && !accepts(envelope,mapMode:false) && !accepts(envelope,sender:false),"capability and role boundaries")
+  var legacy=envelope;legacy.desktopGestureTargetID=nil;legacy.desktopMapRevision=nil;legacy.desktopGlobalX=nil;legacy.desktopGlobalY=nil;legacy.x=0.5;legacy.y=0.5
+  check(accepts(legacy,mapMode:false,negotiated:false) && !accepts(legacy),"legacy normalized codec only outside map mode")
+  for field in 0..<11 {
+    var malformed=envelope
+    switch field {
+    case 0:malformed.desktopGestureTargetID=nil
+    case 1:malformed.desktopMapRevision=nil
+    case 2:malformed.desktopGlobalX=nil
+    case 3:malformed.desktopGlobalY=nil
+    case 4:malformed.desktopGlobalX = .infinity
+    case 5:malformed.desktopGlobalY = .nan
+    case 6:malformed.desktopGestureTargetID=0
+    case 7:malformed.desktopMapRevision=0
+    case 8:malformed.x=0.5;malformed.y=0.5
+    case 9:malformed.desktopPortalSide="left"
+    default:malformed.desktopAppGestureCodec=1
+    }
+    check(!accepts(malformed),"invalid desktop app envelope \(field)")
+  }
+  var hello=Wire(kind:"hello",session:session,sequence:0)
+  hello.desktopAppGestureCodec=1
+  var helloValidator=Validator()
+  check((try? helloValidator.accept(hello)) != nil,"hello advertises independent app capability")
+  do {
+    let key=SymmetricKey(size:.bits256),roundtrip=try unseal(seal(envelope,key),key)
+    check(accepts(roundtrip) && roundtrip.data==envelope.data,"authenticated desktop opaque payload retained")
+  }catch{check(false,"desktop AEAD round trip")}
+  let sourceRelay=Relay()
+  sourceRelay.connectionForTests=OwnedSocket(-1);sourceRelay.contextForTests=SessionContext(OwnedSocket(-1));sourceRelay.keyForTests=SymmetricKey(size:.bits256)
+  sourceRelay.safetyObserversInstalled=true;sourceRelay.gestureTrace.setEnabled(false)
+  sourceRelay.desktopFocusSafetyForTests={true}
+  var sourceFrames=[Wire]()
+  sourceRelay.desktopEnqueueForTests={sourceFrames.append($0);return true}
+  for scalar in [0.25,-0.25] {
+    sourceRelay.prepareSourceDesktopAppGestureForTests(map:map,point:point,token:token)
+    let before=sourceFrames.count
+    for phase:Int64 in [128,1,2,4] {
+      check(sourceRelay.handleSourceAppGestureForTests(fixture(8,phase,scalar:scalar))==true,"actual source full signed pinch suppresses locally")
+    }
+    let frames=Array(sourceFrames.dropFirst(before))
+    check(frames.count==4 && Set(frames.compactMap{$0.appGestureID}).count==1,"actual source full signed pinch enqueues stable stream")
+    check(frames.allSatisfy{$0.x==nil && $0.y==nil && $0.desktopGlobalX==Double(point.x) && $0.desktopGlobalY==Double(point.y) && $0.desktopMapRevision==7 && $0.desktopGestureTargetID==99 && AppGestureCodec.decode($0)?.getDoubleValueField(CGEventField(rawValue:113)!)==scalar},"actual source binds desktop point and preserves signed scalar without normalized coordinates")
+  }
+  sourceRelay.prepareSourceDesktopAppGestureForTests(map:map,point:point,token:token,negotiated:false)
+  let beforeOldPeer=sourceFrames.count
+  for phase:Int64 in [128,1,2,4] {
+    check(sourceRelay.handleSourceAppGestureForTests(fixture(8,phase,scalar:0.25))==true,"old-peer source stream still suppressed")
+  }
+  check(sourceFrames.count==beforeOldPeer,"old-peer source receives no desktop app messages")
+  sourceRelay.contextForTests?.cancel(reason:"Source pinch memory fixture end")
   let r=Relay()
   r.connectionForTests=OwnedSocket(-1);r.contextForTests=SessionContext(OwnedSocket(-1));r.keyForTests=SymmetricKey(size:.bits256)
   r.safetyObserversInstalled=true;r.desktopEnqueueForTests={_ in true};r.gestureTrace.setEnabled(false)
@@ -183,6 +240,28 @@ func runNativeGestureTests() -> Int {
   r.appGesturePermissionForTests={false};let beforePermission=posts.count;r.receive(valid)
   check(posts.count==beforePermission,"permission gate")
   r.appGesturePermissionForTests={true}
+  r.prepareDesktopAppGestureForTests(map:map,point:point,token:token)
+  let continuationID=UUID().uuidString
+  let beforeCancel=posts.count
+  r.receive(packet(1,-0.25,continuationID));r.receive(packet(2,-0.25,continuationID));r.receive(packet(8,-0.25,continuationID))
+  check(posts.count==beforeCancel+3,"negative zoom cancelled stream")
+  r.receive(packet(2,-0.25,continuationID))
+  check(posts.count==beforeCancel+3,"terminal clears target binding and blocks late change")
+  r.prepareDesktopAppGestureForTests(map:map,point:point,token:token)
+  r.receive(packet(128,0.25,stream));let beforeWrongID=posts.count
+  r.receive(packet(1,0.25,UUID().uuidString))
+  check(posts.count==beforeWrongID,"target binding includes stream identity")
+  r.prepareDesktopAppGestureForTests(map:map,point:point,token:token)
+  r.receive(packet(1,0.25,stream));let beforeMove=posts.count
+  let moved=CGPoint(x:-399,y:-300)
+  r.updateDesktopAppGesturePointerForTests(moved)
+  var moving=packet(2,0.25,stream);moving.desktopGlobalX=Double(moved.x)
+  r.receive(moving)
+  check(posts.count==beforeMove+1 && posts.last?.location==moved,"pinch can follow current pointer within its display")
+  r.updateDesktopAppGesturePointerForTests(CGPoint(x:400,y:300))
+  moving.desktopGlobalX=400;moving.desktopGlobalY=300;moving.desktopGestureTargetID=11
+  r.receive(moving)
+  check(posts.count==beforeMove+1,"pinch cannot continue on another display")
   r.prepareDesktopAppGestureForTests(map:map,point:point,token:token)
   r.desktopBeforeGateForTests={epoch+=1};let beforeEpoch=posts.count;r.receive(valid)
   check(posts.count==beforeEpoch,"final epoch gate")

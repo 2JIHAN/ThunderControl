@@ -19,7 +19,8 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
         let context: Context, stage: String, sequence: UInt64?, fields: [String: Double]
         let monotonic: Double, wall: Double
     }
-    private let root: URL, cloudRoot: URL?
+    private let root: URL
+    let cloudRoot: URL?
     private let clock: () -> Date
     private let monotonicClock: () -> TimeInterval
     private let beforeDrain: (() -> Void)?
@@ -58,8 +59,7 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
          beforeCloudRead: (() -> Void)? = nil) {
         self.root = root ?? FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/ThunderControl/DevelopmentDiagnostics")
-        self.cloudRoot = root == nil ? FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs") : cloudRoot
+        self.cloudRoot = root == nil ? nil : cloudRoot
         self.clock = clock; self.monotonicClock = monotonicClock; self.beforeDrain = beforeDrain
         self.beforeCloudRead = beforeCloudRead
         self.chunkBytes = max(256, min(chunkBytes, 512 * 1024))
@@ -196,9 +196,9 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
 
     }
     private let runID = UUID().uuidString.lowercased()
-    private func prepare() throws {
+    private func prepare(create: Bool = true) throws {
         if directory >= 0 { return }
-        let rootFD = try Self.openDirectory(root, create: true); defer { close(rootFD) }
+        let rootFD = try Self.openDirectory(root, create: create); defer { close(rootFD) }
         guard fchmod(rootFD, 0o700) == 0 else { throw Failure.io(errno) }
         let idName = "device-uuid"
         let fd = openat(rootFD, idName, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
@@ -211,16 +211,18 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
             guard read(fd, &bytes, 36) == 36, let s = String(bytes: bytes, encoding: .utf8), UUID(uuidString: s) != nil else { throw Failure.unsafePath }; id = s
         } else {
             guard errno == ENOENT else { throw Failure.unsafePath }
+            if !create { return }
             id = UUID().uuidString.lowercased()
             try Self.atomicWrite(Data(id.utf8), directory: rootFD, name: idName, immutable: true)
         }
-        if mkdirat(rootFD, id, 0o700) != 0 && errno != EEXIST { throw Failure.io(errno) }
+        if create && mkdirat(rootFD, id, 0o700) != 0 && errno != EEXIST { throw Failure.io(errno) }
         let own = openat(rootFD, id, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        if own < 0 && !create && errno == ENOENT { return }
         guard own >= 0 else { throw Failure.unsafePath }
         guard fchmod(own, 0o700) == 0 else { close(own); throw Failure.io(errno) }
         directory = own; deviceID = id
         ingress.lock(); cachedLocalDirectory = root.appendingPathComponent(id); ingress.unlock()
-        try retain()
+        if create { try retain() }
     }
     // Traverse each component with O_NOFOLLOW, including existing ancestors. Never resolve symlinks.
     private static func openDirectory(_ url: URL, create: Bool) throws -> Int32 {
@@ -345,7 +347,7 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
         guard fd >= 0 else { throw Failure.io(errno) }; defer { close(fd) }
         var st = stat()
         guard fstat(fd, &st) == 0, st.st_mode & S_IFMT == S_IFREG,
-              st.st_size >= 0, st.st_size <= 512 * 1024 else { throw Failure.unsafePath }
+              st.st_nlink == 1, st.st_uid == geteuid(), st.st_size >= 0, st.st_size <= 512 * 1024 else { throw Failure.unsafePath }
         var bytes = [UInt8](repeating: 0, count: Int(st.st_size)), offset = 0
         try bytes.withUnsafeMutableBytes { raw in
             while offset < raw.count {
@@ -368,6 +370,7 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
         catch { localError = true }
     }
     private func mirror(force: Bool = false) {
+        guard cloudRoot != nil else { return }
         let files: [(String, Int64, Double)]
         do { files = try Self.chunkFiles(directory) } catch { mirrorError = true; mirrorMissCount += 1; return }
         mirrorKnown.formIntersection(Set(files.map { $0.0 }))
@@ -449,6 +452,32 @@ final class DevelopmentDiagnostics: @unchecked Sendable {
             try atomicWrite(manifest, directory: fd, name: "manifest.json")
         } catch { result.failed = true; result.misses += 1 }
         return result
+    }
+    // Capture on the writer queue so retention cannot remove a chunk mid-export.
+    // Call off the main thread. An unused logger exports nothing and creates no data.
+    func exportSnapshot() throws -> [String: Data] {
+        try queue.sync {
+            drain()
+            if localError { throw Failure.io(EIO) }
+            if directory < 0 {
+                var info = stat()
+                if lstat(root.path, &info) != 0 {
+                    if errno == ENOENT { return [:] }
+                    throw Failure.io(errno)
+                }
+                try prepare(create: false)
+            }
+            guard directory >= 0 else { return [:] }
+            var result: [String: Data] = [:], bytes = 0
+            for (name, _, _) in try Self.chunkFiles(directory) {
+                let data = try Self.readChunk(directory, name)
+                guard data.count <= diskBytes - bytes else { throw Failure.unsafePath }
+                bytes += data.count
+                result["development-" + name] = data
+            }
+            result["development-manifest.json"] = try JSONSerialization.data(withJSONObject: status(), options: [.sortedKeys])
+            return result
+        }
     }
     // Call off the UI/event-tap thread. No implicit singleton disk activity.
     func flushForTests(mirrorTimeout: TimeInterval = 2) throws {
