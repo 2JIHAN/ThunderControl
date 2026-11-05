@@ -4053,7 +4053,11 @@ final class Relay {
     }
     if !sender,isLocalInput,cursorVisibilityCompatible,sourceAutoCursorMode,(standard.contains(type.rawValue) || systemKey != nil) {
       let wasHidden=receiverCursor.isHidden
-      receiverLocalCursorOverride(reason:"physical-input")
+      if receiverActivationPendingToken == nil,[UInt32(5),22].contains(type.rawValue) {
+        _ = restoreReceiverCursor();cursorDiagnostic("local-cursor-activity")
+      } else {
+        receiverLocalCursorOverride(reason:"physical-input")
+      }
       guard !receiverCursor.needsRecovery else{safetyStop("Receiver local input cursor recovery failed");return false}
       if wasHidden {status(TCText("Local input on the Receiver Mac made the cursor visible again."))}
     }
