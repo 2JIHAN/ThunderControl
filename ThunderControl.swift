@@ -3117,6 +3117,81 @@ final class Relay {
     relay.releaseInputs();relay.releaseInputs()
     return posted.count==2 && Set(posted.map{$0.code})==Set([UInt16(0),2]) && posted.allSatisfy{!$0.down && !$0.isRepeat} && relay.receiverSystemKeys.pressed.isEmpty
   }
+  static func verifyReceiverCursorActivityPreservesGesturesForTests()->Bool {
+    final class Cursor:CursorRecoveryAPI {
+      var hides=0,shows=0
+      func associate(_ associated:Bool)->CGError{preconditionFailure("No cursor association in activity fixture")}
+      func hide(display:CGDirectDisplayID)->CGError{hides+=1;return .success}
+      func show(display:CGDirectDisplayID)->CGError{shows+=1;return .success}
+      func warp(to point:CGPoint)->CGError{preconditionFailure("No cursor warp in activity fixture")}
+    }
+    let map=ReceiverDesktop(revision:7,mainID:11,displays:[ReceiverDisplay(id:11,bounds:CGRect(x:0,y:0,width:1920,height:1080)),ReceiverDisplay(id:99,bounds:CGRect(x:-1512,y:-945,width:1512,height:945))],virtualDisplayID:99)
+    let point=CGPoint(x:-400,y:-300)
+    var ok=true
+    for (raw,preserves):(UInt32,Bool) in [(5,true),(22,true),(6,false),(7,false),(27,false)] {for hidden in [false,true] {
+      let cursor=Cursor()
+      let api=RelayInputAPI(native:HIDInputAPI(permissionCheck:{true},open:{(0,42)},post:{_,_ in preconditionFailure("No HID post in cursor activity fixture")},close:{_ in},readFlags:{[]}),postCG:{_,_ in preconditionFailure("No CG post in cursor activity fixture")},warp:{_ in preconditionFailure("No input warp in cursor activity fixture")})
+      let r=Relay(cursorResources:CursorRecoveryController(api:cursor),receiverCursor:CursorVisibilityController(api:cursor),inputAPI:api)
+      let ctx=SessionContext(OwnedSocket(-1));defer{ctx.cancel(reason:"Cursor activity memory fixture end")}
+      r.connection=OwnedSocket(-1);r.context=ctx;r.key=SymmetricKey(size:.bits256)
+      r.safetyObserversInstalled=true;r.gestureTrace.setEnabled(false)
+      r.sessionSnapshotReadForTests={SessionSafetySnapshot(onConsole:true,loginDone:true,screenLocked:false)}
+      var frames=[Wire](),pinches=[CGEvent](),dockPosts=[CGPoint](),dockBuilt=[DockGestureDescriptor](),intents=0
+      r.desktopEnqueueForTests={frames.append($0);return true}
+      r.desktopEpochForTests={0};r.desktopMapReadForTests={_,_ in map}
+      r.appGesturePermissionForTests={true};r.appGesturePostForTests={pinches.append($0)}
+      r.desktopSystemGesturePermissionForTests={true}
+      r.desktopSystemGestureBuildForTests={dockBuilt.append($0);return CGEvent(source:nil)}
+      r.desktopSystemGesturePostForTests={dockPosts.append($0.location)}
+      r.receiverLocalUserIntent={intents+=1}
+      let token=UUID().uuidString
+      r.prepareDesktopAppGestureForTests(map:map,point:point,token:token)
+      r.cursorVisibilityCompatible=true;r.sourceAutoCursorMode=true
+      if hidden {guard r.receiverCursor.hide(display:99) else{return false}}
+      func streams()->Bool {
+        let beforePinch=pinches.count,beforeDock=dockPosts.count
+        for scalar in [0.25,-0.25] {
+          let stream=UUID().uuidString
+          for phase:Int64 in [128,1,2,4] {
+            guard let event=CGEvent(source:nil) else{return false}
+            event.type=CGEventType(rawValue:29)!
+            event.setIntegerValueField(CGEventField(rawValue:110)!,value:8)
+            event.setIntegerValueField(CGEventField(rawValue:132)!,value:phase)
+            event.setDoubleValueField(CGEventField(rawValue:113)!,value:scalar)
+            guard let data=event.data else{return false}
+            let packet=Wire(kind:"appGesture",session:r.session,sequence:1,raw:29,data:data as Data,token:token,appGesture:NativeGestureDescriptor.decode(event),appGestureID:stream,appGestureCodec:1,desktopMapRevision:7,desktopGlobalX:Double(point.x),desktopGlobalY:Double(point.y),desktopGestureTargetID:99)
+            r.receive(packet)
+          }
+        }
+        let stream=UUID().uuidString
+        for phase in [1,2,4] {
+          let descriptor=DockGestureDescriptor(motion:2,phase:phase,progress:-0.25,velocityX:0,velocityY:-1)
+          r.receive(Wire(kind:"dock",session:r.session,sequence:1,token:token,dock:descriptor,dockID:stream,desktopMapRevision:7,desktopGlobalX:Double(point.x),desktopGlobalY:Double(point.y),desktopGestureTargetID:99))
+        }
+        return pinches.count==beforePinch+8 && dockPosts.count==beforeDock+3 &&
+          pinches.suffix(8).enumerated().allSatisfy{index,event in event.location==point && event.getDoubleValueField(CGEventField(rawValue:113)!)==(index<4 ? 0.25:-0.25)} &&
+          dockPosts.suffix(3).allSatisfy{$0==point} && dockBuilt.suffix(3).map(\.phase)==[1,2,4]
+      }
+      guard streams() else{print("FAIL cursor activity fixture baseline raw=\(raw) hidden=\(hidden)");return false}
+      for repetition in 0..<3 {
+        guard let type=CGEventType(rawValue:raw),let event=CGEvent(source:nil) else{return false}
+        event.type=type;event.flags=[]
+        event.setIntegerValueField(.eventSourceUnixProcessID,value:0)
+        event.setIntegerValueField(.eventSourceUserData,value:0)
+        _ = r.handle(type,event)
+        let beforePinch=pinches.count,beforeDock=dockPosts.count
+        let posted=streams()
+        let expectedOutput=preserves ? posted:(!posted && pinches.count==beforePinch && dockPosts.count==beforeDock)
+        let preserved=expectedOutput && r.inject && r.handoff.phase == .targetActive && r.handoff.token==token &&
+          r.receiverActivationPendingToken==nil && r.receiverCursorLocalOverride == !preserves && intents==(preserves ? 0:repetition+1) && frames.isEmpty &&
+          !r.receiverCursor.isHidden && !r.receiverCursor.needsRecovery && cursor.hides==(hidden ? 1:0) && cursor.shows==(hidden ? 1:0)
+        if !preserved {print("FAIL receiver cursor activity raw=\(raw) hidden=\(hidden) repetition=\(repetition) pinch=\(pinches.count) dock=\(dockPosts.count) override=\(r.receiverCursorLocalOverride) intent=\(intents)")}
+        ok=preserved && ok
+      }
+    }}
+    print("\(ok ? "PASS":"FAIL") actual Relay.handle motion/scroll preserves signed pinch and Dock output; drags retain local override; repeated activity and cursor restoration; memory-only")
+    return ok
+  }
   static func verifyReceiverPhysicalInputCancelsActivationForTests()->Bool {
     let relay=Relay();let token=UUID().uuidString
     relay.cursorVisibilityCompatible=true;relay.sourceAutoCursorMode=true

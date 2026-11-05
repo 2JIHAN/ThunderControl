@@ -267,6 +267,7 @@ func runNativeGestureTests() -> Int {
   check(posts.count==beforeEpoch,"final epoch gate")
   r.desktopBeforeGateForTests=nil
   r.contextForTests?.cancel(reason:"Native pinch memory fixture end")
+  check(Relay.verifyReceiverCursorActivityPreservesGesturesForTests(),"active receiver cursor activity preserves pinch and Dock output")
   print("NativeGesture: \(checks) checks, \(failures) failures (memory-only, not native injection validation)")
   return failures
 }
