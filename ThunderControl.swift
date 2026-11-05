@@ -1109,6 +1109,7 @@ final class Relay {
   private var multiDisplayDesktopCompatible=false
   #endif
   private var desktopSystemGestureCompatible=false
+  private var desktopAppGestureCompatible=false
   private var displayBarrier:ConcurrentDisplayBarrier?
   private var displayBarrierCompletion:((Result<Void,Error>)->Void)?
   private var displayLease:ConcurrentDisplayLease?
@@ -2120,6 +2121,13 @@ final class Relay {
     desktopHandoffRevision=map.revision;desktopGlobalPointer=point;desktopReceiverPreviousPointer=point
     desktopPortal=map.portals(sourceRect:CGRect(x:-1200,y:0,width:1200,height:800)).first
     dockReceiver.reset();dockReceiverDesktopTarget=nil;receiverCursorLocalOverride=false
+  }
+  var appGesturePermissionForTests:(()->Bool)?
+  var appGesturePostForTests:((CGEvent)->Void)?
+  func prepareDesktopAppGestureForTests(map:ReceiverDesktop,point:CGPoint,token:String,negotiated:Bool=true) {
+    prepareDesktopSystemGestureForTests(map:map,point:point,token:token)
+    desktopAppGestureCompatible=negotiated;appGestureCompatible=true;appGestureExperimental=true
+    receiverAppGesture.reset()
   }
   private var dockLocalActive=false
   private var dockOrphanMotion:Int?

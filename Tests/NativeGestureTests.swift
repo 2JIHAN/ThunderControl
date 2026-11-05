@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import CryptoKit
 
 // Synthetic fixtures are memory-only classifier inputs. They have no HID queue
 // payload and do NOT establish that native injection or system gestures work.
@@ -135,6 +136,58 @@ func runNativeGestureTests() -> Int {
   _ = receiver.accept(begin, id: id, now: 34)
   receiver.reset()
   check(!receiver.active && !receiver.accept(change, id: id, now: 35), "receiver reset")
+  let map=ReceiverDesktop(revision:7,mainID:11,displays:[
+    ReceiverDisplay(id:11,bounds:CGRect(x:0,y:0,width:1920,height:1080)),
+    ReceiverDisplay(id:99,bounds:CGRect(x:-1512,y:-945,width:1512,height:945))],virtualDisplayID:99)
+  let point=CGPoint(x:-400,y:-300),token=UUID().uuidString,session=UUID().uuidString
+  func packet(_ phase:Int64,_ scalar:Double,_ stream:String)->Wire {
+    let event=fixture(8,phase,scalar:scalar)
+    var w=Wire(kind:"appGesture",session:session,sequence:1,raw:29,data:event.data! as Data,token:token,
+      appGesture:NativeGestureDescriptor.decode(event),appGestureID:stream,appGestureCodec:1)
+    w.desktopMapRevision=7;w.desktopGlobalX=Double(point.x);w.desktopGlobalY=Double(point.y);w.desktopGestureTargetID=99
+    return w
+  }
+  let r=Relay()
+  r.connectionForTests=OwnedSocket(-1);r.contextForTests=SessionContext(OwnedSocket(-1));r.keyForTests=SymmetricKey(size:.bits256)
+  r.safetyObserversInstalled=true;r.desktopEnqueueForTests={_ in true};r.gestureTrace.setEnabled(false)
+  var epoch:UInt64=0,posts=[CGEvent]()
+  r.desktopEpochForTests={epoch};r.desktopMapReadForTests={_,_ in map}
+  r.appGesturePermissionForTests={true};r.appGesturePostForTests={posts.append($0)}
+  for scalar in [0.25,-0.25] {
+    r.prepareDesktopAppGestureForTests(map:map,point:point,token:token)
+    let stream=UUID().uuidString,before=posts.count
+    for phase:Int64 in [128,1,2,4] {r.receive(packet(phase,scalar,stream))}
+    check(posts.count==before+4,"actual Relay complete signed zoom stream reaches record-only post hook")
+    check(posts.suffix(4).allSatisfy{$0.location==point && $0.getDoubleValueField(CGEventField(rawValue:113)!)==scalar},"desktop pinch preserves scalar and virtual destination")
+  }
+  func rejected(_ w:Wire,_ label:String,negotiated:Bool=true) {
+    r.prepareDesktopAppGestureForTests(map:map,point:point,token:token,negotiated:negotiated)
+    let before=posts.count;r.receive(w);check(posts.count==before,label)
+  }
+  let stream=UUID().uuidString,valid=packet(1,0.25,UUID().uuidString)
+  rejected(valid,"absent desktop app negotiation",negotiated:false)
+  var bad=valid;bad.desktopGestureTargetID=11;rejected(bad,"wrong display")
+  bad=valid;bad.desktopMapRevision=8;rejected(bad,"stale map")
+  bad=valid;bad.desktopGlobalX = .nan;rejected(bad,"nonfinite global point")
+  bad=valid;bad.desktopGlobalX = -401;rejected(bad,"gesture cannot relocate pointer")
+  bad=valid;bad.token=UUID().uuidString;rejected(bad,"stale token")
+  bad=valid;bad.x=0.5;bad.y=0.5;rejected(bad,"mixed normalized and desktop shape")
+  bad=valid;bad.desktopPortalSide="left";rejected(bad,"portal fields cannot be smuggled")
+  for subtype:Int64 in [5,16] {
+    let event=fixture(subtype,1,scalar:0.25)
+    bad=valid;bad.data=event.data! as Data;bad.appGesture=NativeGestureDescriptor.decode(event)
+    rejected(bad,"nonpinch desktop blocked")
+  }
+  rejected(packet(2,0.25,stream),"unknown change cannot post")
+  r.prepareDesktopAppGestureForTests(map:map,point:point,token:token)
+  r.appGesturePermissionForTests={false};let beforePermission=posts.count;r.receive(valid)
+  check(posts.count==beforePermission,"permission gate")
+  r.appGesturePermissionForTests={true}
+  r.prepareDesktopAppGestureForTests(map:map,point:point,token:token)
+  r.desktopBeforeGateForTests={epoch+=1};let beforeEpoch=posts.count;r.receive(valid)
+  check(posts.count==beforeEpoch,"final epoch gate")
+  r.desktopBeforeGateForTests=nil
+  r.contextForTests?.cancel(reason:"Native pinch memory fixture end")
   print("NativeGesture: \(checks) checks, \(failures) failures (memory-only, not native injection validation)")
   return failures
 }
