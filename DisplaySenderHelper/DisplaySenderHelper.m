@@ -445,7 +445,9 @@ static BOOL BaselinePreserved(BOOL compareModes){
     CGDirectDisplayID id=baseline[i].id;
     if(CGDisplayMirrorsDisplay(id)!=baseline[i].mirror)return NO;
     if((bool)(CGDisplayIsActive(id)!=0)!=baseline[i].active)return NO;
-    if(!CGRectEqualToRect(CGDisplayBounds(id),baseline[i].bounds))return NO;
+    CGRect bounds=CGDisplayBounds(id);
+    if(compareModes && !CGPointEqualToPoint(bounds.origin,baseline[i].bounds.origin))return NO;
+    if(compareModes && !CGSizeEqualToSize(bounds.size,baseline[i].bounds.size))return NO;
     if(!compareModes)continue;
     CGDisplayModeRef m=CGDisplayCopyDisplayMode(id);if(!m)return NO;
     BOOL ok=ModeSame(m,baseline[i].mode) && CGDisplayModeGetPixelWidth(m)==baseline[i].pixelWidth && CGDisplayModeGetPixelHeight(m)==baseline[i].pixelHeight;
@@ -2315,9 +2317,8 @@ int main(int argc,const char **argv){@autoreleasepool {
   Pump(1);ownedInitialBounds=CGDisplayBounds(ownedID);
   // Retain the owned mode as the authoritative read-only reference. OwnedSafe
   // compares live modes against this reference; drift fails validation. On
-  // any post-commit failure below, we drop the owned virtual and attempt a
-  // best-effort restore of baseline topology before Fail(); mode CFRefs
-  // are retained through this failure cleanup.
+  // any post-commit failure below, drop the owned virtual without replaying
+  // an earlier physical layout.
   const char *postFail=NULL;
   // Detach/preserve FIRST. While creation is mirrored, CoreGraphics can expose
   // the mirror group's effective modes rather than the owned Retina modes.
@@ -2380,29 +2381,7 @@ int main(int argc,const char **argv){@autoreleasepool {
     if(ownedInitialMode){CGDisplayModeRelease(ownedInitialMode);ownedInitialMode=NULL;}
     display=nil; // release retained CGVirtualDisplay so the OS removes it
     for(int s=0;s<20;s++)usleep(50000); // ~1s settle without Guard() reentry
-    // Best-effort baseline-only reassertion (no owned writes, no mode
-    // writes). Same ordering as the setup transaction. Baseline mode CFRefs
-    // remain retained in case diagnostics or a later path needs them.
-    const char *rstage="rS0:begin";CGError rce=kCGErrorSuccess;
-    CGDisplayConfigRef rconfig=NULL;
-    if(CGBeginDisplayConfiguration(&rconfig)!=kCGErrorSuccess){fprintf(stderr,"Display sender rollback failure stage=%s cgErrorCode=%d\n",rstage,rce);Fail(postFail);}
-    rstage="rS1:rootDetach";
-    for(uint32_t i=0;i<baselineCount && rce==kCGErrorSuccess;i++)
-      if(baseline[i].mirror==kCGNullDirectDisplay)
-        rce=CGConfigureDisplayMirrorOfDisplay(rconfig,baseline[i].id,kCGNullDirectDisplay);
-    if(rce==kCGErrorSuccess){rstage="rS2:rootOrigin";
-      for(uint32_t i=0;i<baselineCount && rce==kCGErrorSuccess;i++)
-        if(baseline[i].mirror==kCGNullDirectDisplay)
-          rce=CGConfigureDisplayOrigin(rconfig,baseline[i].id,(int32_t)baseline[i].bounds.origin.x,(int32_t)baseline[i].bounds.origin.y);
-    }
-    if(rce==kCGErrorSuccess){rstage="rS3:aliasMirror";
-      for(uint32_t i=0;i<baselineCount && rce==kCGErrorSuccess;i++)
-        if(baseline[i].mirror!=kCGNullDirectDisplay)
-          rce=CGConfigureDisplayMirrorOfDisplay(rconfig,baseline[i].id,baseline[i].mirror);
-    }
-    if(rce!=kCGErrorSuccess){fprintf(stderr,"Display sender rollback failure stage=%s cgErrorCode=%d\n",rstage,rce);CGCancelDisplayConfiguration(rconfig);Fail(postFail);}
-    rstage="rS6:complete";CGError rccErr=CGCompleteDisplayConfiguration(rconfig,kCGConfigureForSession);
-    if(rccErr!=kCGErrorSuccess)fprintf(stderr,"Display sender rollback failure stage=%s cgErrorCode=%d\n",rstage,rccErr);
+    // Never replay a pre-create layout after startup validation fails.
     Fail(postFail);
   }
   // Baseline modes have served their purpose; policy prohibits any post-start

@@ -6,13 +6,13 @@
 typedef struct {size_t w,h,pw,ph;double hz;uint32_t flags,id;} TestMode;
 static TestMode saved={1920,1080,3840,2160,30,7,67},drift={1920,1080,1920,1080,120,7,64},fresh={1920,1080,3840,2160,30,7,67};
 static TestMode *current=&drift;
-static BOOL topologyOK=YES,onlineOK=YES,available=YES,configureOK=YES;
+static BOOL topologyOK=YES,onlineOK=YES,available=YES,configureOK=YES,sizeOK=YES;
 static unsigned begins,writes,commits,cancels;
 static CGDirectDisplayID TestMain(void){return topologyOK?1:3;}
 static CGError TestOnline(uint32_t max,CGDirectDisplayID *ids,uint32_t *n){(void)max;ids[0]=1;ids[1]=2;ids[2]=99;*n=onlineOK?3:2;return kCGErrorSuccess;}
 static CGDirectDisplayID TestMirror(CGDirectDisplayID d){return d==2?1:0;}
 static uint32_t TestActive(CGDirectDisplayID d){(void)d;return 1;}
-static CGRect TestBounds(CGDirectDisplayID d){(void)d;return CGRectMake(0,0,1920,1080);}
+static CGRect TestBounds(CGDirectDisplayID d){return !sizeOK && d==1 && current!=&fresh?CGRectMake(0,0,1280,720):CGRectMake(0,0,1920,1080);}
 static CGDisplayModeRef TestCopy(CGDirectDisplayID d){(void)d;return (CGDisplayModeRef)current;}
 static CFArrayRef TestAll(CGDirectDisplayID d,CFDictionaryRef options){(void)d;(void)options;const void *v[]={&fresh};return CFArrayCreate(NULL,v,available?1:0,NULL);}
 static CGError TestBegin(CGDisplayConfigRef *c){begins++;*c=(CGDisplayConfigRef)1;return kCGErrorSuccess;}
@@ -43,7 +43,7 @@ static CGError TestCancel(CGDisplayConfigRef c){(void)c;cancels++;return kCGErro
 #include "../DisplaySenderHelper/DisplaySenderHelper.m"
 #undef main
 static void Reset(void){
-  originalID=1;ownedID=99;baselineCount=2;topologyOK=onlineOK=available=configureOK=YES;
+  originalID=1;ownedID=99;baselineCount=2;topologyOK=onlineOK=available=configureOK=sizeOK=YES;
   current=&drift;begins=writes=commits=cancels=0;atomic_store(&topologyArmed,false);
   for(unsigned i=0;i<2;i++){baseline[i].id=i+1;baseline[i].mirror=i?1:0;baseline[i].active=true;baseline[i].bounds=CGRectMake(0,0,1920,1080);baseline[i].mode=(CGDisplayModeRef)&saved;baseline[i].pixelWidth=3840;baseline[i].pixelHeight=2160;}
 }
@@ -54,11 +54,12 @@ int main(int argc,const char **argv){@autoreleasepool {
   Reset();EXPECT(RestoreStartupRootModes() && writes==1 && commits==1 && current==&fresh,"fresh-root-mode-restores-drift");
   Reset();fresh.id=88;EXPECT(RestoreStartupRootModes() && writes==1 && !BaselinePreserved(YES),"fresh-selection-ignores-id-but-strict-readback-rejects-id-drift");fresh.id=67;
   Reset();current=&saved;EXPECT(RestoreStartupRootModes() && !begins && !writes,"no-drift-no-transaction");
+  Reset();sizeOK=NO;EXPECT(RestoreStartupRootModes() && writes==1 && BaselinePreserved(YES),"mode-size-drift-restored-without-origin-change");
   Reset();topologyOK=NO;EXPECT(!RestoreStartupRootModes() && !writes,"changed-main-no-write");
   Reset();onlineOK=NO;EXPECT(!RestoreStartupRootModes() && !writes,"changed-online-no-write");
   Reset();baseline[1].mirror=0;EXPECT(!RestoreStartupRootModes() && !writes,"changed-mirror-no-write");
   Reset();baseline[1].active=false;EXPECT(!RestoreStartupRootModes() && !writes,"changed-active-no-write");
-  Reset();baseline[1].bounds.origin.x=10;EXPECT(!RestoreStartupRootModes() && !writes,"changed-bounds-no-write");
+  Reset();baseline[1].bounds.origin.x=10;EXPECT(RestoreStartupRootModes() && writes==1 && !BaselinePreserved(YES),"changed-origin-still-rejected-by-final-baseline");
   Reset();atomic_store(&topologyArmed,true);EXPECT(!RestoreStartupRootModes() && !writes,"armed-no-write");
   Reset();available=NO;EXPECT(!RestoreStartupRootModes() && !writes,"missing-fresh-match-no-write");
   Reset();fresh.flags=8;EXPECT(!RestoreStartupRootModes() && !writes,"different-ioflags-no-write");fresh.flags=7;
