@@ -1916,9 +1916,15 @@ final class Relay {
     while !context.cancelled {
       let w = try unseal(readFrame(fd), incomingKey)
       try validator.accept(w)
-      guard self.inbound.wait(timeout: .now()) == .success else {
-        throw Failure("Inbound queue overload")
+      let capacityDeadline=ProcessInfo.processInfo.systemUptime+2
+      while self.inbound.wait(timeout: .now() + .milliseconds(20)) != .success {
+        guard !context.cancelled else{return}
+        guard ProcessInfo.processInfo.systemUptime < capacityDeadline else {
+          context.cancel(reason:"Authenticated stream: Inbound queue overload")
+          throw Failure("Inbound queue overload")
+        }
       }
+      guard !context.cancelled else {self.inbound.signal();return}
       let inputQueuedAt=ProcessInfo.processInfo.systemUptime
       DispatchQueue.main.async {
         defer { self.inbound.signal() }

@@ -14,6 +14,22 @@ private final class ClipboardReadSpy: NSObject, NSPasteboardItemDataProvider {
     }
 }
 
+private final class ClipboardIPCBlocker: @unchecked Sendable {
+    private let lock = NSLock()
+    private let release = DispatchSemaphore(value: 0)
+    private var armed = false
+    private var entered = false
+    func arm() { lock.lock(); armed = true; entered = false; lock.unlock() }
+    var isBlocked: Bool { lock.lock(); defer { lock.unlock() }; return entered }
+    func blockIfArmed() {
+        lock.lock()
+        guard armed else { lock.unlock(); return }
+        armed = false; entered = true; lock.unlock()
+        _ = release.wait(timeout: .now() + 5)
+    }
+    func resume() { release.signal() }
+}
+
 @MainActor func runImageClipboardTests() -> Int {
     var failures = 0
     func check(_ condition: @autoclosure () -> Bool, _ name: String) {
@@ -68,12 +84,14 @@ private final class ClipboardReadSpy: NSObject, NSPasteboardItemDataProvider {
         for _ in 0..<5 {
             let sent = forward; forward.removeAll(); sent.forEach { receiver.receive($0) }
             let replies = backward; backward.removeAll(); replies.forEach { sender.receive($0) }
+            spin(0.01)
         }
         copy(large, source); sender.poll()
         for _ in 0..<100 { if forward.contains(where: { $0.op == .chunk }) { break }; spin(0.005) }
         check(forward.contains { $0.op == .chunk }, "metadata fixture queues real sender PNG")
         if midChunk, let index = forward.firstIndex(where: { $0.op == .chunk }) {
             receiver.receive(sender.sendGate.packetForTransmission(forward.remove(at: index)))
+            spin()
         }
         let spy = ClipboardReadSpy(png)
         let item = NSPasteboardItem()
@@ -164,12 +182,16 @@ private final class ClipboardReadSpy: NSObject, NSPasteboardItemDataProvider {
     check(chunks.count > 1 && chunks.allSatisfy { ($0.bytes?.count ?? 0) <= 32768 }, "bounded chunks")
     check(sentA.filter { $0.op == .ack }.count == chunks.count, "one ACK per chunk")
     let bitmap = NSBitmapImageRep(data: png)!
+    let beforeTIFF = b.changeCount
     a.clearContents(); a.setData(bitmap.tiffRepresentation!, forType: .tiff)
-    pump(50)
+    let tiffDeadline = Date().addingTimeInterval(2)
+    while Date() < tiffDeadline && (b.changeCount == beforeTIFF || b.types?.contains(ImageClipboardController.receivedImageType) != true) { pump(1) }
     let converted = b.data(forType: .png).flatMap { NSBitmapImageRep(data: $0) }
     check(converted?.pixelsWide == 1 && converted?.pixelsHigh == 1 && converted?.colorAt(x: 0, y: 0) == bitmap.colorAt(x: 0, y: 0), "TIFF conversion preserves pixels")
+    let beforeReverseTIFF = a.changeCount
     b.clearContents(); b.setData(bitmap.tiffRepresentation!, forType: .tiff)
-    pump(50)
+    let reverseDeadline = Date().addingTimeInterval(2)
+    while Date() < reverseDeadline && (a.changeCount == beforeReverseTIFF || a.types?.contains(ImageClipboardController.receivedImageType) != true) { pump(1) }
     let reverseConverted = a.data(forType: .png).flatMap { NSBitmapImageRep(data: $0) }
     check(reverseConverted?.colorAt(x: 0, y: 0) == bitmap.colorAt(x: 0, y: 0), "reverse TIFF conversion preserves pixels")
     a.clearContents(); a.setData(png, forType: .png); a.setString("image metadata", forType: .string)
@@ -242,33 +264,30 @@ private final class ClipboardReadSpy: NSObject, NSPasteboardItemDataProvider {
     c.isSafe = { true }; c.send = { cPackets.append($0); return true }
     c.start(); copy(png, a); c.poll(); spin()
     check(!cPackets.contains { $0.op == .chunk }, "old peer no consent no images")
-    c.receive(.init(op: .consent, epoch: e, enabled: true))
+    c.receive(.init(op: .consent, epoch: e, enabled: true)); spin()
     let localEpoch = cPackets.last { $0.op == .consent }!.epoch
     let first = ImageClipboardPacket(op: .chunk, epoch: e, peerEpoch: localEpoch, id: id,
                                      offset: 0, totalBytes: large.count, bytes: large.prefix(32768))
     let beforeOrder = a.changeCount
     var outOfOrder = first; outOfOrder.offset = 1
-    c.receive(outOfOrder)
+    c.receive(outOfOrder); spin()
     check(a.changeCount == beforeOrder && cPackets.last?.op == .cancel, "first chunk ordering")
-    c.receive(first)
+    c.receive(first); spin()
     a.clearContents(); a.setString("new local wins", forType: .string)
     var second = first; second.offset = 32768; second.bytes = large.subdata(in: 32768..<65536)
-    c.receive(second)
+    c.receive(second); spin()
     check(a.string(forType: .string) == "new local wins", "incoming newer local copy wins")
     c.poll()
     let beforeInvalid = a.changeCount
     c.receive(.init(op: .chunk, epoch: e, peerEpoch: localEpoch, id: UUID().uuidString,
                     offset: 0, totalBytes: 4, bytes: Data([1, 2, 3, 4])))
+    spin()
     check(a.changeCount == beforeInvalid, "non-image payload rejected")
     copy(large, a); c.poll()
     for _ in 0..<60 { spin(0.005); if cPackets.contains(where: { $0.op == .chunk }) { break } }
     let pending = cPackets.last { $0.op == .chunk }
     check(pending != nil, "timeout transfer starts")
     if let pending {
-        c.sendGate.revoke()
-        let synchronouslyRevoked = c.sendGate.packetForTransmission(pending)
-        check(synchronouslyRevoked.op == .cancel && synchronouslyRevoked.id == pending.id && synchronouslyRevoked.epoch == pending.epoch && synchronouslyRevoked.peerEpoch == pending.peerEpoch && synchronouslyRevoked.bytes == nil, "synchronous quarantine revokes queued image")
-        check(c.sendGate.packetForTransmission(.init(op: .consent, epoch: localEpoch, enabled: true)).enabled == false, "synchronous quarantine revokes consent")
         let countBeforeACK = cPackets.filter { $0.op == .chunk }.count
         c.receive(.init(op: .ack, epoch: e, peerEpoch: localEpoch, id: pending.id, offset: 1))
         spin()
@@ -276,8 +295,83 @@ private final class ClipboardReadSpy: NSObject, NSPasteboardItemDataProvider {
         spin(10.25); c.poll()
         check(cPackets.contains { $0.op == .cancel && $0.id == pending.id }, "ten-second timeout cancels")
         check(c.sendGate.packetForTransmission(pending).op == .cancel, "timeout releases queued payload")
+        let previousID = pending.id
+        copy(png, a); c.poll()
+        for _ in 0..<80 { spin(0.005); if cPackets.contains(where: { $0.op == .chunk && $0.id != previousID }) { break } }
+        let quarantinePacket = cPackets.last { $0.op == .chunk && $0.id != previousID }
+        check(quarantinePacket != nil, "quarantine fixture queues live image")
+        if let pending = quarantinePacket {
+            c.sendGate.revoke()
+            let synchronouslyRevoked = c.sendGate.packetForTransmission(pending)
+            check(synchronouslyRevoked.op == .cancel && synchronouslyRevoked.id == pending.id && synchronouslyRevoked.epoch == pending.epoch && synchronouslyRevoked.peerEpoch == pending.peerEpoch && synchronouslyRevoked.bytes == nil, "synchronous quarantine revokes queued image")
+            check(c.sendGate.packetForTransmission(.init(op: .consent, epoch: localEpoch, enabled: true)).enabled == false, "synchronous quarantine revokes consent")
+        }
     }
-    c.stop()
+    c.stop(); spin()
+    for mode in 0..<5 {
+        let revoke = mode != 0
+        let board = NSPasteboard(name: .init("ThunderControl.BlockedClipboard.\(UUID().uuidString)"))
+        let blocker = ClipboardIPCBlocker()
+        let controller = ImageClipboardController(pasteboard: board, enabled: true, beforeWorkerIPC: { blocker.blockIfArmed() })
+        var packets: [ImageClipboardPacket] = []
+        var callbacksOnMain = true
+        var safe = true
+        controller.isSafe = { callbacksOnMain = callbacksOnMain && Thread.isMainThread; return safe }
+        controller.send = { callbacksOnMain = callbacksOnMain && Thread.isMainThread; packets.append($0); return true }
+        controller.onStatus = { _ in callbacksOnMain = callbacksOnMain && Thread.isMainThread }
+        controller.start(); spin()
+        let peer = UUID().uuidString
+        controller.receive(.init(op: .consent, epoch: peer, enabled: true)); spin()
+        let local = packets.last { $0.op == .consent }!.epoch
+        blocker.arm()
+        let transferID = UUID().uuidString
+        controller.receive(.init(op: .chunk, epoch: peer, peerEpoch: local, id: transferID, offset: 0, totalBytes: png.count, bytes: png))
+        for _ in 0..<100 { if blocker.isBlocked { break }; spin(0.002) }
+        check(blocker.isBlocked, "synthetic clipboard IPC entered off main")
+        var heartbeat = false
+        DispatchQueue.main.async { heartbeat = true }
+        spin(0.01)
+        check(heartbeat, "main responsive while clipboard IPC blocked")
+        if mode == 0 { board.clearContents(); board.setString("new local wins", forType: .string) }
+        let count = board.changeCount
+        if mode == 1 { controller.setEnabled(false) }
+        if mode == 2 { controller.stop() }
+        if mode == 3 { controller.sendGate.revoke() }
+        if mode == 4 {
+            safe = false; controller.poll()
+            controller.sendGate.revoke(); controller.poll()
+            controller.sendGate.revoke(); controller.poll()
+        }
+        check(!revoke || controller.sendGate.packetForTransmission(.init(op: .consent, epoch: local, enabled: true)).enabled == false,
+              "OFF revokes synchronously during blocked clipboard IPC")
+        blocker.resume(); spin(0.1)
+        check(board.changeCount == count && (mode != 0 || board.string(forType: .string) == "new local wins"), "blocked clipboard never writes after revoke/new copy \(mode)")
+        check(!packets.contains { $0.op == .ack && $0.id == transferID }, "blocked stale write never ACKs \(mode)")
+        if mode == 3 {
+            controller.poll(); spin(0.05)
+            check(controller.sendGate.packetForTransmission(.init(op: .consent, epoch: local, enabled: true)).enabled == false,
+                  "continuously safe polling never rearms external revocation")
+        }
+        if mode == 4 {
+            let consentCount = packets.filter { $0.op == .consent }.count
+            safe = true; controller.poll(); spin(0.05)
+            check(packets.filter { $0.op == .consent }.count > consentCount, "repeated unsafe revocation recovers consent")
+            let recoveredLocal = packets.last { $0.op == .consent }!.epoch
+            let recoveredPeer = UUID().uuidString
+            controller.receive(.init(op: .consent, epoch: recoveredPeer, enabled: true)); spin(0.05)
+            copy(png, board); controller.poll()
+            for _ in 0..<100 { if packets.contains(where: { $0.op == .chunk }) { break }; spin(0.005) }
+            check(packets.contains { $0.op == .chunk && controller.sendGate.packetForTransmission($0).bytes == png },
+                  "fresh image copy sends after repeated unsafe revocation")
+            controller.receive(.init(op: .chunk, epoch: recoveredPeer, peerEpoch: recoveredLocal, id: UUID().uuidString,
+                                     offset: 0, totalBytes: png.count, bytes: png))
+            spin(0.1)
+            check(board.data(forType: .png) == png && board.types?.contains(ImageClipboardController.receivedImageType) == true,
+                  "fresh image writes after repeated unsafe revocation")
+        }
+        check(callbacksOnMain, "safety send and status callbacks remain main")
+        controller.stop(); spin(); board.releaseGlobally()
+    }
     print("ImageClipboardTests: \(failures) failures")
     return failures
 }

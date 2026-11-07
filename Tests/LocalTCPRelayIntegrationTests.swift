@@ -441,6 +441,10 @@ func runLocalTCPRelayIntegrationTests() throws {
     precondition(Thread.isMainThread && CommandLine.arguments.contains("--self-test") && CommandLine.arguments.contains("--local-tcp-relay-integration-test"))
     if CommandLine.arguments.contains("--local-native-input-test") { try runLocalTCPNativeInput(); return }
     let sides = LocalTCPSides(senderStore: LocalTCPMemoryStore(UUID().uuidString), receiverStore: LocalTCPMemoryStore(UUID().uuidString))
+    if CommandLine.arguments.contains("--local-tcp-backpressure-test") {
+        try runLocalTCPInboundBackpressure(sides: sides, enrollment: true)
+        return
+    }
     let core = try LocalTCPFixture(sides: sides, enrollment: true)
     do {
         defer { try? core.finish() }
@@ -565,6 +569,8 @@ func runLocalTCPRelayIntegrationTests() throws {
         try f.finish()
         print("PASS local TCP queued inbound \(cancel ? "context cancellation" : "stale generation")")
     }
+    try runLocalTCPInboundBackpressure(sides: sides)
+    try runLocalTCPWaitedLeaseExpiry(sides: sides)
     try runLocalTCPNegotiatedLifecycle(sides: sides)
     try runLocalTCPNegotiatedDenial(sides: sides)
     try runLocalTCPRemainingRecovery(sides: sides)
@@ -931,4 +937,96 @@ private func runLocalTCPReplayReleaseEOF(sides:LocalTCPSides) throws {
     f.receiver.stop()
     try localTCPRequire(f.input.totalPosts==posts,"repeated receiver EOF cleanup is idempotent")
     print("PASS local TCP actual receiver EOF cleanup admitted-down/staged-up; captured up discarded only after context cancellation")
+}
+
+private func runLocalTCPInboundBackpressure(sides: LocalTCPSides, enrollment: Bool = false) throws {
+    func burst(_ f: LocalTCPFixture) throws {
+        f.sender.prepareLocalTCPSafetyForTests(); f.receiver.prepareLocalTCPSafetyForTests()
+        for i in 1...64 {
+            let wire = try f.packet(dx: i.isMultiple(of: 2) ? Double(i) : -Double(i), dy: 0)
+            try localTCPRequire(f.sender.enqueue(wire), "64 authenticated input frames accepted by actual Relay.enqueue")
+            f.point = CGPoint(x: wire.desktopGlobalX!, y: wire.desktopGlobalY!)
+        }
+        f.sender.flushLocalTCPWritesForTests()
+        for _ in 0..<32 {
+            try localTCPRequire(f.queued.wait(timeout: .now() + 1) == .success, "32 authenticated frames admitted while main delivery held")
+        }
+        try localTCPRequire(f.queued.wait(timeout: .now() + .milliseconds(100)) == .timedOut, "33rd frame waits without exceeding 32 pending main deliveries")
+        try localTCPRequire(!f.result.done, "brief main stall must preserve authenticated stream; error=\(String(describing: f.result.error))")
+        try localTCPRequire(f.input.totalPosts == 0, "main delivery deliberately held before any recorded input")
+    }
+    func waitForWorker(_ f: LocalTCPFixture, seconds: Double) throws {
+        let deadline = ProcessInfo.processInfo.systemUptime + seconds
+        while !f.result.done && ProcessInfo.processInfo.systemUptime < deadline { Thread.sleep(forTimeInterval: 0.005) }
+        try localTCPRequire(f.result.done, "capacity wait terminates without main queue progress")
+    }
+    do {
+        let f = try LocalTCPFixture(sides: sides, enrollment: enrollment)
+        defer { try? f.finish() }
+        try burst(f)
+        try localTCPPump(until: { f.processed == 64 || f.result.done }, "resume actual Relay input delivery after bounded stall")
+        try localTCPRequire(f.result.error == nil && !f.result.done && f.processed == 64, "all 64 authenticated frames delivered with connection alive")
+        let expectedDeltas = (1...64).map { $0.isMultiple(of: 2) ? Double($0) : -Double($0) }
+        try localTCPRequire(f.input.plans.map(\.dx) == expectedDeltas && f.input.cg.isEmpty, "all input delivered exactly once in wire order through record-only HID")
+        try f.send(f.packet(dx: 65, dy: 0))
+        try localTCPRequire(f.input.plans.count == 65 && f.input.plans.last?.dx == 65, "same connection accepts input after recovery")
+        try f.finish()
+        print("PASS local TCP inbound 32-slot bound 64 authenticated inputs brief main stall resume exact order connection alive")
+    }
+    for cancel in [true, false] {
+        let f = try LocalTCPFixture(sides: sides, enrollment: false)
+        defer { try? f.finish() }
+        try burst(f)
+        if cancel {
+            f.context.cancel(reason: "cancel while inbound capacity waited")
+            try waitForWorker(f, seconds: 0.5)
+        } else {
+            f.receiver.invalidateLocalTCPGenerationForTests()
+        }
+        try localTCPPump(until: { cancel ? f.processed == 32 : f.processed == 64 }, "drain cancelled or stale generation callbacks")
+        try localTCPRequire(f.input.totalPosts == 0 && f.input.opens == 0, "capacity-waited cancelled or stale-generation input never delivered")
+        try f.finish()
+        print("PASS local TCP inbound capacity wait \(cancel ? "cancellation exits without main progress" : "stale generation rejects all inputs")")
+    }
+    do {
+        let f = try LocalTCPFixture(sides: sides, enrollment: false)
+        defer { try? f.finish() }
+        try burst(f)
+        try waitForWorker(f, seconds: 3)
+        try localTCPRequire(f.result.error != nil && f.context.cancelled, "sustained main stall terminates and cancels session before queued input can run")
+        try localTCPPump(until: { f.processed == 32 }, "timed-out session callbacks drained")
+        try localTCPRequire(f.input.totalPosts == 0 && f.input.opens == 0, "sustained-stall shutdown discards queued input before native effects")
+        try f.finish()
+        print("PASS local TCP inbound sustained stall finite timeout cancels session no delayed input")
+    }
+}
+
+private func runLocalTCPWaitedLeaseExpiry(sides: LocalTCPSides) throws {
+    let f = try LocalTCPFixture(sides: sides, enrollment: false, mode: .negotiated)
+    defer { try? f.finish() }
+    f.receiver.consent(true)
+    try localTCPPump(until: { f.sender.localTCPMapForTests != nil && f.reverseProcessed >= 2 }, "lease before queued-input expiry")
+    guard let map = f.sender.localTCPMapForTests else { throw LocalTCPError.assertion("queued-input map") }
+    f.sender.desktopPrepareEntryForTests(map: map, origin: CGPoint(x: -1200, y: 0))
+    let now = ProcessInfo.processInfo.systemUptime
+    _ = f.sender.desktopEntryForTests(CGPoint(x: 600, y: 400), delta: CGVector(dx: 1, dy: 0), now: now)
+    _ = f.sender.desktopEntryForTests(CGPoint(x: 1199, y: 400), delta: CGVector(dx: 1, dy: 0), now: now + 0.001)
+    try localTCPPump(until: { f.sender.desktopFocusRemoteForTests }, "active ownership before queued-input expiry")
+    f.point = f.receiver.desktopFocusPointForTests!
+    try f.send(f.packet(dx: 100, dy: 0), acceptedMotion: true)
+    while f.queued.wait(timeout: .now()) == .success {}
+    let before = f.processed, posts = f.input.totalPosts
+    for i in 1...64 {
+        let wire = try f.packet(dx: Double(i % 2 == 0 ? i : -i), dy: 0)
+        try localTCPRequire(f.sender.enqueue(wire), "valid leased burst accepted before expiry")
+        f.point = CGPoint(x: wire.desktopGlobalX!, y: wire.desktopGlobalY!)
+    }
+    f.sender.flushLocalTCPWritesForTests()
+    for _ in 0..<32 { try localTCPRequire(f.queued.wait(timeout: .now() + 1) == .success, "32 leased frames held on main") }
+    Thread.sleep(forTimeInterval: 0.4)
+    try localTCPRequire(!f.result.done, "lease expiry must not close the authenticated input stream")
+    try localTCPPump(until: { f.processed >= before + 64 || f.result.done }, "drain expired queued input")
+    try localTCPRequire(f.input.totalPosts == posts && f.result.error == nil && !f.context.cancelled, "expired input queued or waiting for capacity never reaches native input")
+    print("PASS local TCP inbound waited negotiated lease expiry rejects 64 frames without native input")
+    try f.finish()
 }
