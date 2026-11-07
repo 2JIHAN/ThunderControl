@@ -168,6 +168,7 @@ struct Wire: Codable {
   var displayPreference:Bool? = nil
   var desktopGestureTargetID:UInt32? = nil
   var desktopAppGestureCodec:Int? = nil
+  var fileTransferCodec:Int? = nil
   var imageClipboardCodec:Int? = nil
   var imageClipboardIsolationCodec:Int? = nil
   var imageClipboard:ImageClipboardPacket? = nil
@@ -367,13 +368,14 @@ struct Validator {
       guard w.kind == "hello", w.sequence == 0, let id = UUID(uuidString: w.session),
         id.uuidString == w.session, w.data == nil,
         (w.desktopAppGestureCodec==nil || w.desktopAppGestureCodec==0 || w.desktopAppGestureCodec==1),
+        (w.fileTransferCodec==nil || w.fileTransferCodec==1),
         (w.imageClipboardCodec==nil || w.imageClipboardCodec==1),
         (w.imageClipboardIsolationCodec==nil || w.imageClipboardIsolationCodec==1),w.imageClipboard==nil
       else { throw Failure("Invalid hello") }
       session = w.session
       next = 1
     } else {
-      guard w.session == session, w.sequence == next, w.kind == "event", next < UInt64.max else {
+      guard w.fileTransferCodec==nil,w.session == session, w.sequence == next, w.kind == "event", next < UInt64.max else {
         throw Failure("Replay or invalid sequence")
       }
       next += 1
@@ -559,7 +561,7 @@ struct PeerValidator {
       guard imageClipboardSupported,ImageClipboardWirePolicy.validEnvelope(w) else{throw Failure("Invalid image clipboard envelope")}
       next += 1;return
     }
-    guard w.imageClipboard==nil,w.imageClipboardCodec==nil,w.imageClipboardIsolationCodec==nil else{throw Failure("Unexpected image clipboard fields")}
+    guard w.fileTransferCodec==nil,w.imageClipboard==nil,w.imageClipboardCodec==nil,w.imageClipboardIsolationCodec==nil else{throw Failure("Unexpected image clipboard fields")}
     guard w.desktopAppGestureCodec==nil else{throw Failure("Unexpected desktop app gesture capability")}
     guard w.bridgeRecoveryCodec==nil else{throw Failure("Unexpected bridge recovery capability")}
     if ["linkReset","linkReady","inputLease"].contains(w.kind) {
@@ -891,6 +893,10 @@ final class SessionContext {
   }
   private var reason: String?
   var terminalReason: String? {lock.lock();defer{lock.unlock()};return reason}
+  private var cancellationHandlers:[()->Void] = []
+  func addCancellationHandler(_ handler:@escaping ()->Void) {
+    lock.lock(); if stopped {lock.unlock();handler();return}; cancellationHandlers.append(handler);lock.unlock()
+  }
   private var sockets: [OwnedSocket]
   init(_ initial: OwnedSocket,fastRoute:Bool=false) { self.fastRoute=fastRoute;sockets = [initial] }
   var cancelled: Bool {
@@ -914,9 +920,11 @@ final class SessionContext {
     guard !stopped else{lock.unlock();return}
     reason=value;stopped=true
     let current=sockets
+    let handlers=cancellationHandlers;cancellationHandlers.removeAll()
     lock.unlock()
     connectionLog("First transport termination: \(value)")
     for socket in current{socket.interrupt()}
+    for handler in handlers{handler()}
   }
 }
 func connectBound(_ socket: OwnedSocket, _ address: sockaddr_in, _ context: SessionContext,timeout:Double=5) throws {
@@ -1062,6 +1070,18 @@ final class Relay {
   var inject = false
   var experimental = true
   var appGestureExperimental = true
+  @MainActor lazy var fileTransfer = FileTransferCoordinator()
+  private var fileSafetyTimer:Timer?
+  @MainActor private func startFileTransfer(_ session:FileSession,generation expected:UUID,context expectedContext:SessionContext) {
+    fileTransfer.configure(session)
+    fileSafetyTimer?.invalidate()
+    fileSafetyTimer=Timer.scheduledTimer(withTimeInterval:0.2,repeats:true) { [weak self,weak expectedContext] _ in
+      MainActor.assumeIsolated {
+        guard let self,let expectedContext else{return}
+        self.fileTransfer.pollSafety(self.generation==expected && self.context === expectedContext && !expectedContext.cancelled && self.authenticated && !self.lockedTransportOnly && !self.bridgeInputSuspended && self.currentSessionBlockReason()==nil)
+      }
+    }
+  }
   private var imageClipboardCompatible=false
   private var imageClipboardController:ImageClipboardController?
   var imageClipboardEnabled=false
@@ -3089,6 +3109,8 @@ final class Relay {
     return sawCancellationBeforeCallback && !recovery.needsRecovery && context.cancelled
   }
   func stop(reason:String="Local Stop") {
+    fileSafetyTimer?.invalidate();fileSafetyTimer=nil
+    MainActor.assumeIsolated{fileTransfer.configure(nil)}
     if let clipboard=imageClipboardController {MainActor.assumeIsolated{clipboard.stop()};imageClipboardController=nil}
     imageClipboardCompatible=false
     abortDesktopReplay()
@@ -3738,7 +3760,7 @@ final class Relay {
           seal(
             Wire(
               concurrentDisplayCodec:1,kind: sendMode ? "sender-hello-v5" : "receiver-hello-v5", session: localSession,
-              sequence: 0, os: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,osBuild:systemBuildIdentifier(),gestureCodec:DockGestureCodec.supported ? 1 : 0,appGestureCodec:AppGestureCodec.supported ? 1 : 0,cursorVisibilityCodec:1,peerDisplayName:ConnectionNotificationTracker.displayName(Host.current().localizedName ?? "ThunderControl Mac"),multiDisplayDesktopCodec:1,desktopGestureCodec:DockGestureCodec.supported ? 1:0,systemControlKeyCodec:1,videoQualityCodec:localVideoQualityCodec,bridgeRecoveryCodec:1,displayPreferenceCodec:1,desktopAppGestureCodec:AppGestureCodec.supported ? 1:0,imageClipboardCodec:1,imageClipboardIsolationCodec:1), k))
+              sequence: 0, os: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,osBuild:systemBuildIdentifier(),gestureCodec:DockGestureCodec.supported ? 1 : 0,appGestureCodec:AppGestureCodec.supported ? 1 : 0,cursorVisibilityCodec:1,peerDisplayName:ConnectionNotificationTracker.displayName(Host.current().localizedName ?? "ThunderControl Mac"),multiDisplayDesktopCodec:1,desktopGestureCodec:DockGestureCodec.supported ? 1:0,systemControlKeyCodec:1,videoQualityCodec:localVideoQualityCodec,bridgeRecoveryCodec:1,displayPreferenceCodec:1,desktopAppGestureCodec:AppGestureCodec.supported ? 1:0,fileTransferCodec:1,imageClipboardCodec:1,imageClipboardIsolationCodec:1), k))
         var remoteHello = try unseal(readFrame(c), k)
         guard (sendMode || remoteHello.session==pairingScope),remoteHello.kind == (sendMode ? "receiver-hello-v5" : "sender-hello-v5") else {
           throw Failure("Handshake role mismatch")
@@ -3768,6 +3790,9 @@ final class Relay {
           k, sender: senderNonce, receiver: receiverNonce, reverse: !sendMode)
         let incomingKey = connectionKey(
           k, sender: senderNonce, receiver: receiverNonce, reverse: sendMode)
+        let fileSession:FileSession? = remoteHello.fileTransferCodec==1 ? DisplayPeerRoute.authenticatedSocketHost(c).map { host in
+          FileSession(root:FileSession.purposeRoot(k,local:localSession,peer:remoteHello.session),inputIDs:[localSession,remoteHello.session].sorted().joined(separator:"|"),localIP:b.ip,interfaceIndex:b.index,peerIP:host,cancelled:{sessionContext.cancelled},onCancel:{sessionContext.addCancellationHandler($0)})
+        } : nil
         var peerValidator = PeerValidator(senderPeer: !sendMode, session: remoteHello.session,cursorVisibilitySupported:visibilityCompatible,concurrentDisplaySupported:displayCompatible,multiDisplayDesktopSupported:multiDisplayDesktopCompatibleNegotiated,desktopGesturesSupported:desktopSystemGestureNegotiated,desktopAppGesturesSupported:desktopAppGestureNegotiated,displayPreferenceSupported:displayPreferenceNegotiated,systemControlKeysSupported:systemControlKeysNegotiated,bridgeRecoverySupported:bridgeRecoveryNegotiated,imageClipboardSupported:imageClipboardWireSupported)
         timeout.tv_sec = 0
         setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
@@ -3815,6 +3840,7 @@ final class Relay {
             guard inputPermissionsReady() else{self.safetyStop("Input permissions missing after authentication");return}
             try self.capture()
             if imageClipboardNegotiated {self.startImageClipboard(generation:g,context:sessionContext)}
+            if let fileSession {self.startFileTransfer(fileSession,generation:g,context:sessionContext)}
             if !self.sender,self.automaticSharingInputAllowed(false) {self.consent(true)}
             self.status(visibilityCompatible ? TCText("Two-way cursor visibility switching available: enable automatic switching and Receiver input to show the cursor only on the active Mac.") : TCText("Two-way cursor visibility requires 0.6.6 or later on both Macs. Existing input forwarding continues."))
             self.status(appCompatible ? TCText("App zoom/rotate/swipe enabled by default") : TCText("App gestures unavailable because OS builds differ."))
@@ -3844,6 +3870,7 @@ final class Relay {
   @discardableResult private func quarantineBridgeInput(local:Bool,now:Double)->Bool {
     guard displayBarrier==nil else{stop(reason:"Display transition interrupted by link recovery");return false}
     let alreadySuspended=bridgeInputSuspended
+    MainActor.assumeIsolated{fileTransfer.pollSafety(false)}
     imageClipboardController?.sendGate.revoke()
     bridgeRecovery.begin(local:local,now:now)
     if let clipboard=imageClipboardController {MainActor.assumeIsolated{clipboard.poll()}}
@@ -5315,6 +5342,7 @@ final class PasteCommandProbe: NSResponder {
     appearanceTab.view=setupImageClipboardUI(appearance.makePreferencesView())
     #endif
     settingsTabs.addTabViewItem(appearanceTab)
+    let fileTab=NSTabViewItem(identifier:"files");fileTab.label=TCText("Files");fileTab.view=FileTransferView(coordinator:relay.fileTransfer);settingsTabs.addTabViewItem(fileTab)
     installDisplaySharing()
     screenLayout.onArrangementChanged = { [weak self] right,value in self?.setScreenArrangement(remoteOnRight:right,offset:value) }
     screenLayout.onSourceOriginChanged = { [weak self] origin in guard let self else{return}; _ = self.relay.setSourceOrigin(origin,fromLocalLayoutDrag:self.screenLayout.isSourceDragActive); self.refreshLayout() }
@@ -5503,7 +5531,7 @@ final class PasteCommandProbe: NSResponder {
       flag + 1 < CommandLine.arguments.count
     {
       verifyUnlockStatusUIForTests()
-      check(settingsTabs.numberOfTabViewItems == 4)
+      check(settingsTabs.numberOfTabViewItems == 5)
       check(displayPreferenceToggle.superview === sendSection)
       check(displayStatus.superview === sendSection.superview)
       check(!settingsTabs.tabViewItems.contains{($0.identifier as? String)=="displayStream"})
@@ -5566,9 +5594,9 @@ final class PasteCommandProbe: NSResponder {
             else { throw Failure("A required UI control lies outside the window") }
           }
           self.mode.selectedSegment=1;self.refreshModeUI()
-          check(self.sendSection.isHidden && !self.receiveSection.isHidden && self.settingsTabs.numberOfTabViewItems==3)
+          check(self.sendSection.isHidden && !self.receiveSection.isHidden && self.settingsTabs.numberOfTabViewItems==4)
           self.mode.selectedSegment=0;self.refreshModeUI()
-          check(!self.sendSection.isHidden && self.receiveSection.isHidden && self.settingsTabs.numberOfTabViewItems==4)
+          check(!self.sendSection.isHidden && self.receiveSection.isHidden && self.settingsTabs.numberOfTabViewItems==5)
           self.relay.remoteDisplaySize=CGSize(width:1920,height:1080);self.relay.auto=true;self.refreshLayout()
           check(self.screenLayout.isInteractionEnabled && self.layoutOffsetField.isEnabled)
           self.setLayoutOffset(40);check(self.relay.auto && self.relay.layoutOffsetY==40)

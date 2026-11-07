@@ -284,3 +284,23 @@
 "Image clipboard sent" = "Image clipboard sent";
 "Image clipboard received" = "Image clipboard received";
 "Image clipboard image is unsupported or exceeds 8 MiB." = "Image clipboard image is unsupported or exceeds 8 MiB.";
+
+"Files" = "Files";
+"Connect both Macs with file transfer support." = "Connect both Macs with file transfer support.";
+"Choose File…" = "Choose File…";
+"Accept and Save…" = "Accept and Save…";
+"Cancel Transfer" = "Cancel Transfer";
+"Send one file to the paired Mac" = "Send one file to the paired Mac";
+"Drop one regular file here or choose a file. The receiving Mac chooses where to save it. Folders and links are not supported. Maximum 64 GiB." = "Drop one regular file here or choose a file. The receiving Mac chooses where to save it. Folders and links are not supported. Maximum 64 GiB.";
+"Ready. Drop a file here." = "Ready. Drop a file here.";
+"Preparing file…" = "Preparing file…";
+"Waiting for approval: {0}" = "Waiting for approval: {0}";
+"Incoming: {0} ({1})" = "Incoming: {0} ({1})";
+"Transferring: {0}" = "Transferring: {0}";
+"Verifying file…" = "Verifying file…";
+"Completed: {0}" = "Completed: {0}";
+"Transfer cancelled." = "Transfer cancelled.";
+"File connection unavailable." = "File connection unavailable.";
+"Delivery unconfirmed. Check the receiving Mac before sending again." = "Delivery unconfirmed. Check the receiving Mac before sending again.";
+"File transfer failed or was declined. No existing destination was replaced." = "File transfer failed or was declined. No existing destination was replaced.";
+"Existing files are not replaced. Choose a different name if it already exists." = "Existing files are not replaced. Choose a different name if it already exists.";
