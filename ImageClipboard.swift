@@ -1,0 +1,294 @@
+import AppKit
+import ImageIO
+import UniformTypeIdentifiers
+
+struct ImageClipboardPacket: Codable, Equatable {
+    enum Operation: String, Codable { case consent, chunk, ack, cancel }
+    var op: Operation
+    var epoch: String
+    var peerEpoch: String? = nil
+    var enabled: Bool? = nil
+    var id: String? = nil
+    var offset: Int? = nil
+    var totalBytes: Int? = nil
+    var bytes: Data? = nil
+    var valid: Bool {
+        func uuid(_ s: String?) -> Bool { guard let s else { return false }; return UUID(uuidString: s)?.uuidString == s }
+        guard uuid(epoch) else { return false }
+        if op == .consent {
+            return enabled != nil && peerEpoch == nil && id == nil && offset == nil && totalBytes == nil && bytes == nil
+        }
+        guard uuid(peerEpoch), uuid(id), enabled == nil else { return false }
+        switch op {
+        case .chunk:
+            guard let offset, let totalBytes, let bytes else { return false }
+            return (1...32768).contains(bytes.count) && (1...8388608).contains(totalBytes) && offset >= 0 && offset <= totalBytes - bytes.count
+        case .ack:
+            return offset.map { (1...8388608).contains($0) } == true && totalBytes == nil && bytes == nil
+        case .cancel:
+            return offset == nil && totalBytes == nil && bytes == nil
+        case .consent: return false
+        }
+    }
+}
+
+final class ImageClipboardSendGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var consent: ImageClipboardPacket
+    private var peer: String?
+    private var allowed = false
+    private var outgoing: String?
+    private var incoming: String?
+    init() { consent = .init(op: .consent, epoch: UUID().uuidString, enabled: false) }
+    fileprivate func update(epoch: String, enabled: Bool, peer: String?, allowed: Bool, outgoing: String?, incoming: String?) {
+        lock.lock(); defer { lock.unlock() }
+        consent = .init(op: .consent, epoch: epoch, enabled: enabled)
+        self.peer = peer; self.allowed = allowed; self.outgoing = outgoing; self.incoming = incoming
+    }
+    func revoke() {
+        lock.lock(); defer { lock.unlock() }
+        allowed = false; consent.enabled = false; outgoing = nil; incoming = nil
+    }
+    func packetForTransmission(_ original: ImageClipboardPacket) -> ImageClipboardPacket {
+        lock.lock(); defer { lock.unlock() }
+        if original.op == .consent { return consent }
+        let bound = allowed && original.valid && original.epoch == consent.epoch && original.peerEpoch == peer
+        let current = original.op == .chunk ? original.id == outgoing : original.op == .ack ? original.id == incoming : true
+        if bound && current { return original }
+        // Preserve the outer sequence slot, but never retain revoked image bytes.
+        return .init(op: .cancel, epoch: original.epoch, peerEpoch: original.peerEpoch, id: original.id)
+    }
+}
+
+@MainActor final class ImageClipboardController {
+    var send: ((ImageClipboardPacket) -> Bool)?
+    var isSafe: () -> Bool = { false }
+    var onStatus: ((String) -> Void)?
+    let sendGate = ImageClipboardSendGate()
+    private let board: NSPasteboard
+    private var enabled: Bool
+    private var running = false
+    private var safe = false
+    private var active = false
+    private var epoch = UUID().uuidString
+    private var peerEpoch: String?
+    private var peerEnabled = false
+    private var retiredEpochs: [String] = []
+    nonisolated private static let conversionPermit = DispatchSemaphore(value: 1)
+    private var seenCount: Int?
+    private var generation = 0
+    private var converting = false
+    private var timer: Timer?
+    private var ackID: String?
+    private struct Outgoing {
+        var id: String; var data: Data; var offset = 0; var pending = 0; var touched = Date()
+    }
+    private struct Incoming {
+        var id: String; var total: Int; var count: Int; var data = Data(); var touched = Date()
+    }
+    private var outgoing: Outgoing?
+    private var incoming: Incoming?
+
+    init(pasteboard: NSPasteboard = .general, enabled: Bool = false) {
+        board = pasteboard; self.enabled = enabled
+        updateGate()
+    }
+    private func updateGate() {
+        sendGate.update(epoch: epoch, enabled: running && safe && enabled, peer: peerEpoch,
+                        allowed: active && running && safe && enabled && peerEnabled,
+                        outgoing: outgoing?.id, incoming: ackID)
+    }
+    private func clearTransfers() {
+        generation += 1; outgoing = nil; incoming = nil; ackID = nil; updateGate()
+    }
+    private func reconcile() {
+        let nowSafe = running && isSafe()
+        if nowSafe != safe {
+            safe = nowSafe; active = false; seenCount = nil; peerEpoch = nil; peerEnabled = false
+            epoch = UUID().uuidString; clearTransfers()
+            if safe { sendConsent() }
+        }
+        let next = running && safe && enabled && peerEnabled && peerEpoch != nil
+        if next != active {
+            active = next; clearTransfers()
+            seenCount = active ? board.changeCount : nil
+            snapshotCount = seenCount
+        }
+        updateGate()
+    }
+    private func emit(_ packet: ImageClipboardPacket) -> Bool {
+        guard running, safe, isSafe(), packet.valid else { return false }
+        return send?(packet) ?? false
+    }
+    private func sendConsent() {
+        updateGate()
+        _ = emit(.init(op: .consent, epoch: epoch, enabled: enabled))
+    }
+    func start() {
+        guard !running else { return }
+        running = true; reconcile()
+        timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.poll() }
+        }
+    }
+    func stop() {
+        guard running else { return }
+        active = false; clearTransfers()
+        _ = emit(.init(op: .consent, epoch: epoch, enabled: false))
+        running = false; safe = false; epoch = UUID().uuidString
+        peerEpoch = nil; peerEnabled = false; seenCount = nil
+        timer?.invalidate(); timer = nil; updateGate()
+    }
+    func setEnabled(_ value: Bool) {
+        guard enabled != value else { return }
+        enabled = value; epoch = UUID().uuidString; active = false; seenCount = nil
+        clearTransfers(); reconcile(); sendConsent()
+        onStatus?(value ? "Image clipboard enabled" : "Image clipboard off")
+    }
+    private func cancel(_ id: String) {
+        guard let peerEpoch else { return }
+        _ = emit(.init(op: .cancel, epoch: epoch, peerEpoch: peerEpoch, id: id))
+    }
+    func poll() {
+        guard running else { return }
+        reconcile()
+        guard active, isSafe() else { return }
+        let count = board.changeCount
+        if count != seenCount {
+            if let outgoing { cancel(outgoing.id) }
+            if let incoming { cancel(incoming.id) }
+            clearTransfers(); seenCount = count
+        }
+        let now = Date()
+        if let outgoing, now.timeIntervalSince(outgoing.touched) >= 10 { cancel(outgoing.id); self.outgoing = nil; updateGate(); onStatus?("Image clipboard timed out") }
+        if let incoming, now.timeIntervalSince(incoming.touched) >= 10 { cancel(incoming.id); self.incoming = nil; ackID = nil; updateGate() }
+        if outgoing?.pending == 0 { sendNext() }
+        guard !converting, outgoing == nil, count != snapshotCount else { return }
+        guard let types = board.types, types.contains(.png) || types.contains(.tiff) else { snapshotCount = count; return }
+        // Bound raw snapshots and conversions across reconnecting controller instances.
+        guard Self.conversionPermit.wait(timeout: .now()) == .success else { return }
+        snapshotCount = count
+        let png = types.contains(.png) ? board.data(forType: .png) : nil
+        let tiff = types.contains(.tiff) ? board.data(forType: .tiff) : nil
+        guard (png?.count ?? 0) <= 67108864, (tiff?.count ?? 0) <= 67108864 else { Self.conversionPermit.signal(); return }
+        let token = generation
+        converting = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            defer { Self.conversionPermit.signal() }
+            let result = Self.canonicalPNG(png: png, tiff: tiff)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.converting = false
+                self.reconcile()
+                guard self.active, self.isSafe(), self.generation == token,
+                      self.board.changeCount == count, let result else { return }
+                self.outgoing = Outgoing(id: UUID().uuidString, data: result)
+                self.updateGate(); self.sendNext()
+            }
+        }
+    }
+    private var snapshotCount: Int? // Last snapshot attempted, including unsupported clipboard contents.
+    private func sendNext() {
+        reconcile()
+        guard active, isSafe(), var transfer = outgoing, transfer.pending == 0, let peerEpoch else { return }
+        guard board.changeCount == seenCount else { poll(); return }
+        let end = min(transfer.offset + 32768, transfer.data.count)
+        let packet = ImageClipboardPacket(op: .chunk, epoch: epoch, peerEpoch: peerEpoch, id: transfer.id,
+                                         offset: transfer.offset, totalBytes: transfer.data.count,
+                                         bytes: transfer.data.subdata(in: transfer.offset..<end))
+        transfer.pending = end; outgoing = transfer; updateGate()
+        if emit(packet) { outgoing?.touched = Date() }
+        else { outgoing?.pending = 0; updateGate(); onStatus?("Image clipboard unavailable") }
+    }
+    func receive(_ packet: ImageClipboardPacket) {
+        guard running else { return }
+        reconcile()
+        guard safe, isSafe(), packet.valid else { return }
+        if packet.op == .consent {
+            guard !retiredEpochs.contains(packet.epoch) else { return }
+            let changed = packet.epoch != peerEpoch
+            if changed || packet.enabled != peerEnabled {
+                if changed, let peerEpoch {
+                    retiredEpochs.append(peerEpoch)
+                    if retiredEpochs.count > 128 { retiredEpochs.removeFirst() }
+                }
+                clearTransfers(); active = false; seenCount = nil
+                peerEpoch = packet.epoch; peerEnabled = packet.enabled == true
+                reconcile()
+                if changed { sendConsent() }
+            }
+            return
+        }
+        guard active, packet.epoch == peerEpoch, packet.peerEpoch == epoch, let id = packet.id else { return }
+        switch packet.op {
+        case .cancel:
+            if outgoing?.id == id { outgoing = nil }
+            if incoming?.id == id { incoming = nil; ackID = nil }
+            updateGate()
+        case .ack:
+            guard var transfer = outgoing, transfer.id == id, transfer.pending != 0, packet.offset == transfer.pending else { return }
+            transfer.offset = transfer.pending; transfer.pending = 0; transfer.touched = Date()
+            if transfer.offset == transfer.data.count {
+                outgoing = nil; updateGate(); onStatus?("Image clipboard sent")
+            } else {
+                outgoing = transfer
+                DispatchQueue.main.async { [weak self] in self?.sendNext() }
+            }
+        case .chunk:
+            guard let offset = packet.offset, let total = packet.totalBytes, let bytes = packet.bytes else { return }
+            if incoming == nil {
+                guard offset == 0, board.changeCount == seenCount else { cancel(id); return }
+                incoming = Incoming(id: id, total: total, count: board.changeCount)
+            }
+            guard var transfer = incoming, transfer.id == id, transfer.total == total, transfer.data.count == offset,
+                  board.changeCount == transfer.count else {
+                cancel(id); incoming = nil; ackID = nil; updateGate(); return
+            }
+            transfer.data.append(bytes); transfer.touched = Date(); incoming = transfer
+            if transfer.data.count == total {
+                guard Self.validImage(transfer.data, pngOnly: true), active, isSafe(),
+                      board.changeCount == transfer.count else {
+                    cancel(id); incoming = nil; ackID = nil; updateGate(); return
+                }
+                board.clearContents()
+                guard board.setData(transfer.data, forType: .png) else {
+                    incoming = nil; ackID = nil; updateGate(); cancel(id); return
+                }
+                seenCount = board.changeCount; snapshotCount = seenCount
+                if let outgoing { cancel(outgoing.id) }
+                outgoing = nil; incoming = nil; generation += 1
+                onStatus?("Image clipboard received")
+            }
+            ackID = id; updateGate()
+            if !emit(.init(op: .ack, epoch: epoch, peerEpoch: peerEpoch, id: id, offset: transfer.data.count)) {
+                incoming = nil; ackID = nil; updateGate()
+            }
+        case .consent: break
+        }
+    }
+    nonisolated private static func validImage(_ data: Data, pngOnly: Bool) -> Bool {
+        guard !data.isEmpty, data.count <= (pngOnly ? 8388608 : 67108864),
+              let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
+              CGImageSourceGetCount(source) == 1,
+              CGImageSourceGetStatus(source) == .statusComplete,
+              CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete,
+              let kind = CGImageSourceGetType(source) as String?,
+              kind == UTType.png.identifier || (!pngOnly && kind == UTType.tiff.identifier),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = props[kCGImagePropertyPixelWidth] as? Int,
+              let height = props[kCGImagePropertyPixelHeight] as? Int else { return false }
+        return width > 0 && height > 0 && width <= 16384 && height <= 16384 && width <= 32000000 / height
+    }
+    nonisolated private static func canonicalPNG(png: Data?, tiff: Data?) -> Data? {
+        if let png, validImage(png, pngOnly: true) { return png }
+        guard let tiff, validImage(tiff, pngOnly: false),
+              let source = CGImageSourceCreateWithData(tiff as CFData, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let output = CFDataCreateMutable(nil, 0),
+              let dest = CGImageDestinationCreateWithData(output, UTType.png.identifier as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(dest, image, nil)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        let result = output as Data
+        return validImage(result, pngOnly: true) ? result : nil
+    }
+}

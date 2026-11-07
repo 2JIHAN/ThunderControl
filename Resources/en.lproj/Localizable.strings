@@ -272,3 +272,15 @@
 "Input connection maintained" = "Input connection maintained";
 "Input sharing waits for held keys, buttons or gestures to finish." = "Input sharing waits for held keys, buttons or gestures to finish.";
 "Input handoff is already in progress." = "Input handoff is already in progress.";
+
+"Share copied images with the paired Mac" = "Share copied images with the paired Mac";
+"Both Macs need 0.9.6 or later and image sharing enabled. Only newly copied images are shared. PNG and TIFF are sent as PNG, up to 8 MiB. Text and files are not shared." = "Both Macs need 0.9.6 or later and image sharing enabled. Only newly copied images are shared. PNG and TIFF are sent as PNG, up to 8 MiB. Text and files are not shared.";
+"Image clipboard sharing is off." = "Image clipboard sharing is off.";
+"Image clipboard: waiting for both Macs to update and enable sharing." = "Image clipboard: waiting for both Macs to update and enable sharing.";
+"Image clipboard enabled" = "Image clipboard enabled";
+"Image clipboard off" = "Image clipboard off";
+"Image clipboard timed out" = "Image clipboard timed out";
+"Image clipboard unavailable" = "Image clipboard unavailable";
+"Image clipboard sent" = "Image clipboard sent";
+"Image clipboard received" = "Image clipboard received";
+"Image clipboard image is unsupported or exceeds 8 MiB." = "Image clipboard image is unsupported or exceeds 8 MiB.";

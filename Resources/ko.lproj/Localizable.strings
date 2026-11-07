@@ -272,3 +272,15 @@
 "Input connection maintained" = "입력 연결 유지 중";
 "Input sharing waits for held keys, buttons or gestures to finish." = "누른 키, 마우스 버튼 또는 제스처가 끝나면 입력을 공유할 수 있습니다.";
 "Input handoff is already in progress." = "입력 제어권을 전환하고 있습니다.";
+
+"Share copied images with the paired Mac" = "연결된 Mac과 복사한 이미지 공유";
+"Both Macs need 0.9.6 or later and image sharing enabled. Only newly copied images are shared. PNG and TIFF are sent as PNG, up to 8 MiB. Text and files are not shared." = "두 Mac 모두 0.9.6 이상에서 이미지 공유를 켜야 합니다. 새로 복사한 PNG와 TIFF 이미지만 최대 8 MiB의 PNG로 보냅니다. 텍스트와 파일은 공유하지 않습니다.";
+"Image clipboard sharing is off." = "이미지 클립보드 공유 꺼짐";
+"Image clipboard: waiting for both Macs to update and enable sharing." = "두 Mac 모두 업데이트한 뒤 이미지 공유를 켜 주세요.";
+"Image clipboard enabled" = "이미지 클립보드 공유 켜짐";
+"Image clipboard off" = "이미지 클립보드 공유 꺼짐";
+"Image clipboard timed out" = "이미지 전송 시간이 초과됐습니다. 다시 복사해 주세요.";
+"Image clipboard unavailable" = "지금은 이미지를 공유할 수 없습니다.";
+"Image clipboard sent" = "이미지를 상대 Mac에 복사했습니다.";
+"Image clipboard received" = "상대 Mac의 이미지를 클립보드에 받았습니다.";
+"Image clipboard image is unsupported or exceeds 8 MiB." = "지원하지 않는 이미지이거나 8 MiB 한도를 넘습니다.";
