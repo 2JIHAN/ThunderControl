@@ -103,6 +103,7 @@ struct OwnedDisplayMonitor {
   var abortInputTransition:(()->Void)?
   private var transport:DisplayTransport?,viewer:DisplayViewer?,helper:Process?,heartbeat:FileHandle?,timer:Timer?
   private var baseline:DisplayBaseline?,virtualID:CGDirectDisplayID?,expectedPair:LayoutDevicePair?
+  private var physicalRetirement:(id:CGDirectDisplayID,snapshot:PhysicalDisplayMirroring?,required:Bool)?
   private var observers:[(NotificationCenter,NSObjectProtocol)]=[]
 #if TC_VIDEO_OFFMAIN
   private var epoch=UUID() {didSet{publishDelivery()}}
@@ -561,14 +562,24 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
   }
   private func cleanUpHelper() {
     guard cleaning,!pausing,!cleanupRunning else{return};cleanupRunning=true;timer?.invalidate();timer=nil
+    // EOF can retire the display before terminate(), so capture the user's latest
+    // mirror graph before either teardown trigger, never from the startup baseline.
+    if physicalRetirement==nil,let id=virtualID {
+      let required=CGDisplayIsOnline(id) != 0
+      let first=PhysicalDisplayMirroring.read(excluding:id,requireOwned:true)
+      let second=PhysicalDisplayMirroring.read(excluding:id,requireOwned:true)
+      physicalRetirement=(id,first==second ? second:nil,required)
+      connectionLog("Display physical_mirror_capture owned=\(id) stable=\(physicalRetirement?.snapshot != nil) present=\(required)")
+    }
+    let retirement=physicalRetirement
     try? heartbeat?.close();heartbeat=nil
-    let process=helper;helper=nil;let original=baseline,retiredDisplayID=virtualID;virtualID=nil;sourceReady=false;placementSession=nil
+    let process=helper;helper=nil;let original=baseline,retiredDisplayID=retirement?.id ?? virtualID;virtualID=nil;sourceReady=false;placementSession=nil
     if let process,process.isRunning{process.terminate()}
     DispatchQueue.global(qos:.utility).async {[weak self] in
       if let process {for _ in 0..<20{if !process.isRunning{break};Thread.sleep(forTimeInterval:0.1)};if process.isRunning{kill(process.processIdentifier,SIGKILL)};process.waitUntilExit()}
       var restored=false
-      // Check only retirement of the owned display and a valid current OS map.
-      // Never restore an old physical layout over the user's later OS edits.
+      // Adopt the remaining map only after the latest physical mirror graph is
+      // preserved. A supported map alone can hide an OS-induced mirror breakup.
       for _ in 0..<40 {
         if let current=DisplayBaseline.read(),current.supported {
           if let id=retiredDisplayID {restored = !current.ids.contains(id)}
@@ -577,6 +588,11 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
         }
         Thread.sleep(forTimeInterval:0.25)
       }
+      if restored,let id=retiredDisplayID {
+        if let snapshot=retirement?.snapshot {restored=snapshot.repairAfterRemoval(ownedID:id)}
+        else if retirement?.required==true {restored=false}
+        connectionLog("Display physical_mirror_preservation owned=\(id) confirmed=\(restored) captured=\(retirement?.snapshot != nil)")
+      }
       DispatchQueue.main.async {
         guard let self else{return};self.cleanupRunning=false
         guard restored,let original else{self.abortInputTransition?();self.report(TCText("Input stopped for safety because restoration of the original display configuration could not be confirmed. Click Stop Screen Sharing again to check."));return}
@@ -584,7 +600,7 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
           do {guard let finish=self.finishInputDisplay else{throw Failure("Missing input restoration")};try finish(original)}
           catch {self.transitionFailed=true;self.abortInputTransition?();try? self.finishInputDisplay?(original)}
         }
-        self.baseline=nil;self.cleaning=false;self.transitionEngaged=false
+        self.baseline=nil;self.physicalRetirement=nil;self.cleaning=false;self.transitionEngaged=false
         self.report(self.transitionFailed ? TCText("The display was restored, but the input transition could not be confirmed. Check the input connection again."):self.finalMessage)
       }
     }

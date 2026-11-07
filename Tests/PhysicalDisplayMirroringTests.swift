@@ -34,14 +34,23 @@ import Foundation
     deny("vendor changed") { $0.displays[1].vendor += 1 }
     deny("model changed") { $0.displays[1].model += 1 }
     deny("serial changed") { $0.displays[1].serial += 1 }
+    deny("main cannot be an alias") { $0.mainID = 22; $0.displays[1] = display(22, 33, active: false) }
+    deny("too many participants") { $0.displays.append(contentsOf: (40...44).map { display(UInt32($0)) }) }
     deny("main changed") { $0.mainID = 33 }
     deny("root origin changed") { $0.displays[2].bounds.origin.x = 1 }
     deny("root mode changed") { $0.displays[2].mode = fallback }
+    deny("root refresh changed") { $0.displays[2].mode.hz = 30 }
+    deny("root flags changed") { $0.displays[2].mode.flags = 2 }
+    deny("root backing pixels changed") { $0.displays[2].mode.pixelWidth = 5120 }
+    deny("root bounds changed") { $0.displays[2].bounds.size.width = 1920 }
     deny("root inactive") { $0.displays[2].active = false }
     deny("new mirror target") { $0.displays[1].mirror = 11 }
     deny("owned still present") { $0.ownedPresent = true }
     deny("mirror to excluded owned display") { $0.displays[1].mirror = 99 }
     deny("cycle") { $0.displays[0].mirror = 33; $0.displays[2].mirror = 11 }
+    deny("self mirror") { $0.displays[1].mirror = 22 }
+    deny("inactive lost alias") { $0.displays[1].active = false }
+    deny("duplicate identity") { $0.displays[1].uuid = "physical-11" }
     deny("duplicate ID") { $0.displays[1].id = 11 }
     var invalidSaved = saved
     invalidSaved.ownedPresent = false
@@ -50,6 +59,18 @@ import Foundation
     expect(invalidSaved.repairPlan(current: lost) == nil, "invalid saved graph")
     var aliasChanged = saved; aliasChanged.ownedPresent = false; aliasChanged.displays[1].mode = fallback
     expect(saved.repairPlan(current: aliasChanged) == nil, "unchanged mirror with changed state denied")
+    var startup = saved
+    startup.displays[2].mode = fallback
+    expect(startup.repairPlan(current: lost) == nil, "startup snapshot cannot overwrite latest root")
+    var independent = saved
+    independent.displays[1] = display(22)
+    var independentNow = independent; independentNow.ownedPresent = false
+    expect(independent.repairPlan(current: independentNow) == [], "no existing aliases means no writes")
+    var mixedSaved = saved
+    mixedSaved.displays.append(display(44, 33, active: false))
+    var mixedNow = lost
+    mixedNow.displays.append(display(44, 33, active: false))
+    expect(mixedSaved.repairPlan(current: mixedNow) == plan, "only lost alias restored, existing mirror untouched")
     print("PhysicalDisplayMirroringTests: \(failures) failures")
     return failures
 }
