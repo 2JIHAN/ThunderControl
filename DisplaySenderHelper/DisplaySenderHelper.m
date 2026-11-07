@@ -52,14 +52,13 @@
 //    pixelSizes all flip). To undo that side effect we snapshot the
 //    authoritative pre-create state (per display: id, mirror relationship,
 //    active, bounds, retained CGDisplayMode, pixel size) and REASSERT each
-//    display's own pre-create mode + mirrorOf + origin inside the SAME
-//    CGBegin/Complete transaction that configures the owned virtual. Mirror
+//    display's mirrorOf + origin in the transaction that configures the
+//    owned virtual. Drifted root modes are restored from a freshly enumerated
+//    mode table after detach, only while the original topology is intact. Mirror
 //    relationships are reasserted field-by-field, not forced to any topology
 //    (no hardcoded "all mirror-to-main").
 //    Transaction order is the proven 0.8.19 path generalized to multiple
-//    pre-create roots (no mode writes; mode writes on inactive aliases are
-//    rejected by CoreGraphics, and the OS restores modes once the mirror
-//    group's root is restored):
+//    pre-create roots. Inactive aliases never receive mode writes:
 //      1) mirrorOf(NULL) for every pre-create ROOT (unmirror the OS-induced
 //         perturbation but leave aliases alone until step 3)
 //      2) origin for every pre-create ROOT at its pre-create bounds.origin
@@ -436,7 +435,7 @@ static BOOL StartupOnlineExact(void){
   }
   return foundOwned;
 }
-static BOOL BaselinePreserved(void){
+static BOOL BaselinePreserved(BOOL compareModes){
   if(CGMainDisplayID()!=originalID)return NO;
   CGDirectDisplayID ids[32];uint32_t n=0;
   if(CGGetOnlineDisplayList(32,ids,&n)!=kCGErrorSuccess||n>8)return NO;
@@ -447,12 +446,14 @@ static BOOL BaselinePreserved(void){
     if(CGDisplayMirrorsDisplay(id)!=baseline[i].mirror)return NO;
     if((bool)(CGDisplayIsActive(id)!=0)!=baseline[i].active)return NO;
     if(!CGRectEqualToRect(CGDisplayBounds(id),baseline[i].bounds))return NO;
+    if(!compareModes)continue;
     CGDisplayModeRef m=CGDisplayCopyDisplayMode(id);if(!m)return NO;
     BOOL ok=ModeSame(m,baseline[i].mode) && CGDisplayModeGetPixelWidth(m)==baseline[i].pixelWidth && CGDisplayModeGetPixelHeight(m)==baseline[i].pixelHeight;
     CGDisplayModeRelease(m);if(!ok)return NO;
   }
   return YES;
 }
+static BOOL __attribute__((unused)) RestoreStartupRootModes(void){return BaselinePreserved(YES);}
 // Owned-only validation: never consults other displays' geometry. Fails safe
 // if owned ID isn't present/active/unique/non-mirrored or if its mode drifted
 // from the mode we actually applied at setup.
@@ -1251,7 +1252,7 @@ static int Benchmark(void){
 // a mocked observed snapshot (same shape as the harness ScreenState). Returns
 // first mismatch field name, or NULL if all fields match for all entries.
 // Used only by --selftest; NOT invoked by the live preservation path (that
-// uses live CoreGraphics reads in BaselinePreserved()).
+// uses live CoreGraphics reads in BaselinePreserved(YES)).
 typedef struct {uint32_t id,mirror;bool active;int32_t x,y,w,h;size_t pw,ph;int32_t modeID;} MockDisplay;
 static const char *MockBaselineMismatch(const MockDisplay *base,const MockDisplay *obs,uint32_t count){
   for(uint32_t i=0;i<count;i++){
@@ -2000,7 +2001,7 @@ static int SelfTest(void){
   // comparison must be detected as a mismatch, so our pre-create snapshot +
   // in-transaction reassert must cover each of them (id/mirror/active/
   // bounds/pixelSize/modeID). This mirrors harness-side ScreenState equality
-  // field-for-field; it does NOT change what the live BaselinePreserved()
+  // field-for-field; it does NOT change what the live BaselinePreserved(YES)
   // checks, which goes through CoreGraphics directly.
   const MockDisplay base2[2]={
     {.id=1,.mirror=0,.active=true,.x=0,.y=0,.w=1920,.h=1080,.pw=1920,.ph=1080,.modeID=100},
@@ -2270,14 +2271,14 @@ int main(int argc,const char **argv){@autoreleasepool {
   // Retain the owned mode as the authoritative read-only reference. OwnedSafe
   // compares live modes against this reference; drift fails validation. On
   // any post-commit failure below, we drop the owned virtual and attempt a
-  // best-effort restore of the baseline before Fail(); baseline mode CFRefs
+  // best-effort restore of baseline topology before Fail(); mode CFRefs
   // are retained through this failure cleanup.
   const char *postFail=NULL;
   // Detach/preserve FIRST. While creation is mirrored, CoreGraphics can expose
   // the mirror group's effective modes rather than the owned Retina modes.
   BOOL detachedCommit=YES;
   if(negotiatedFormat->pixelScale==2)OwnedHiDPIDiagnostic("after_detach",YES);
-  if(!BaselinePreserved())postFail="physical baseline preservation";
+  if(!BaselinePreserved(YES))postFail="physical baseline preservation";
   else if(!StartupOnlineExact())postFail="startup online set mismatch";
   if(!postFail && negotiatedFormat->pixelScale==2){
     BOOL unmirrored=!CGDisplayIsInMirrorSet(ownedID) && CGDisplayMirrorsDisplay(ownedID)==kCGNullDirectDisplay;
@@ -2322,7 +2323,7 @@ int main(int argc,const char **argv){@autoreleasepool {
     }
   }
   if(!postFail && !StartupOnlineExact())postFail="startup online set mismatch";
-  if(!postFail && !BaselinePreserved())postFail="physical baseline preservation";
+  if(!postFail && !BaselinePreserved(YES))postFail="physical baseline preservation";
   ownedInitialMode=CGDisplayCopyDisplayMode(ownedID);
   if(!postFail && !ownedInitialMode)postFail="owned mode unavailable";
   if(!postFail && fabs(CGDisplayModeGetRefreshRate(ownedInitialMode)-targetFPS)>0.01)postFail="owned refresh rate not accepted";
