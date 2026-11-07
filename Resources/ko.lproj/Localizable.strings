@@ -274,7 +274,7 @@
 "Input handoff is already in progress." = "입력 제어권을 전환하고 있습니다.";
 
 "Share copied images with the paired Mac" = "연결된 Mac과 복사한 이미지 공유";
-"Both Macs need 0.9.6 or later and image sharing enabled. Only newly copied images are shared. PNG and TIFF are sent as PNG, up to 8 MiB. Text and files are not shared." = "두 Mac 모두 0.9.6 이상에서 이미지 공유를 켜야 합니다. 새로 복사한 PNG와 TIFF 이미지만 최대 8 MiB의 PNG로 보냅니다. 텍스트와 파일은 공유하지 않습니다.";
+"Both Macs need 0.9.7 or later and image sharing enabled. Only newly copied images are shared. PNG and TIFF are sent as PNG, up to 8 MiB. Text and files are not shared." = "두 Mac 모두 0.9.7 이상에서 이미지 공유를 켜야 합니다. 새로 복사한 PNG와 TIFF 이미지만 최대 8 MiB의 PNG로 보냅니다. 텍스트와 파일은 공유하지 않습니다.";
 "Image clipboard sharing is off." = "이미지 클립보드 공유 꺼짐";
 "Image clipboard: waiting for both Macs to update and enable sharing." = "두 Mac 모두 업데이트한 뒤 이미지 공유를 켜 주세요.";
 "Image clipboard enabled" = "이미지 클립보드 공유 켜짐";

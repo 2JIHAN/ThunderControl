@@ -7,7 +7,7 @@ import AppKit
     imageClipboardToggle.state=enabled ? .on:.off
     imageClipboardToggle.target=self;imageClipboardToggle.action=#selector(toggleImageClipboard)
     imageClipboardToggle.setAccessibilityIdentifier("imageClipboardSharing")
-    imageClipboardToggle.toolTip=TCText("Both Macs need 0.9.6 or later and image sharing enabled. Only newly copied images are shared. PNG and TIFF are sent as PNG, up to 8 MiB. Text and files are not shared.")
+    imageClipboardToggle.toolTip=TCText("Both Macs need 0.9.7 or later and image sharing enabled. Only newly copied images are shared. PNG and TIFF are sent as PNG, up to 8 MiB. Text and files are not shared.")
     stack.addArrangedSubview(imageClipboardToggle)
     imageClipboardStatus.font = .systemFont(ofSize:12)
     imageClipboardStatus.textColor = .secondaryLabelColor

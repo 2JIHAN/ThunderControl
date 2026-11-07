@@ -169,6 +169,7 @@ struct Wire: Codable {
   var desktopGestureTargetID:UInt32? = nil
   var desktopAppGestureCodec:Int? = nil
   var imageClipboardCodec:Int? = nil
+  var imageClipboardIsolationCodec:Int? = nil
   var imageClipboard:ImageClipboardPacket? = nil
 }
 struct DesktopSystemGestureTarget:Equatable {
@@ -366,7 +367,8 @@ struct Validator {
       guard w.kind == "hello", w.sequence == 0, let id = UUID(uuidString: w.session),
         id.uuidString == w.session, w.data == nil,
         (w.desktopAppGestureCodec==nil || w.desktopAppGestureCodec==0 || w.desktopAppGestureCodec==1),
-        (w.imageClipboardCodec==nil || w.imageClipboardCodec==1),w.imageClipboard==nil
+        (w.imageClipboardCodec==nil || w.imageClipboardCodec==1),
+        (w.imageClipboardIsolationCodec==nil || w.imageClipboardIsolationCodec==1),w.imageClipboard==nil
       else { throw Failure("Invalid hello") }
       session = w.session
       next = 1
@@ -557,7 +559,7 @@ struct PeerValidator {
       guard imageClipboardSupported,ImageClipboardWirePolicy.validEnvelope(w) else{throw Failure("Invalid image clipboard envelope")}
       next += 1;return
     }
-    guard w.imageClipboard==nil,w.imageClipboardCodec==nil else{throw Failure("Unexpected image clipboard fields")}
+    guard w.imageClipboard==nil,w.imageClipboardCodec==nil,w.imageClipboardIsolationCodec==nil else{throw Failure("Unexpected image clipboard fields")}
     guard w.desktopAppGestureCodec==nil else{throw Failure("Unexpected desktop app gesture capability")}
     guard w.bridgeRecoveryCodec==nil else{throw Failure("Unexpected bridge recovery capability")}
     if ["linkReset","linkReady","inputLease"].contains(w.kind) {
@@ -3730,7 +3732,7 @@ final class Relay {
           seal(
             Wire(
               concurrentDisplayCodec:1,kind: sendMode ? "sender-hello-v5" : "receiver-hello-v5", session: localSession,
-              sequence: 0, os: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,osBuild:systemBuildIdentifier(),gestureCodec:DockGestureCodec.supported ? 1 : 0,appGestureCodec:AppGestureCodec.supported ? 1 : 0,cursorVisibilityCodec:1,peerDisplayName:ConnectionNotificationTracker.displayName(Host.current().localizedName ?? "ThunderControl Mac"),multiDisplayDesktopCodec:1,desktopGestureCodec:DockGestureCodec.supported ? 1:0,systemControlKeyCodec:1,videoQualityCodec:localVideoQualityCodec,bridgeRecoveryCodec:1,displayPreferenceCodec:1,desktopAppGestureCodec:AppGestureCodec.supported ? 1:0,imageClipboardCodec:1), k))
+              sequence: 0, os: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,osBuild:systemBuildIdentifier(),gestureCodec:DockGestureCodec.supported ? 1 : 0,appGestureCodec:AppGestureCodec.supported ? 1 : 0,cursorVisibilityCodec:1,peerDisplayName:ConnectionNotificationTracker.displayName(Host.current().localizedName ?? "ThunderControl Mac"),multiDisplayDesktopCodec:1,desktopGestureCodec:DockGestureCodec.supported ? 1:0,systemControlKeyCodec:1,videoQualityCodec:localVideoQualityCodec,bridgeRecoveryCodec:1,displayPreferenceCodec:1,desktopAppGestureCodec:AppGestureCodec.supported ? 1:0,imageClipboardCodec:1,imageClipboardIsolationCodec:1), k))
         var remoteHello = try unseal(readFrame(c), k)
         guard (sendMode || remoteHello.session==pairingScope),remoteHello.kind == (sendMode ? "receiver-hello-v5" : "sender-hello-v5") else {
           throw Failure("Handshake role mismatch")
@@ -3743,7 +3745,8 @@ final class Relay {
         let displayPreferenceNegotiated=multiDisplayDesktopCompatibleNegotiated && remoteHello.displayPreferenceCodec==1
         let videoQualityNegotiated=localVideoQualityCodec==1 && displayPreferenceNegotiated && remoteHello.videoQualityCodec==1
         let systemControlKeysNegotiated=remoteHello.systemControlKeyCodec==1
-        let imageClipboardNegotiated=remoteHello.imageClipboardCodec==1
+        let imageClipboardWireSupported=remoteHello.imageClipboardCodec==1
+        let imageClipboardNegotiated=ImageClipboardWirePolicy.isolatedSharingSupported(codec:remoteHello.imageClipboardCodec,isolation:remoteHello.imageClipboardIsolationCodec)
         let bridgeRecoveryNegotiated=remoteHello.bridgeRecoveryCodec==1
         let visibilityCompatible=remoteHello.cursorVisibilityCodec==1
         let appCompatible=AppGestureCodec.compatible(build:remoteHello.osBuild,codec:remoteHello.appGestureCodec)
@@ -3759,7 +3762,7 @@ final class Relay {
           k, sender: senderNonce, receiver: receiverNonce, reverse: !sendMode)
         let incomingKey = connectionKey(
           k, sender: senderNonce, receiver: receiverNonce, reverse: sendMode)
-        var peerValidator = PeerValidator(senderPeer: !sendMode, session: remoteHello.session,cursorVisibilitySupported:visibilityCompatible,concurrentDisplaySupported:displayCompatible,multiDisplayDesktopSupported:multiDisplayDesktopCompatibleNegotiated,desktopGesturesSupported:desktopSystemGestureNegotiated,desktopAppGesturesSupported:desktopAppGestureNegotiated,displayPreferenceSupported:displayPreferenceNegotiated,systemControlKeysSupported:systemControlKeysNegotiated,bridgeRecoverySupported:bridgeRecoveryNegotiated,imageClipboardSupported:imageClipboardNegotiated)
+        var peerValidator = PeerValidator(senderPeer: !sendMode, session: remoteHello.session,cursorVisibilitySupported:visibilityCompatible,concurrentDisplaySupported:displayCompatible,multiDisplayDesktopSupported:multiDisplayDesktopCompatibleNegotiated,desktopGesturesSupported:desktopSystemGestureNegotiated,desktopAppGesturesSupported:desktopAppGestureNegotiated,displayPreferenceSupported:displayPreferenceNegotiated,systemControlKeysSupported:systemControlKeysNegotiated,bridgeRecoverySupported:bridgeRecoveryNegotiated,imageClipboardSupported:imageClipboardWireSupported)
         timeout.tv_sec = 0
         setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         DispatchQueue.main.async {

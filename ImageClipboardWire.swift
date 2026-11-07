@@ -1,6 +1,7 @@
 import Foundation
 
 enum ImageClipboardWirePolicy {
+  static func isolatedSharingSupported(codec:Int?,isolation:Int?)->Bool {codec==1 && isolation==1}
   static func validEnvelope(_ w:Wire)->Bool {
     guard w.kind=="imageClipboard",let packet=w.imageClipboard,packet.valid,
       let data=try? JSONEncoder().encode(w),data.count<=96*1024,

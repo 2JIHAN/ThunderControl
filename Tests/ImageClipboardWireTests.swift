@@ -4,6 +4,9 @@ import CryptoKit
 func runImageClipboardWireTests()->Int {
   var failures=0,checks=0
   func check(_ value:Bool,_ label:String){checks+=1;if !value{failures+=1;print("FAIL image clipboard wire: \(label)")}}
+  check(ImageClipboardWirePolicy.isolatedSharingSupported(codec:1,isolation:1),"fixed peers enable image sharing")
+  check(!ImageClipboardWirePolicy.isolatedSharingSupported(codec:1,isolation:nil),"0.9.6 images remain disabled without breaking wire acceptance")
+  check(!ImageClipboardWirePolicy.isolatedSharingSupported(codec:nil,isolation:nil),"older peers remain disabled")
   let session=UUID().uuidString,epoch=UUID().uuidString
   let consent=ImageClipboardPacket(op:.consent,epoch:epoch,enabled:true)
   let wire=Wire(kind:"imageClipboard",session:session,sequence:1,imageClipboard:consent)
