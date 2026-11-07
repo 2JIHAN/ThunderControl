@@ -453,7 +453,52 @@ static BOOL BaselinePreserved(BOOL compareModes){
   }
   return YES;
 }
-static BOOL __attribute__((unused)) RestoreStartupRootModes(void){return BaselinePreserved(YES);}
+static BOOL RestoreStartupRootModes(void){
+  if(atomic_load(&topologyArmed) || !StartupOnlineExact() || !BaselinePreserved(NO))return NO;
+  CGDisplayModeRef requested[8]={0};
+  BOOL valid=YES,drift=NO;
+  NSDictionary *options=@{(__bridge NSString*)kCGDisplayShowDuplicateLowResolutionModes:@YES};
+  for(uint32_t i=0;i<baselineCount && valid;i++){
+    if(baseline[i].mirror!=kCGNullDirectDisplay)continue;
+    CGDisplayModeRef current=CGDisplayCopyDisplayMode(baseline[i].id);
+    valid=current!=NULL;
+    BOOL same=ModeSame(current,baseline[i].mode);
+    if(current)CGDisplayModeRelease(current);
+    if(!valid || same)continue;
+    drift=YES;
+    // Mode objects retained before virtual creation can configure successfully
+    // without restoring the physical mode. Select from the current mode table.
+    CFArrayRef modes=CGDisplayCopyAllDisplayModes(baseline[i].id,(__bridge CFDictionaryRef)options);
+    if(modes){for(CFIndex j=0;j<CFArrayGetCount(modes);j++){
+      CGDisplayModeRef mode=(CGDisplayModeRef)CFArrayGetValueAtIndex(modes,j),saved=baseline[i].mode;
+      double hz=CGDisplayModeGetRefreshRate(mode),savedHz=CGDisplayModeGetRefreshRate(saved);
+      if(CGDisplayModeGetWidth(mode)==CGDisplayModeGetWidth(saved) &&
+         CGDisplayModeGetHeight(mode)==CGDisplayModeGetHeight(saved) &&
+         CGDisplayModeGetPixelWidth(mode)==baseline[i].pixelWidth &&
+         CGDisplayModeGetPixelHeight(mode)==baseline[i].pixelHeight &&
+         isfinite(hz) && isfinite(savedHz) && fabs(hz-savedHz)<0.01 &&
+         CGDisplayModeGetIOFlags(mode)==CGDisplayModeGetIOFlags(saved)){
+        requested[i]=CGDisplayModeRetain(mode);break;
+      }
+    }CFRelease(modes);}
+    if(!requested[i])valid=NO;
+  }
+  if(valid && drift){
+    // Revalidate topology before opening a mode-only startup transaction.
+    valid=!atomic_load(&topologyArmed) && StartupOnlineExact() && BaselinePreserved(NO);
+    CGDisplayConfigRef config=NULL;
+    if(valid)valid=CGBeginDisplayConfiguration(&config)==kCGErrorSuccess;
+    if(valid){
+      CGError error=kCGErrorSuccess;
+      for(uint32_t i=0;i<baselineCount && error==kCGErrorSuccess;i++)
+        if(requested[i])error=CGConfigureDisplayWithDisplayMode(config,baseline[i].id,requested[i],NULL);
+      if(error!=kCGErrorSuccess){CGCancelDisplayConfiguration(config);valid=NO;}
+      else valid=CGCompleteDisplayConfiguration(config,kCGConfigureForSession)==kCGErrorSuccess;
+    }
+  }
+  for(uint32_t i=0;i<baselineCount;i++)if(requested[i])CGDisplayModeRelease(requested[i]);
+  return valid;
+}
 // Owned-only validation: never consults other displays' geometry. Fails safe
 // if owned ID isn't present/active/unique/non-mirrored or if its mode drifted
 // from the mode we actually applied at setup.
@@ -2278,7 +2323,9 @@ int main(int argc,const char **argv){@autoreleasepool {
   // the mirror group's effective modes rather than the owned Retina modes.
   BOOL detachedCommit=YES;
   if(negotiatedFormat->pixelScale==2)OwnedHiDPIDiagnostic("after_detach",YES);
-  if(!BaselinePreserved(YES))postFail="physical baseline preservation";
+  if(!RestoreStartupRootModes())postFail="physical baseline preservation";
+  else {Pump(1);ownedInitialBounds=CGDisplayBounds(ownedID);}
+  if(!postFail && !BaselinePreserved(YES))postFail="physical baseline preservation";
   else if(!StartupOnlineExact())postFail="startup online set mismatch";
   if(!postFail && negotiatedFormat->pixelScale==2){
     BOOL unmirrored=!CGDisplayIsInMirrorSet(ownedID) && CGDisplayMirrorsDisplay(ownedID)==kCGNullDirectDisplay;
