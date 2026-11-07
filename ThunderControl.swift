@@ -1104,6 +1104,47 @@ final class Relay {
   }
   var sharingLifecyclePairForTests:LayoutDevicePair? {get{authenticatedDevicePair} set{authenticatedDevicePair=newValue}}
   var sharingLifecycleCapabilityForTests:Bool {get{displayPreferenceCompatible} set{displayPreferenceCompatible=newValue}}
+  var sourceBoundarySize:CGSize? {topology?.bounds.size}
+  var boundaryBlockedReason:BoundaryBlockedReason? {
+    if !authenticated {return .disconnected}
+    if lockedTransportOnly || sessionLockedSignal || screenSleeping || systemSleeping || displayBarrier != nil || bridgeInputSuspended || automaticReconnectSuspended || ownership.blocked || hasUnresolvedLocalRecovery {return .safety}
+    if !sender {return inject ? nil:.receiverInputDisabled}
+    if !receiverAvailable {return .receiverUnavailable}
+    if !auto {return .senderInputDisabled}
+    if handoff.phase != .local {return .handoffInProgress}
+    if sourceGesture.blockAuto || dockLocalActive || dockOrphanMotion != nil || !localKeys.isEmpty || !localButtons.isEmpty || !localFlags.isEmpty || ProcessInfo.processInfo.systemUptime<gestureUntil {return .inputHeld}
+    if sourceBoundarySize==nil || (multiDisplayDesktopCompatible ? (receiverDesktop==nil || sourceOrigin==nil):remoteDisplaySize==nil) {return .geometry}
+    return nil
+  }
+  private var lastBoundaryDecision=""
+  private var lastBoundaryRejection=""
+  private var lastBoundaryAttempt:DesktopPortal?
+  private var firstPostedBoundaryToken:String?
+  private func boundaryStage(_ stage:String,token:String?=nil,reason:String?=nil,attempt:DesktopPortal?=nil,point:CGPoint?=nil) {
+    let portal=attempt ?? desktopPortal
+    connectionLog("Boundary stage=\(stage) session=\(session.prefix(8)) token=\((token ?? handoff.token ?? "none").prefix(8)) revision=\(attempt == nil ? (desktopHandoffRevision ?? receiverDesktopAdoptedRevision):receiverDesktopAdoptedRevision) targetID=\(portal?.displayID ?? 0) source=\(portal.map{String(describing:$0.sourceRect)} ?? "none") target=\(portal.map{String(describing:$0.targetRect)} ?? "none") point=\((point ?? desktopGlobalPointer).map{String(describing:$0)} ?? "none") reason=\(reason ?? "none")")
+  }
+  private func diagnoseDesktopBoundary(_ p:CGPoint,delta:CGVector,held:Bool) {
+    guard let size=sourceBoundarySize,let origin=sourceOrigin,let map=receiverDesktop else{return}
+    let source=CGRect(origin:origin,size:size)
+    let near=map.portals(sourceRect:source).first { portal in
+      switch portal.sourceSide {
+      case .left:return p.x<=1 && delta.dx<0 && origin.y+p.y>=portal.intervalStart && origin.y+p.y<portal.intervalEnd
+      case .right:return p.x>=size.width-2 && delta.dx>0 && origin.y+p.y>=portal.intervalStart && origin.y+p.y<portal.intervalEnd
+      case .top:return p.y<=1 && delta.dy<0 && origin.x+p.x>=portal.intervalStart && origin.x+p.x<portal.intervalEnd
+      case .bottom:return p.y>=size.height-2 && delta.dy>0 && origin.x+p.x>=portal.intervalStart && origin.x+p.x<portal.intervalEnd
+      }
+    }
+    guard let near else{lastBoundaryDecision="";lastBoundaryRejection="";lastBoundaryAttempt=nil;return}
+    lastBoundaryAttempt=near
+    let reason=boundaryBlockedReason?.rawValue ?? (held ? "held input":nil)
+    let key="\(near.displayID)-\(near.sourceSide)-\(reason ?? "reached")"
+    guard key != lastBoundaryDecision else{return}
+    lastBoundaryDecision=key
+    let point=CGPoint(x:origin.x+p.x,y:origin.y+p.y)
+    boundaryStage("boundary_reached",attempt:near,point:point)
+    if let reason {boundaryStage("crossing_decision",reason:"blocked: "+reason,attempt:near,point:point)}
+  }
   var sharingReadinessSummary:String {"sender=\(sender) auto=\(auto) inject=\(inject) receiverAvailable=\(receiverAvailable) geometry=\(remoteDisplaySize != nil) desktop=\(receiverDesktop != nil) origin=\(sourceOrigin != nil) peerVideo=\(peerDisplayPreference.map(String.init) ?? "none") compatible=\(displayPreferenceCompatible)"}
   private func automaticSharingInputAllowed(_ sending:Bool)->Bool {
     guard let pair=authenticatedDevicePair else{return automaticInputSharingPermitted == nil}
@@ -1918,13 +1959,23 @@ final class Relay {
     guard sender,auto,multiDisplayDesktopCompatible,handoff.phase == .local,
       let desktop=receiverDesktop,desktop.valid,
       let origin=sourceOrigin,
-      let bounds=topology?.bounds,bounds.width>=64,bounds.height>=64 else { return false }
-    let sourceRect=CGRect(origin:origin,size:bounds.size)
+      let sourceSize=sourceBoundarySize,sourceSize.width>=64,sourceSize.height>=64 else { return false }
+    let sourceRect=CGRect(origin:origin,size:sourceSize)
     guard ReceiverDesktop.sane(sourceRect) else { return false }
     let portals=desktop.portals(sourceRect:sourceRect)
     guard !portals.isEmpty else { return false }
-    guard let portal=desktopEntryPolicy.candidate(sourceLocal:sourceLocal,delta:delta,sourceRect:sourceRect,portals:portals,held:held) else{return true}
-    if desktopPhysicalInputsForTests?() ?? physicalInputsHeld() { return true }
+    guard let portal=desktopEntryPolicy.candidate(sourceLocal:sourceLocal,delta:delta,sourceRect:sourceRect,portals:portals,held:held) else{
+      if !lastBoundaryDecision.isEmpty,lastBoundaryRejection != desktopEntryPolicy.blockedReason {
+        boundaryStage("crossing_decision",reason:desktopEntryPolicy.blockedReason,attempt:lastBoundaryAttempt,point:CGPoint(x:origin.x+sourceLocal.x,y:origin.y+sourceLocal.y))
+        lastBoundaryRejection=desktopEntryPolicy.blockedReason
+      }
+      return true
+    }
+    guard boundaryBlockedReason==nil else{return true}
+    if desktopPhysicalInputsForTests?() ?? physicalInputsHeld() {
+      if lastBoundaryRejection != "physical input held" {lastBoundaryRejection="physical input held";boundaryStage("crossing_decision",reason:"physical input held",attempt:portal)}
+      return true
+    }
     let localX=sourceLocal.x,localY=sourceLocal.y
     // Compose entry point: edge touch point on the source rect maps to the
     // portal's target edge via DesktopPortal.targetPoint.
@@ -1946,6 +1997,7 @@ final class Relay {
     handoff.deadline=now+1.5
     handoff.startedAt=now
     if let token=handoff.token { entryMotion.begin(token:token) }
+    boundaryStage("crossing_decision",reason:"accepted")
     status("Desktop handoff: edge reached; acquiring source foreground")
     if let begin=desktopFocusBeginForTests,let token=handoff.token {begin(token)} else{prepareSourceForeground()}
     return true
@@ -1953,6 +2005,7 @@ final class Relay {
   private func sendDesktopBeginControl(token:String)->Bool {
     guard let portal=desktopPortal,let entry=desktopGlobalPointer,let revision=desktopHandoffRevision,
       let desktop=receiverDesktop,revision==desktop.revision,revision==receiverDesktopAdoptedRevision else{forceLocal();return false}
+    boundaryStage("source_begin",token:token)
     let frame=DesktopHandoffRouting.beginFrame(session:session,token:token,portal:portal,entry:entry,revision:revision)
     guard DesktopHandoffRouting.portal(frame,desktop:desktop,publishedRevision:revision)==portal,enqueue(frame) else{forceLocal();return false}
     return true
@@ -2233,6 +2286,9 @@ final class Relay {
   // Drives the actual entry detector, with foreground/physical-input hooks
   // supplied by the isolated test. No CGEvent construction or OS input.
   func desktopPrepareEntryForTests(map:ReceiverDesktop,origin:CGPoint) {
+    if connection==nil {connection=OwnedSocket(-1)}
+    if key==nil {key=SymmetricKey(size:.bits256)}
+    receiverAvailable=true
     receiverDesktop=map;receiverDesktopAdoptedRevision=map.revision;sourceOrigin=origin
     handoff.phase = .local;desktopEntryPolicy.reset();auto=true
   }
@@ -2779,6 +2835,48 @@ final class Relay {
   }
   // Actual Dock routing + focus-loss + active-ack transitions; all outputs,
   // cursor resources and platform observations are inert fixture replacements.
+  @MainActor static func verifyBoundaryReadinessForTests()->Bool {
+    let r=Relay()
+    r.sender=true;r.connection=OwnedSocket(-1);r.key=SymmetricKey(size:.bits256)
+    r.safetyObserversInstalled=true;r.auto=true;r.multiDisplayDesktopCompatible=true
+    r.topology=DisplayTopologySnapshot(mainID:1,activeIDs:[1],bounds:CGRect(x:500,y:200,width:400,height:300))
+    let map=ReceiverDesktop(revision:7,mainID:11,displays:[
+      ReceiverDisplay(id:11,bounds:CGRect(x:0,y:0,width:400,height:300)),
+      ReceiverDisplay(id:42,bounds:CGRect(x:400,y:0,width:400,height:300)),
+      ReceiverDisplay(id:99,bounds:CGRect(x:0,y:-300,width:400,height:300))],virtualDisplayID:99)
+    r.receiverDesktop=map;r.receiverDesktopAdoptedRevision=7;r.sourceOrigin=CGPoint(x:-400,y:-300)
+    guard r.sourceBoundarySize==CGSize(width:400,height:300),map.displays[2].id==99,
+      r.boundaryBlockedReason == .receiverUnavailable else{return false}
+    let preview=ScreenArrangementView(frame:CGRect(x:0,y:0,width:800,height:400))
+    preview.sourceSize=r.sourceBoundarySize ?? .zero;preview.receiverDesktop=map;preview.sourceOrigin=r.sourceOrigin
+    preview.boundaryBlockedReason=r.boundaryBlockedReason?.localized
+    guard preview.sourceSize==r.sourceBoundarySize,preview.boundaryBlockedReason != nil else{return false}
+    r.auto=false
+    guard r.boundaryBlockedReason == .receiverUnavailable else{return false}
+    r.auto=true
+    var began=0;r.desktopFocusBeginForTests={_ in began+=1};r.desktopPhysicalInputsForTests={false}
+    func motion(_ p:CGPoint,_ d:CGVector,_ held:Bool=false) {
+      _=r.detectAndProposeDesktopHandoff(sourceLocal:p,delta:d,held:held,now:1)
+    }
+    motion(CGPoint(x:200,y:100),.zero)
+    motion(CGPoint(x:399,y:100),CGVector(dx:1,dy:0))
+    guard began==0,r.handoff.phase == .local else{return false}
+    r.receiverAvailable=true
+    guard r.boundaryBlockedReason==nil else{return false}
+    motion(CGPoint(x:200,y:100),.zero)
+    motion(CGPoint(x:399,y:100),CGVector(dx:-1,dy:0))
+    motion(CGPoint(x:399,y:100),CGVector(dx:1,dy:0),true)
+    guard began==0 else{return false}
+    motion(CGPoint(x:399,y:100),CGVector(dx:1,dy:0))
+    guard began==1,r.desktopPortal?.displayID==99,r.desktopGlobalPointer==CGPoint(x:0,y:-200),r.handoff.phase == .pending else{return false}
+    let capturedPoint=CGPoint(x:899,y:300),capturedBounds=r.topology!.bounds
+    guard CGPoint(x:capturedPoint.x-capturedBounds.minX,y:capturedPoint.y-capturedBounds.minY)==CGPoint(x:399,y:100) else{return false}
+    r.handoff.phase = .local
+    motion(CGPoint(x:399,y:100),CGVector(dx:1,dy:0))
+    guard began==1 else{return false}
+    let receiver=Relay();receiver.connection=OwnedSocket(-1);receiver.key=SymmetricKey(size:.bits256)
+    return receiver.boundaryBlockedReason == .receiverInputDisabled
+  }
   static func verifyReceiverSingleMapReadForTests()->Bool {
     final class Mock:CursorRecoveryAPI {
       func associate(_ associated:Bool)->CGError{.success}
@@ -4162,6 +4260,9 @@ final class Relay {
       .maskShift, .maskControl, .maskAlternate, .maskCommand, .maskSecondaryFn,
     ])
 
+    if sender,multiDisplayDesktopCompatible,type == .mouseMoved,handoff.phase == .local,let b=topology?.bounds {
+      diagnoseDesktopBoundary(CGPoint(x:e.location.x-b.minX,y:e.location.y-b.minY),delta:CGVector(dx:e.getDoubleValueField(.mouseEventDeltaX),dy:e.getDoubleValueField(.mouseEventDeltaY)),held:!localKeys.isEmpty || !localButtons.isEmpty || !localFlags.isEmpty)
+    }
     guard sender,displayBarrier == nil,!bridgeInputSuspended else { return false }
     if auto,type == .mouseMoved,[EdgeHandoff.Phase.pending,.committed].contains(handoff.phase),let token=handoff.token {
       let dx=e.getDoubleValueField(.mouseEventDeltaX),dy=e.getDoubleValueField(.mouseEventDeltaY)
@@ -4611,12 +4712,14 @@ final class Relay {
         return
       }
       if multiDisplayDesktopCompatible {
+        boundaryStage("receiver_begin",token:token)
         guard !sender,inject,(desktopInputPermissionForTests?() ?? AXIsProcessTrusted()),handoff.phase == .local,
           UUID(uuidString:token)?.uuidString==token,let desktop=currentRoutingDesktop(),
           let portal=DesktopHandoffRouting.portal(w,desktop:desktop,publishedRevision:receiverDesktopPublishRevision),
-          let entry=DesktopHandoffRouting.point(w,desktop:desktop,revision:receiverDesktopPublishRevision) else{_ = control("cancel",token:token);return}
+          let entry=DesktopHandoffRouting.point(w,desktop:desktop,revision:receiverDesktopPublishRevision) else{boundaryStage("crossing_decision",token:token,reason:boundaryBlockedReason?.rawValue ?? "invalid token, map or entry");_ = control("cancel",token:token);return}
         desktopPortal=portal;desktopGlobalPointer=entry;desktopReceiverPreviousPointer=entry;desktopHandoffRevision=desktop.revision
         handoff.arrangement=nil;handoff.token=token;handoff.phase = .targetReady;handoff.deadline=now+1.5
+        boundaryStage("receiver_ready",token:token)
         _ = control("ready",token:token,width:portal.targetRect.width,height:portal.targetRect.height)
         return
       }
@@ -4651,6 +4754,7 @@ final class Relay {
           let desktop=receiverDesktop,desktop.revision==desktopHandoffRevision,
           let portal=desktopPortal,w.width==portal.targetRect.width,w.height==portal.targetRect.height else{_ = control("cancel",token:token);forceLocal();return}
         handoff.phase = .committed
+        boundaryStage("source_commit",token:token)
         _ = control("commit",token:token);return
       }
       if handoff.ready(token, w: w.width!, h: w.height!, now: now) == .commit {
@@ -4659,6 +4763,7 @@ final class Relay {
       }
     case "commit":
       status("Handoff: commit received")
+      boundaryStage("receiver_commit",token:token)
       guard handoff.token == token else { return }
       guard topologyUnchanged() else {
         if pauseReceiverTopologyFailure() {return}
@@ -4753,9 +4858,10 @@ final class Relay {
     } else {entry=CGPoint(x:bounds.minX+handoff.x,y:bounds.minY+handoff.y)}
     guard finalDesktopInjectionGate() else{return}
     guard warpInputCursor(entry) == .success else{safetyStop("Target entry warp failed");return}
+    boundaryStage("receiver_apply_entry_warp",token:token)
     receiverActivationPendingToken=nil;receiverActivationDeadline=nil
     status("Handoff: receiver target foreground confirmed; active acknowledgement sent")
-    _ = control("active",token:token)
+    if control("active",token:token) {boundaryStage("receiver_apply_active_ack",token:token)}
   }
   func receive(_ w: Wire) {
     let inputStartedAt=ProcessInfo.processInfo.systemUptime
@@ -4924,6 +5030,9 @@ final class Relay {
     if t == 12,modifierDescriptors[inputCode] != nil,modifierDown(inputCode,flags:e.flags) == false,!modifiers.contains(inputCode) {return}
     if [UInt32(2),4,26].contains(t),!buttons.contains(UInt32(e.getIntegerValueField(.mouseEventButtonNumber))) {return}
     let result=postReceiverInput(e,modifierCodes:nextModifiers,canPost:canPostInput)
+    if result == .posted,let token=handoff.token,firstPostedBoundaryToken != token {
+      firstPostedBoundaryToken=token;boundaryStage("receiver_apply_first_event_post",token:token)
+    }
     let attempted:Bool
     switch result {
     case .posted: attempted=true
@@ -5081,6 +5190,7 @@ final class PasteCommandProbe: NSResponder {
   let automatic = NSButton(
     checkboxWithTitle: TCText("Automatic edge handoff (experimental)"), target: nil,
     action: nil)
+  let resumeInputButton = NSButton(title:TCText("Resume Input Sharing"),target:nil,action:nil)
   let enable = NSButton(checkboxWithTitle: TCText("Enable input (receiver)"), target: nil, action: nil)
   let gesture = NSButton(
     checkboxWithTitle: TCText("Experimental native gesture relay (unverified)"), target: nil, action: nil)
@@ -5243,7 +5353,9 @@ final class PasteCommandProbe: NSResponder {
     connectButton.target=self;connectButton.action=#selector(start)
     connectButton.bezelStyle = .rounded
     connectButton.bezelColor = .controlAccentColor
-    stack.addArrangedSubview(NSStackView(views:[connectButton,NSButton(title:TCText("Stop"),target:self,action:#selector(stop))]))
+    resumeInputButton.target=self;resumeInputButton.action=#selector(resumeInputSharing)
+    resumeInputButton.bezelStyle = .rounded
+    stack.addArrangedSubview(NSStackView(views:[connectButton,resumeInputButton,NSButton(title:TCText("Stop"),target:self,action:#selector(stop))]))
     relay.sessionTransitionSuspended = { [weak self] epoch in
       guard let self else{return}
       if !self.relay.sessionLockedSignal {self.invalidateUnlockEvidenceForNewTransition()}
@@ -5639,7 +5751,8 @@ final class PasteCommandProbe: NSResponder {
     var frame=window.frame;frame.origin.y+=frame.height-target.height;frame.size=target.size;window.setFrame(frame,display:true,animate:false)
   }
   func refreshLayout() {
-    screenLayout.sourceSize = CGDisplayBounds(CGMainDisplayID()).size
+    screenLayout.sourceSize = relay.sourceBoundarySize ?? .zero
+    screenLayout.boundaryBlockedReason = relay.boundaryBlockedReason?.localized
     screenLayout.remoteSize = relay.remoteDisplaySize
     screenLayout.remoteOnRight = relay.selectedEdge == .right
     screenLayout.offsetY = relay.layoutOffsetY
@@ -6533,7 +6646,7 @@ struct ThunderControlMain {
       check(runDisplayRuntimePresentationTests()==0)
       check(runDisplayRuntimeViewerModeTests()==0)
       #endif
-      do { try tests();check(runLocalizationTests()==0);check(runConcurrentDisplayTests()==0);check(runReceiverDesktopRelayTests()==0);check(runReceiverDesktopTests()==0);check(runSavedDesktopPlacementTests()==0);check(runReceiverDesktopUITests()==0);check(runDesktopMapTransitionTests()==0);check(runDesktopHandoffRoutingTests()==0);check(runDesktopEntryPolicyTests()==0);check(runDisplayHeartbeatTests()==0);check(runDisplayTrustTests()==0);check(runDisplayRemoteInputTests()==0);check(runDisplayTransportTests()==0);check(runDisplayCadenceTests()==0);check(runDisplayFramePacingTests()==0);check(runDisplayVideoFormatTests()==0);check(runSavedSharingStateTests()==0);check(runAutomaticSharingResumeTests()==0);check(runSharingLifecycleIntegrationTests()==0);check(runDisplayPreferenceTests()==0);check(runUpdateReleaseTests()==0);check(runSavedVirtualDisplayPlacementTests()==0);check(runVirtualDisplayPlacementSessionTests()==0);check(runDisplayVideoDecoderTests()==0);check(runDisplayDecodeWorkerTests()==0);check(runScrollReplayTests()==0);check(runDiscoveryRecoveryPolicyTests()==0);check(runNativeGestureTests()==0);check((runDockTransferStateTests()+runDesktopSystemGestureTests())==0);check(runTransitionMotionTests()==0);check(Relay.verifyDesktopReplayForTests());check(runGestureTraceTests()==0);check(runCursorVisibilityTests()==0);check(runConnectedLayoutTests()==0);check(runCursorModeProtocolTests()==0);ReceiverCursorFocusTests.run();check(runAutomaticConnectionPolicyTests()==0);check(runBridgeLinkRecoveryTests()==0);check(runCableReconnectPolicyTests()==0);check(runReceiverFocusRetryTests()==0);check(runReturnWarpResumeTests()==0);check(runDiagnosticStoreTests()==0);check(runDevelopmentDiagnosticsTests()==0);check(runDevelopmentFrameTraceTests()==0);check(runDisplayDiagnosticLinesTests()==0);check(runTrustedPairingTests()==0);check(runConnectionNotificationTests()==0);check(runSingleConnectionNotificationTests()==0);check(runAppAppearancePreferencesTests()==0);check(runSourcePreferencesConnectionTests()==0);check(runAppWindowPresentationPolicyTests()==0);check(runConnectedWindowVisibilityTests()==0);check(runSavedScreenLayoutTests()==0);check(Relay.verifyDeviceLayoutPersistenceForTests());check(runSessionAutoResumeTests()==0);check(runSessionSuspensionOriginTests()==0);check(Relay.verifySessionSuspensionOriginsForTests());check(runAutomaticReconnectBackoffTests()==0);check(runBridgeRecoverySchedulingTests()==0);check(runLockedTransportPolicyTests()==0);check(runAuthenticatedRouteHintTests()==0);check(runFastReconnectPolicyTests()==0);check(Relay.verifyLockedTransportInputBarrierForTests());check(!Relay().receiverWantsCursorHidden);ScreenArrangementDragTests.run();check(Relay.verifyReceiverRecoveryBlocksStartForTests());check(Relay.verifyReceiverInputCleanupBlocksLifecycleForTests());check(Relay.verifyReceiverPhysicalInputCancelsActivationForTests());check(Relay.verifyReceiverLocalInputClassificationForTests());try dockProtocolTests();try appGesturePacketTests();print("PASS gesture memory classification and system stream ordering; no posting") } catch {
+      do { try tests();check(runLocalizationTests()==0);check(runConcurrentDisplayTests()==0);check(runReceiverDesktopRelayTests()==0);check(runReceiverDesktopTests()==0);check(runSavedDesktopPlacementTests()==0);check(runReceiverDesktopUITests()==0);check(runDesktopMapTransitionTests()==0);check(runDesktopHandoffRoutingTests() + runBoundaryReadinessTests()==0);check(runDesktopEntryPolicyTests()==0);check(runDisplayHeartbeatTests()==0);check(runDisplayTrustTests()==0);check(runDisplayRemoteInputTests()==0);check(runDisplayTransportTests()==0);check(runDisplayCadenceTests()==0);check(runDisplayFramePacingTests()==0);check(runDisplayVideoFormatTests()==0);check(runSavedSharingStateTests()==0);check(runAutomaticSharingResumeTests()==0);check(runSharingLifecycleIntegrationTests()==0);check(runDisplayPreferenceTests()==0);check(runUpdateReleaseTests()==0);check(runSavedVirtualDisplayPlacementTests()==0);check(runVirtualDisplayPlacementSessionTests()==0);check(runDisplayVideoDecoderTests()==0);check(runDisplayDecodeWorkerTests()==0);check(runScrollReplayTests()==0);check(runDiscoveryRecoveryPolicyTests()==0);check(runNativeGestureTests()==0);check((runDockTransferStateTests()+runDesktopSystemGestureTests())==0);check(runTransitionMotionTests()==0);check(Relay.verifyDesktopReplayForTests());check(runGestureTraceTests()==0);check(runCursorVisibilityTests()==0);check(runConnectedLayoutTests()==0);check(runCursorModeProtocolTests()==0);ReceiverCursorFocusTests.run();check(runAutomaticConnectionPolicyTests()==0);check(runBridgeLinkRecoveryTests()==0);check(runCableReconnectPolicyTests()==0);check(runReceiverFocusRetryTests()==0);check(runReturnWarpResumeTests()==0);check(runDiagnosticStoreTests()==0);check(runDevelopmentDiagnosticsTests()==0);check(runDevelopmentFrameTraceTests()==0);check(runDisplayDiagnosticLinesTests()==0);check(runTrustedPairingTests()==0);check(runConnectionNotificationTests()==0);check(runSingleConnectionNotificationTests()==0);check(runAppAppearancePreferencesTests()==0);check(runSourcePreferencesConnectionTests()==0);check(runAppWindowPresentationPolicyTests()==0);check(runConnectedWindowVisibilityTests()==0);check(runSavedScreenLayoutTests()==0);check(Relay.verifyDeviceLayoutPersistenceForTests());check(runSessionAutoResumeTests()==0);check(runSessionSuspensionOriginTests()==0);check(Relay.verifySessionSuspensionOriginsForTests());check(runAutomaticReconnectBackoffTests()==0);check(runBridgeRecoverySchedulingTests()==0);check(runLockedTransportPolicyTests()==0);check(runAuthenticatedRouteHintTests()==0);check(runFastReconnectPolicyTests()==0);check(Relay.verifyLockedTransportInputBarrierForTests());check(!Relay().receiverWantsCursorHidden);ScreenArrangementDragTests.run();check(Relay.verifyReceiverRecoveryBlocksStartForTests());check(Relay.verifyReceiverInputCleanupBlocksLifecycleForTests());check(Relay.verifyReceiverPhysicalInputCancelsActivationForTests());check(Relay.verifyReceiverLocalInputClassificationForTests());try dockProtocolTests();try appGesturePacketTests();print("PASS gesture memory classification and system stream ordering; no posting") } catch {
         fputs("FAIL \(error)\n", stderr)
         exit(1)
       }

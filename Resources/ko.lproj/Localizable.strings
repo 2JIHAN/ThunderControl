@@ -61,7 +61,7 @@
 "Could not save the diagnostic files." = "진단 파일을 저장하지 못했습니다.";
 "Could not start the extended display helper." = "확장 화면 도구를 시작하지 못했습니다.";
 "Could not verify the display helper or input connection." = "화면 도구 또는 입력 연결을 확인할 수 없습니다.";
-"Cross between the two Macs at the highlighted edge." = "강조된 경계에서 두 맥 사이를 이동합니다.";
+"Cross between the two Macs at the highlighted edge." = "포인터를 안쪽으로 옮긴 뒤 강조된 경계 밖으로 밀어 전환하세요.";
 "Cut" = "잘라내기";
 "Decline" = "거절";
 "Direct IPv4" = "직접 IPv4";
@@ -261,3 +261,14 @@
 
 "Screen safety sampling is still busy. Reconnect to continue." = "이전 화면 안전 상태 확인이 아직 끝나지 않았습니다. 잠시 후 다시 연결해 주세요.";
 "Quit paused: screen sharing cleanup did not finish. Choose Quit again after it finishes." = "종료 보류: 화면 공유 정리가 끝나지 않았습니다. 정리가 끝난 뒤 다시 종료하세요.";
+
+"Resume Input Sharing" = "입력 공유 다시 켜기";
+"Input sharing waits for an authenticated connection." = "인증된 연결이 완료되면 입력을 공유할 수 있습니다.";
+"Input sharing paused by session, topology or safety state." = "세션, 화면 구성 또는 안전 상태로 입력 공유가 일시 중지되었습니다.";
+"Sender input sharing is off. Choose Resume Input Sharing." = "송신 Mac의 입력 공유가 꺼져 있습니다. 입력 공유 다시 켜기를 누르세요.";
+"Receiver input sharing is off. Choose Resume Input Sharing on this Mac." = "이 Mac의 입력 수신이 꺼져 있습니다. 입력 공유 다시 켜기를 누르세요.";
+"Receiver input is unavailable. Check input sharing on the Receiver Mac." = "수신 Mac에서 입력을 받을 수 없습니다. 수신 Mac의 입력 공유 상태를 확인하세요.";
+"Input sharing waits for authenticated display geometry." = "인증된 화면 구성 정보를 기다리고 있습니다.";
+"Input connection maintained" = "입력 연결 유지 중";
+"Input sharing waits for held keys, buttons or gestures to finish." = "누른 키, 마우스 버튼 또는 제스처가 끝나면 입력을 공유할 수 있습니다.";
+"Input handoff is already in progress." = "입력 제어권을 전환하고 있습니다.";

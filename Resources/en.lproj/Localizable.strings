@@ -261,3 +261,14 @@
 
 "Screen safety sampling is still busy. Reconnect to continue." = "Screen safety sampling is still busy. Reconnect to continue.";
 "Quit paused: screen sharing cleanup did not finish. Choose Quit again after it finishes." = "Quit paused: screen sharing cleanup did not finish. Choose Quit again after it finishes.";
+
+"Resume Input Sharing" = "Resume Input Sharing";
+"Input sharing waits for an authenticated connection." = "Input sharing waits for an authenticated connection.";
+"Input sharing paused by session, topology or safety state." = "Input sharing paused by session, topology or safety state.";
+"Sender input sharing is off. Choose Resume Input Sharing." = "Sender input sharing is off. Choose Resume Input Sharing.";
+"Receiver input sharing is off. Choose Resume Input Sharing on this Mac." = "Receiver input sharing is off. Choose Resume Input Sharing on this Mac.";
+"Receiver input is unavailable. Check input sharing on the Receiver Mac." = "Receiver input is unavailable. Check input sharing on the Receiver Mac.";
+"Input sharing waits for authenticated display geometry." = "Input sharing waits for authenticated display geometry.";
+"Input connection maintained" = "Input connection maintained";
+"Input sharing waits for held keys, buttons or gestures to finish." = "Input sharing waits for held keys, buttons or gestures to finish.";
+"Input handoff is already in progress." = "Input handoff is already in progress.";

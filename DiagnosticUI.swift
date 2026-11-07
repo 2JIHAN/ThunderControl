@@ -3,17 +3,20 @@ import ApplicationServices
 @MainActor extension App {
   func updateConnectionState(_ message:String="") {
     if !message.isEmpty {latestConnectionMessage=message}
+    resumeInputButton.isHidden = !relay.authenticated || (relay.inputIsSender ? relay.auto:relay.inject)
+    resumeInputButton.isEnabled = relay.boundaryBlockedReason != .receiverUnavailable && !applicationIsQuitting && !automaticConnectionPaused && !relay.automaticReconnectSuspended && !relay.displayTopologyTransitionActive && !relay.hasUnresolvedLocalRecovery && !relay.bridgeInputSuspended && relay.sessionAllowed && !displayMode.cleaning && !relay.lockedTransportOnly && !relay.sessionLockedSignal && !relay.screenSleeping && !relay.systemSleeping && inputPermissionsReady()
+    screenLayout.boundaryBlockedReason=relay.boundaryBlockedReason?.localized
     if relay.lockedTransportOnly || relay.sessionLockedSignal || relay.screenSleeping || relay.systemSleeping {
       state.stringValue=TCText("Locked, input sharing stopped")
       state.textColor = .secondaryLabelColor
     } else if displayMode.active {
-      state.stringValue=(relay.authenticated ? TCText("Input connection maintained / "):TCText("No input connection / "))+(displayMode.connected ? TCText("Screen connected"):TCText("Connecting screen..."))
+      state.stringValue=(relay.authenticated ? ((relay.boundaryBlockedReason?.localized ?? TCText("Input connection maintained"))+" / "):TCText("No input connection / "))+(displayMode.connected ? TCText("Screen connected"):TCText("Connecting screen..."))
       state.textColor = .labelColor
     } else if displayMode.cleaning {
       state.stringValue=TCText("Verifying sharing has stopped and inputs are released")
       state.textColor = .secondaryLabelColor
     } else if relay.authenticated {
-      state.stringValue=relay.isTransferring ? TCText("Controlling remote Mac"):(sharingBlockedReason ?? (relay.inputIsSender && !relay.auto ? TCText("Connected. Waiting for input sharing readiness."):TCText("Connected")))
+      state.stringValue=relay.isTransferring ? TCText("Controlling remote Mac"):(relay.boundaryBlockedReason?.localized ?? sharingBlockedReason ?? (relay.inputIsSender && !relay.auto ? TCText("Connected. Waiting for input sharing readiness."):TCText("Connected")))
       state.textColor = .labelColor
     } else if relay.hasSession {
       state.stringValue=mode.selectedSegment==1 ? TCText("Waiting for connection requests"):TCText("Connecting...")

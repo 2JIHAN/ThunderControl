@@ -2,6 +2,16 @@ import Foundation
 import AppKit
 
 @MainActor extension App {
+  @objc func resumeInputSharing() {
+    guard relay.authenticated,let pair=relay.authenticatedDevicePair,
+      !applicationIsQuitting,!automaticConnectionPaused,!relay.automaticReconnectSuspended,
+      !displayMode.cleaning,!relay.displayTopologyTransitionActive,!relay.hasUnresolvedLocalRecovery,
+      !relay.bridgeInputSuspended,relay.sessionAllowed,!relay.sessionLockedSignal,
+      !relay.screenSleeping,!relay.systemSleeping,inputPermissionsReady() else{return}
+    sharingDidStartExplicitConnection(sending:relay.inputIsSender)
+    guard sharingApplyExplicitConnectIntent(pair:pair,sender:relay.inputIsSender) else{return}
+    sharingRestoreTick();refreshModeUI()
+  }
   func sharingPrepareRoleChange() {sharingExplicitResumePending=nil}
   func sharingDidStartExplicitConnection(sending:Bool) {sharingExplicitResumePending=(relay.generation,sending)}
   @discardableResult func sharingApplyExplicitConnectIntent(pair:LayoutDevicePair,sender:Bool)->Bool {

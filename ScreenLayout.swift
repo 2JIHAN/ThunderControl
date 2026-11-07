@@ -84,6 +84,7 @@ public func screenArrangementDragProposal(
     public var sourceSize: CGSize = CGSize(width: 1920, height: 1080) {
         didSet { needsDisplay = true }
     }
+    var boundaryBlockedReason:String? {didSet{if oldValue != boundaryBlockedReason {needsDisplay=true}}}
     public var remoteSize: CGSize? { didSet { needsDisplay = true } }
     public var remoteOnRight = true { didSet { needsDisplay = true } }
     public var offsetY: Double = 0 { didSet { needsDisplay = true } }
@@ -231,7 +232,7 @@ public func screenArrangementDragProposal(
         }
         let source=CGRect(origin:origin,size:sourceSize)
         drawMonitor(desktopFrame(source,t),title:TCText("Sender Mac"),subtitle:isInteractionEnabled ? TCText("Drag only this display") : TCText("Waiting for layout change"),remote:true)
-        NSColor.controlAccentColor.setStroke()
+        (boundaryBlockedReason==nil ? NSColor.controlAccentColor:NSColor.separatorColor).setStroke()
         for portal in desktop.portals(sourceRect:source) {
             let a:CGPoint,b:CGPoint
             switch portal.sourceSide {
@@ -243,7 +244,7 @@ public func screenArrangementDragProposal(
             let path=NSBezierPath();path.move(to:CGPoint(x:t.origin.x+a.x*t.scale,y:t.origin.y+a.y*t.scale));path.line(to:CGPoint(x:t.origin.x+b.x*t.scale,y:t.origin.y+b.y*t.scale));path.lineWidth=4;path.stroke()
         }
         drawText(TCText("The Receiver layout reflects its macOS settings."),rect:CGRect(x:8,y:8,width:max(0,bounds.width-16),height:22),secondary:true)
-        drawText(TCText("Cross between the two Macs at the highlighted edge."),rect:CGRect(x:8,y:bounds.maxY-26,width:max(0,bounds.width-16),height:22),secondary:true)
+        drawText(boundaryBlockedReason ?? TCText("Cross between the two Macs at the highlighted edge."),rect:CGRect(x:8,y:bounds.maxY-26,width:max(0,bounds.width-16),height:22),secondary:true)
     }
 
     public override func mouseDown(with event: NSEvent) {

@@ -7,6 +7,7 @@ struct DesktopEntryPolicy {
   private var armed=Set<DesktopSide>()
   private var sourceRect:CGRect?
   private(set) var latchedSide:DesktopSide?
+  private(set) var blockedReason="move inward before rearming"
 
   mutating func reset(returningThrough side:DesktopSide?=nil) {
     armed.removeAll();sourceRect=nil;latchedSide=side
@@ -21,15 +22,16 @@ struct DesktopEntryPolicy {
   }
   mutating func candidate(sourceLocal p:CGPoint,delta:CGVector,sourceRect rect:CGRect,portals:[DesktopPortal],held:Bool)->DesktopPortal? {
     guard ReceiverDesktop.sane(rect),ReceiverDesktop.has(CGRect(origin:.zero,size:rect.size),p),
-      delta.dx.isFinite,delta.dy.isFinite else{return nil}
+      delta.dx.isFinite,delta.dy.isFinite else{blockedReason="invalid source point or motion";return nil}
     if sourceRect != rect {armed.removeAll();sourceRect=rect}
     for side in DesktopSide.allCases where distance(p,size:rect.size,side:side)>=2 {
       armed.insert(side)
       if latchedSide==side {latchedSide=nil}
     }
-    guard !held else{return nil}
-    return portals.first { portal in
-      guard portal.sourceRect==rect,armed.contains(portal.sourceSide),distance(p,size:rect.size,side:portal.sourceSide)<=1 else{return false}
+    guard !held else{blockedReason="held input";return nil}
+    blockedReason="outside boundary strip or portal interval"
+    for portal in portals {
+      guard portal.sourceRect==rect,distance(p,size:rect.size,side:portal.sourceSide)<=1 else{continue}
       let tangent:CGFloat,outward:Bool
       switch portal.sourceSide {
       case .left:tangent=rect.minY+p.y;outward=delta.dx<0
@@ -37,8 +39,12 @@ struct DesktopEntryPolicy {
       case .top:tangent=rect.minX+p.x;outward=delta.dy<0
       case .bottom:tangent=rect.minX+p.x;outward=delta.dy>0
       }
-      return outward && tangent>=portal.intervalStart && tangent<portal.intervalEnd
+      guard tangent>=portal.intervalStart && tangent<portal.intervalEnd else{continue}
+      guard armed.contains(portal.sourceSide) else{blockedReason="move inward before rearming";continue}
+      guard outward else{blockedReason="waiting for outward motion";continue}
+      return portal
     }
+    return nil
   }
   mutating func latch(_ side:DesktopSide) {armed.removeAll();latchedSide=side}
 }
