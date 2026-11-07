@@ -570,6 +570,7 @@ func runLocalTCPRelayIntegrationTests() throws {
         print("PASS local TCP queued inbound \(cancel ? "context cancellation" : "stale generation")")
     }
     try runLocalTCPInboundBackpressure(sides: sides)
+    try runLocalTCPWaitedLeaseExpiry(sides: sides)
     try runLocalTCPNegotiatedLifecycle(sides: sides)
     try runLocalTCPNegotiatedDenial(sides: sides)
     try runLocalTCPRemainingRecovery(sides: sides)
@@ -998,4 +999,34 @@ private func runLocalTCPInboundBackpressure(sides: LocalTCPSides, enrollment: Bo
         try f.finish()
         print("PASS local TCP inbound sustained stall finite timeout cancels session no delayed input")
     }
+}
+
+private func runLocalTCPWaitedLeaseExpiry(sides: LocalTCPSides) throws {
+    let f = try LocalTCPFixture(sides: sides, enrollment: false, mode: .negotiated)
+    defer { try? f.finish() }
+    f.receiver.consent(true)
+    try localTCPPump(until: { f.sender.localTCPMapForTests != nil && f.reverseProcessed >= 2 }, "lease before queued-input expiry")
+    guard let map = f.sender.localTCPMapForTests else { throw LocalTCPError.assertion("queued-input map") }
+    f.sender.desktopPrepareEntryForTests(map: map, origin: CGPoint(x: -1200, y: 0))
+    let now = ProcessInfo.processInfo.systemUptime
+    _ = f.sender.desktopEntryForTests(CGPoint(x: 600, y: 400), delta: CGVector(dx: 1, dy: 0), now: now)
+    _ = f.sender.desktopEntryForTests(CGPoint(x: 1199, y: 400), delta: CGVector(dx: 1, dy: 0), now: now + 0.001)
+    try localTCPPump(until: { f.sender.desktopFocusRemoteForTests }, "active ownership before queued-input expiry")
+    f.point = f.receiver.desktopFocusPointForTests!
+    try f.send(f.packet(dx: 100, dy: 0), acceptedMotion: true)
+    while f.queued.wait(timeout: .now()) == .success {}
+    let before = f.processed, posts = f.input.totalPosts
+    for i in 1...64 {
+        let wire = try f.packet(dx: Double(i % 2 == 0 ? i : -i), dy: 0)
+        try localTCPRequire(f.sender.enqueue(wire), "valid leased burst accepted before expiry")
+        f.point = CGPoint(x: wire.desktopGlobalX!, y: wire.desktopGlobalY!)
+    }
+    f.sender.flushLocalTCPWritesForTests()
+    for _ in 0..<32 { try localTCPRequire(f.queued.wait(timeout: .now() + 1) == .success, "32 leased frames held on main") }
+    Thread.sleep(forTimeInterval: 0.4)
+    try localTCPRequire(!f.result.done, "lease expiry must not close the authenticated input stream")
+    try localTCPPump(until: { f.processed >= before + 64 || f.result.done }, "drain expired queued input")
+    try localTCPRequire(f.input.totalPosts == posts && f.result.error == nil && !f.context.cancelled, "expired input queued or waiting for capacity never reaches native input")
+    print("PASS local TCP inbound waited negotiated lease expiry rejects 64 frames without native input")
+    try f.finish()
 }

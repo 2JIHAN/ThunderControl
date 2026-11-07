@@ -39,15 +39,19 @@ final class ImageClipboardSendGate: @unchecked Sendable {
     private var allowed = false
     private var outgoing: String?
     private var incoming: String?
+    private var revision = 0
+    var currentRevision: Int { lock.lock(); defer { lock.unlock() }; return revision }
     init() { consent = .init(op: .consent, epoch: UUID().uuidString, enabled: false) }
-    fileprivate func update(epoch: String, enabled: Bool, peer: String?, allowed: Bool, outgoing: String?, incoming: String?) {
+    fileprivate func update(revision: Int, epoch: String, enabled: Bool, peer: String?, allowed: Bool, outgoing: String?, incoming: String?) {
         lock.lock(); defer { lock.unlock() }
+        guard revision == self.revision else { return }
         consent = .init(op: .consent, epoch: epoch, enabled: enabled)
         self.peer = peer; self.allowed = allowed; self.outgoing = outgoing; self.incoming = incoming
     }
-    func revoke() {
+    func revoke(renewEpoch: Bool = false) {
         lock.lock(); defer { lock.unlock() }
-        allowed = false; consent.enabled = false; outgoing = nil; incoming = nil
+        revision += 1; allowed = false; consent.enabled = false; outgoing = nil; incoming = nil
+        if renewEpoch { consent.epoch = UUID().uuidString }
     }
     func mayRead(epoch: String, peerEpoch: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
@@ -64,11 +68,16 @@ final class ImageClipboardSendGate: @unchecked Sendable {
     }
 }
 
-@MainActor final class ImageClipboardController {
+private final class ImageClipboardWorker: @unchecked Sendable {
+    let queue: DispatchQueue
+    var revision = 0
+    var currentSafe = false
+    var beforeIPC: (() -> Void)?
+    var isCurrent: Bool { sendGate.currentRevision == revision }
     var send: ((ImageClipboardPacket) -> Bool)?
-    var isSafe: () -> Bool = { false }
+    var isSafe: () -> Bool { { self.currentSafe && self.isCurrent } }
     var onStatus: ((String) -> Void)?
-    let sendGate = ImageClipboardSendGate()
+    let sendGate: ImageClipboardSendGate
     nonisolated static let receivedImageType = NSPasteboard.PasteboardType("local.thundercontrol.received-image")
     nonisolated private static func blocked(_ types: [NSPasteboard.PasteboardType]) -> Bool {
         let markers = ["com.apple.is-remote-clipboard", "org.nspasteboard.ConcealedType",
@@ -76,7 +85,8 @@ final class ImageClipboardSendGate: @unchecked Sendable {
                        receivedImageType.rawValue]
         return types.contains { markers.contains($0.rawValue) }
     }
-    private let board: NSPasteboard
+    private let boardName: String
+    private lazy var board = NSPasteboard(name: .init(boardName))
     private var enabled: Bool
     private var running = false
     private var safe = false
@@ -89,7 +99,6 @@ final class ImageClipboardSendGate: @unchecked Sendable {
     private var seenCount: Int?
     private var generation = 0
     private var converting = false
-    private var timer: Timer?
     private var ackID: String?
     private struct Outgoing {
         var id: String; var data: Data; var offset = 0; var pending = 0; var touched = Date()
@@ -100,12 +109,11 @@ final class ImageClipboardSendGate: @unchecked Sendable {
     private var outgoing: Outgoing?
     private var incoming: Incoming?
 
-    init(pasteboard: NSPasteboard = .general, enabled: Bool = false) {
-        board = pasteboard; self.enabled = enabled
-        updateGate()
+    init(boardName: String, enabled: Bool, gate: ImageClipboardSendGate, queue: DispatchQueue) {
+        self.boardName = boardName; self.enabled = enabled; self.sendGate = gate; self.queue = queue
     }
     private func updateGate() {
-        sendGate.update(epoch: epoch, enabled: running && safe && enabled, peer: peerEpoch,
+        sendGate.update(revision: revision, epoch: epoch, enabled: running && safe && enabled, peer: peerEpoch,
                         allowed: active && running && safe && enabled && peerEnabled,
                         outgoing: outgoing?.id, incoming: ackID)
     }
@@ -138,9 +146,6 @@ final class ImageClipboardSendGate: @unchecked Sendable {
     func start() {
         guard !running else { return }
         running = true; reconcile()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.poll() }
-        }
     }
     func stop() {
         guard running else { return }
@@ -148,7 +153,7 @@ final class ImageClipboardSendGate: @unchecked Sendable {
         _ = emit(.init(op: .consent, epoch: epoch, enabled: false))
         running = false; safe = false; epoch = UUID().uuidString
         peerEpoch = nil; peerEnabled = false; seenCount = nil
-        timer?.invalidate(); timer = nil; updateGate()
+        updateGate()
     }
     func setEnabled(_ value: Bool) {
         guard enabled != value else { return }
@@ -176,6 +181,8 @@ final class ImageClipboardSendGate: @unchecked Sendable {
         guard running else { return }
         reconcile()
         guard active, isSafe() else { return }
+        beforeIPC?()
+        guard isCurrent else { return }
         rebaseRemoteMetadata()
         let count = board.changeCount
         if count != seenCount {
@@ -213,7 +220,7 @@ final class ImageClipboardSendGate: @unchecked Sendable {
                       let data, data.count <= 67108864 else { return nil }
                 return Self.canonicalPNG(png: type == .png ? data : nil, tiff: type == .tiff ? data : nil)
             }
-            DispatchQueue.main.async { [weak self] in
+            self?.queue.async { [weak self] in
                 guard let self else { return }
                 self.converting = false
                 self.reconcile()
@@ -269,10 +276,12 @@ final class ImageClipboardSendGate: @unchecked Sendable {
                 outgoing = nil; updateGate(); onStatus?("Image clipboard sent")
             } else {
                 outgoing = transfer
-                DispatchQueue.main.async { [weak self] in self?.sendNext() }
+                queue.async { [weak self] in self?.sendNext() }
             }
         case .chunk:
             guard let offset = packet.offset, let total = packet.totalBytes, let bytes = packet.bytes else { return }
+            beforeIPC?()
+            guard isCurrent else { return }
             rebaseRemoteMetadata()
             if incoming == nil {
                 guard let count = seenCount, offset == 0, board.changeCount == count else { cancel(id); return }
@@ -292,7 +301,9 @@ final class ImageClipboardSendGate: @unchecked Sendable {
                 item.setData(transfer.data, forType: .png)
                 item.setData(Data(), forType: Self.receivedImageType)
                 // Limit only this received write, not system-wide Handoff preferences.
+                guard isCurrent, board.changeCount == transfer.count, isCurrent else { return }
                 board.prepareForNewContents(with: .currentHostOnly)
+                guard isCurrent else { return }
                 guard board.writeObjects([item]) else {
                     incoming = nil; ackID = nil; updateGate(); cancel(id); return
                 }
@@ -306,6 +317,14 @@ final class ImageClipboardSendGate: @unchecked Sendable {
                 incoming = nil; ackID = nil; updateGate()
             }
         case .consent: break
+        }
+    }
+    func sendFailed(_ packet: ImageClipboardPacket, revision: Int) {
+        guard isCurrent, self.revision == revision else { return }
+        if packet.op == .chunk, outgoing?.id == packet.id {
+            outgoing?.pending = 0; updateGate(); onStatus?("Image clipboard unavailable")
+        } else if packet.op == .ack {
+            incoming = nil; ackID = nil; updateGate()
         }
     }
     nonisolated private static func validImage(_ data: Data, pngOnly: Bool) -> Bool {
@@ -332,5 +351,109 @@ final class ImageClipboardSendGate: @unchecked Sendable {
         guard CGImageDestinationFinalize(dest) else { return nil }
         let result = output as Data
         return validImage(result, pngOnly: true) ? result : nil
+    }
+}
+
+@MainActor final class ImageClipboardController {
+    var send: ((ImageClipboardPacket) -> Bool)?
+    var isSafe: () -> Bool = { false }
+    var onStatus: ((String) -> Void)?
+    let sendGate = ImageClipboardSendGate()
+    static let receivedImageType = ImageClipboardWorker.receivedImageType
+    private let queue = DispatchQueue(label: "ThunderControl.ImageClipboard", qos: .utility)
+    private let worker: ImageClipboardWorker
+    private var timer: Timer?
+    private var running = false
+    private var enabled: Bool
+    private var wasSafe = false
+    private var pollPending = false
+    private var pendingReceives = 0
+    private var authorizationRevision = 0
+
+    init(pasteboard: NSPasteboard = .general, enabled: Bool = false, beforeWorkerIPC: (() -> Void)? = nil) {
+        self.enabled = enabled
+        worker = ImageClipboardWorker(boardName: pasteboard.name.rawValue, enabled: enabled, gate: sendGate, queue: queue)
+        worker.beforeIPC = beforeWorkerIPC
+        worker.send = { [weak self, weak worker] packet in
+            guard let worker else { return false }
+            let revision = worker.revision
+            DispatchQueue.main.async { [weak self, weak worker] in
+                guard let self, self.sendGate.currentRevision == revision, self.running else { return }
+                guard self.isSafe() else {
+                    self.sendGate.revoke(); self.authorizationRevision = self.sendGate.currentRevision
+                    self.wasSafe = false; return
+                }
+                let accepted = self.send?(self.sendGate.packetForTransmission(packet)) ?? false
+                if !accepted {
+                    self.queue.async { [weak worker] in worker?.sendFailed(packet, revision: revision) }
+                }
+            }
+            return true
+        }
+        worker.onStatus = { [weak self, weak worker] status in
+            guard let worker else { return }
+            let revision = worker.revision
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.sendGate.currentRevision == revision else { return }
+                self.onStatus?(status)
+            }
+        }
+    }
+    private func submit(_ operation: @escaping @Sendable (ImageClipboardWorker) -> Void) {
+        let safe = running && isSafe()
+        if wasSafe && !safe { sendGate.revoke(); authorizationRevision = sendGate.currentRevision }
+        if !wasSafe && safe { authorizationRevision = sendGate.currentRevision }
+        wasSafe = safe
+        let revision = authorizationRevision
+        queue.async { [worker] in
+            worker.revision = revision
+            worker.currentSafe = safe
+            operation(worker)
+        }
+    }
+    func start() {
+        guard !running else { return }
+        running = true; authorizationRevision = sendGate.currentRevision
+        submit { $0.start() }
+        timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.poll() }
+        }
+    }
+    func stop() {
+        guard running else { return }
+        sendGate.revoke(); authorizationRevision = sendGate.currentRevision
+        if isSafe() { _ = send?(sendGate.packetForTransmission(.init(op: .consent, epoch: UUID().uuidString, enabled: false))) }
+        submit { $0.stop() }
+        running = false; wasSafe = false
+        timer?.invalidate(); timer = nil
+    }
+    func setEnabled(_ value: Bool) {
+        guard enabled != value else { return }
+        enabled = value
+        sendGate.revoke(renewEpoch: true); authorizationRevision = sendGate.currentRevision
+        submit { $0.setEnabled(value) }
+    }
+    func poll() {
+        guard running else { return }
+        if wasSafe && !isSafe() {
+            sendGate.revoke(); authorizationRevision = sendGate.currentRevision; wasSafe = false
+            submit { $0.poll() }
+            return
+        }
+        guard !pollPending else { return }
+        pollPending = true
+        submit { [weak self] worker in
+            worker.poll()
+            DispatchQueue.main.async { [weak self] in self?.pollPending = false }
+        }
+    }
+    func receive(_ packet: ImageClipboardPacket) {
+        guard running, packet.valid else { return }
+        guard pendingReceives < 32 else { sendGate.revoke(); return }
+        pendingReceives += 1
+        submit { [weak self] worker in
+            worker.receive(packet)
+            DispatchQueue.main.async { [weak self] in self?.pendingReceives -= 1 }
+        }
     }
 }
