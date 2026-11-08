@@ -2,9 +2,6 @@ import Foundation
 import CryptoKit
 import Darwin
 
-// Folder manifest and source snapshot. Foundation/CryptoKit/Darwin only: no AppKit, relay or keys.
-// The manifest is the immutable data contract shared by sender, receiver store and engine.
-
 enum FolderFailureCode: String, Codable, Equatable {
   case exists, resumeMismatch, conflict, space, invalid
 }

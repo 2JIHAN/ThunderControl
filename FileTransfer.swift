@@ -486,7 +486,6 @@ func runFileTransferGuardFixtures() throws {
                  FilePacket(kind: "accept", folder: .accept), FilePacket(kind: "chunk", offset: 0, bytes: Data([1]), folder: .closed), FilePacket(kind: "folder", folder: .data(Data()))] {
     do { try packet.validate(); throw FileTransferError.authentication } catch FileTransferError.invalid {}
   }
-  // File v1 bytes unchanged: no folder key; the largest folder data packet stays under the unchanged frame cap.
   guard String(data: try JSONEncoder().encode(FilePacket(kind: "accept")), encoding: .utf8) == #"{"kind":"accept"}"#,
     try JSONEncoder().encode(FilePacket(kind: "folder", folder: .data(Data(count: 65536)))).count + 16 <= 100000 else { throw FileTransferError.invalid }
   var pair: [Int32] = [0, 0]

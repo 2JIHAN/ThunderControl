@@ -95,7 +95,6 @@ final class FileDestination {
     let quarantine = "0083;" + String(Int(Date().timeIntervalSince1970), radix: 16) + ";ThunderControl;"
     guard quarantine.withCString({ fsetxattr(fd, "com.apple.quarantine", $0, strlen($0), 0, 0) }) == 0, fgetxattr(fd, "com.apple.quarantine", nil, 0, 0, 0) > 0, fsync(fd) == 0 else { throw FileTransferError.io }
     try admit()
-    // Identity is checked after the admission callback, immediately before the exclusive rename.
     var info = stat()
     guard fstatat(directory, temporary, &info, AT_SYMLINK_NOFOLLOW) == 0, info.st_dev == device, info.st_ino == inode else { throw FileTransferError.io }
     guard renameatx_np(directory, temporary, directory, destination, UInt32(RENAME_EXCL)) == 0 else { throw FileTransferError.io }

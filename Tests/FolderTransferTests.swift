@@ -2,10 +2,6 @@ import Foundation
 import CryptoKit
 import Darwin
 
-// Standalone folder module checks: Foundation/CryptoKit/Darwin only, no AppKit or relay.
-// Build: see docs/FOLDER_TRANSFER.md. Uses a plaintext socketpair channel; the product adapter
-// over the authenticated file channel is covered by Tests/FileTransferTests.swift.
-
 final class PairChannel: FolderChannel {
   let fd: Int32
   var dropBeforeSend: (FolderMessage) -> Bool = { _ in false }

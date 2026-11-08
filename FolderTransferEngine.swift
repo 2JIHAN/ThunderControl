@@ -2,21 +2,6 @@ import Foundation
 import CryptoKit
 import Darwin
 
-// Sequential folder protocol over an opaque authenticated channel. No keys, sockets, AppKit or relay.
-//
-//   sender                          receiver
-//   offer ─────────────────────────▶ (approval; working heartbeats)
-//         ◀───────────────────────── accept | decline
-//   manifest × n ──────────────────▶ (checkpoint open + recovery; working)
-//         ◀───────────────────────── plan(needed bitmap) | failed
-//   fileBegin, data × n, fileEnd ──▶ (durable commit; working)
-//         ◀───────────────────────── fileDone          (repeat per needed file)
-//   (tree rescan; working) finish ─▶ (publication; working)
-//         ◀───────────────────────── complete
-//   closed ────────────────────────▶ (journal removed)
-//
-// One thread writes the channel. Long work runs on a helper while that thread sends `working`.
-
 enum FolderMessage: Codable, Equatable {
   case offer(FolderOffer)
   case accept, decline

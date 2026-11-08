@@ -2,13 +2,6 @@ import Foundation
 import CryptoKit
 import Darwin
 
-// Receiver-side owner of every destination path, the resume journal, crash recovery and publication.
-// Layout in the approved parent P for the chosen final name N:
-//   P/N.partial          stage folder (visible), renamed to P/N with RENAME_EXCL when complete
-//   P/N.partial.journal  owned write-ahead journal sidecar, never inside the payload tree
-// The journal is untrusted metadata: every record is bounded, checksummed and checked against the
-// manifest and the real descriptors. Nothing is adopted or deleted unless its recorded identity matches.
-
 struct FolderPeerIdentity: Equatable {
   let local: UUID
   let peer: UUID
@@ -353,7 +346,6 @@ final class FolderReceiverStore {
     try admit()
     // Nothing outside the manifest is published: unknown entries pause with a conflict and stay in place.
     try verifyExactTree(receipts, check: {}, pulse: FolderPulse())
-    // Checked after the intent and admission, immediately before the exclusive rename.
     var info = stat()
     guard fstatat(parent, stageName, &info, AT_SYMLINK_NOFOLLOW) == 0, (info.st_mode & S_IFMT) == S_IFDIR, folderIdentity(info) == rootID else { throw FolderTransferError.unconfirmed }
     guard renameatx_np(parent, stageName, parent, finalName, UInt32(RENAME_EXCL)) == 0 else { throw errno == EEXIST ? FolderTransferError.destinationExists : FileTransferError.io }
