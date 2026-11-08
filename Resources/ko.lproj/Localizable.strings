@@ -274,7 +274,7 @@
 "Input handoff is already in progress." = "입력 제어권을 전환하고 있습니다.";
 
 "Share copied images with the paired Mac" = "연결된 Mac과 복사한 이미지 공유";
-"Both Macs need 0.9.7 or later and image sharing enabled. Only newly copied images are shared. PNG and TIFF are sent as PNG, up to 8 MiB. Text and files are not shared." = "두 Mac 모두 0.9.7 이상에서 이미지 공유를 켜야 합니다. 새로 복사한 PNG와 TIFF 이미지만 최대 8 MiB의 PNG로 보냅니다. 텍스트와 파일은 공유하지 않습니다.";
+"Both Macs need 0.9.7 or later and image sharing enabled. Only newly copied images are shared. PNG and TIFF are sent as PNG, up to 8 MiB. Files are not shared." = "두 Mac 모두 0.9.7 이상에서 이미지 공유를 켜야 합니다. 새로 복사한 PNG와 TIFF 이미지만 최대 8 MiB의 PNG로 보냅니다. 파일은 공유하지 않습니다.";
 "Image clipboard sharing is off." = "이미지 클립보드 공유 꺼짐";
 "Image clipboard: waiting for both Macs to update and enable sharing." = "두 Mac 모두 업데이트한 뒤 이미지 공유를 켜 주세요.";
 "Image clipboard enabled" = "이미지 클립보드 공유 켜짐";
@@ -330,3 +330,14 @@
 "A partially received item was changed on the receiving Mac. Choose a different name on the receiving Mac. Nothing was replaced." = "받던 항목이 받는 Mac에서 바뀌었습니다. 받는 Mac에서 다른 이름을 선택하세요. 기존 항목은 바꾸지 않았습니다.";
 "Not enough free space on the receiving Mac." = "받는 Mac의 저장 공간이 부족합니다.";
 "Folder transfer failed. Completed files were kept. To resume, send the same unchanged folder again and choose the same location and name on the receiving Mac." = "폴더 전송에 실패했습니다. 완료한 파일은 그대로 남겨 두었습니다. 이어서 받으려면 바뀌지 않은 같은 폴더를 다시 보내고, 받는 Mac에서 같은 위치와 같은 이름을 선택하세요.";
+"Share copied text with the paired Mac" = "연결된 Mac과 복사한 텍스트 공유";
+"Text clipboard sharing is off." = "텍스트 클립보드 공유 꺼짐";
+"Text clipboard: waiting for both Macs to update and enable text sharing." = "텍스트 클립보드: 두 Mac 모두 업데이트하고 텍스트 공유를 켜야 합니다.";
+"Text clipboard enabled" = "텍스트 클립보드 켜짐";
+"Text clipboard off" = "텍스트 클립보드 꺼짐";
+"Text clipboard timed out" = "텍스트 클립보드 시간 초과";
+"Text clipboard unavailable" = "텍스트 클립보드를 사용할 수 없음";
+"Text clipboard sent" = "텍스트 클립보드 보냄";
+"Text clipboard received" = "텍스트 클립보드 받음";
+"Both Macs need 0.9.11 or later and text sharing enabled. Only newly copied plain text is shared, up to 1 MiB. Formatting, file paths and files are not shared." = "두 Mac 모두 0.9.11 이상이고 텍스트 공유가 켜져 있어야 합니다. 새로 복사한 일반 텍스트만 최대 1MiB까지 공유합니다. 서식, 파일 경로와 파일은 공유하지 않습니다.";
+"Text clipboard ready" = "텍스트 클립보드 사용 가능";

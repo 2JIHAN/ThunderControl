@@ -274,7 +274,7 @@
 "Input handoff is already in progress." = "Input handoff is already in progress.";
 
 "Share copied images with the paired Mac" = "Share copied images with the paired Mac";
-"Both Macs need 0.9.7 or later and image sharing enabled. Only newly copied images are shared. PNG and TIFF are sent as PNG, up to 8 MiB. Text and files are not shared." = "Both Macs need 0.9.7 or later and image sharing enabled. Only newly copied images are shared. PNG and TIFF are sent as PNG, up to 8 MiB. Text and files are not shared.";
+"Both Macs need 0.9.7 or later and image sharing enabled. Only newly copied images are shared. PNG and TIFF are sent as PNG, up to 8 MiB. Files are not shared." = "Both Macs need 0.9.7 or later and image sharing enabled. Only newly copied images are shared. PNG and TIFF are sent as PNG, up to 8 MiB. Files are not shared.";
 "Image clipboard sharing is off." = "Image clipboard sharing is off.";
 "Image clipboard: waiting for both Macs to update and enable sharing." = "Image clipboard: waiting for both Macs to update and enable sharing.";
 "Image clipboard enabled" = "Image clipboard enabled";
@@ -330,3 +330,14 @@
 "A partially received item was changed on the receiving Mac. Choose a different name on the receiving Mac. Nothing was replaced." = "A partially received item was changed on the receiving Mac. Choose a different name on the receiving Mac. Nothing was replaced.";
 "Not enough free space on the receiving Mac." = "Not enough free space on the receiving Mac.";
 "Folder transfer failed. Completed files were kept. To resume, send the same unchanged folder again and choose the same location and name on the receiving Mac." = "Folder transfer failed. Completed files were kept. To resume, send the same unchanged folder again and choose the same location and name on the receiving Mac.";
+"Share copied text with the paired Mac" = "Share copied text with the paired Mac";
+"Text clipboard sharing is off." = "Text clipboard sharing is off.";
+"Text clipboard: waiting for both Macs to update and enable text sharing." = "Text clipboard: waiting for both Macs to update and enable text sharing.";
+"Text clipboard enabled" = "Text clipboard enabled";
+"Text clipboard off" = "Text clipboard off";
+"Text clipboard timed out" = "Text clipboard timed out";
+"Text clipboard unavailable" = "Text clipboard unavailable";
+"Text clipboard sent" = "Text clipboard sent";
+"Text clipboard received" = "Text clipboard received";
+"Both Macs need 0.9.11 or later and text sharing enabled. Only newly copied plain text is shared, up to 1 MiB. Formatting, file paths and files are not shared." = "Both Macs need 0.9.11 or later and text sharing enabled. Only newly copied plain text is shared, up to 1 MiB. Formatting, file paths and files are not shared.";
+"Text clipboard ready" = "Text clipboard ready";
