@@ -114,6 +114,7 @@ func folderEntry(_ path: String, _ kind: FolderEntry.Kind = .file, _ size: UInt6
     try crashRecovery(base)
     try destinationSafety(base)
     try admitReplacement(base)
+    try exactTree(base)
     try heartbeats(base)
     try largeSynthetic(base)
     print("PASS all folder module checks")
@@ -184,6 +185,26 @@ func folderEntry(_ path: String, _ kind: FolderEntry.Kind = .file, _ size: UInt6
     folderThrows("FIFO entry", { ($0 as? FolderTransferError) == .unsupportedEntry("pipe") }) { _ = try FolderSourcePlan.capture(fifoRoot) }
     folderExpect(ProcessInfo.processInfo.systemUptime - started < 1, "FIFO not opened")
     folderThrows("FIFO root") { _ = try FolderSourcePlan.capture(fifoRoot.appendingPathComponent("pipe")) }
+    // Directory metadata only (xattr like com.apple.macl, ctime) keeps the plan; namespace and file changes do not.
+    let meta = try folderFixture(base, "meta"); let m = try FolderSourcePlan.capture(meta)
+    for dir in [meta, meta.appendingPathComponent("a/b")] { precondition(setxattr(dir.path, "local.thundercontrol.fixture", [1, 2, 3], 3, 0, 0) == 0) }
+    try m.verifyUnchanged()
+    let z = meta.appendingPathComponent("z.txt"); var zs = stat(); precondition(stat(z.path, &zs) == 0)
+    try Data("hellp".utf8).write(to: z)
+    var times = [timeval(tv_sec: zs.st_mtimespec.tv_sec, tv_usec: Int32(zs.st_mtimespec.tv_nsec / 1000)), timeval(tv_sec: zs.st_mtimespec.tv_sec, tv_usec: Int32(zs.st_mtimespec.tv_nsec / 1000))]
+    precondition(utimes(z.path, &times) == 0)
+    folderThrows("same-size content change with restored mtime", { ($0 as? FolderTransferError) == .sourceChanged }) { try m.verifyUnchanged() }
+    for (label, change) in [("added entry", { try Data().write(to: meta.appendingPathComponent("a/new")) }),
+                            ("deleted entry", { try FileManager.default.removeItem(at: meta.appendingPathComponent("a/empty.txt")) }),
+                            ("renamed entry", { try FileManager.default.moveItem(at: meta.appendingPathComponent("a/b/d.bin"), to: meta.appendingPathComponent("a/b/e.bin")) })] as [(String, () throws -> Void)] {
+      let fresh = try FolderSourcePlan.capture(meta); try change()
+      folderThrows(label + " after directory metadata", { ($0 as? FolderTransferError) == .sourceChanged }) { try fresh.verifyUnchanged() }
+    }
+    let rootSwap = try FolderSourcePlan.capture(meta)
+    try FileManager.default.moveItem(at: meta.appendingPathComponent("empty-dir"), to: meta.appendingPathComponent("old-empty"))
+    try FileManager.default.createDirectory(at: meta.appendingPathComponent("empty-dir/nested-empty"), withIntermediateDirectories: true)
+    try FileManager.default.removeItem(at: meta.appendingPathComponent("old-empty"))
+    folderThrows("swapped directory inode", { ($0 as? FolderTransferError) == .sourceChanged }) { try rootSwap.verifyUnchanged() }
     print("PASS source snapshot determinism, change, directory swap, symlink, FIFO, hidden and empty entries")
   }
 
@@ -353,6 +374,49 @@ func folderEntry(_ path: String, _ kind: FolderEntry.Kind = .file, _ size: UInt6
     }
     folderExpect(!store2.published && !FileManager.default.fileExists(atPath: dest2.path) && FileManager.default.fileExists(atPath: dest2.path + ".partial"), "foreign stage not published")
     print("PASS temp and stage replaced during admission are not published, replacements untouched")
+  }
+
+  /// Publication and published recovery accept exactly the manifest tree; unknown entries stay in place.
+  static func exactTree(_ base: URL) throws {
+    let v = Data(count: 32), bytes = Data([1, 2, 3]), sha = Data(SHA256.hash(data: Data([1, 2, 3])))
+    let manifest = try FolderManifest(rootName: "r", rootVersion: v, entries: [folderEntry(".h", .file, 3), folderEntry("d", .directory), folderEntry("d/f", .file, 3), folderEntry("e", .directory)])
+    let dest = base.appendingPathComponent("exact"), stage = dest.path + ".partial"
+    do { // Store released before reopening, like a process that exited after the crash.
+    let store = try FolderReceiverStore.open(destination: dest, manifest: manifest, identity: folderIdentity)
+    for index in [0, 2] { let file = try store.begin(index); try file.write(bytes); try store.commit(index, file, sha: sha) {} }
+    let temp = ".thundercontrol-" + UUID().uuidString + ".partial"
+    let plants: [(String, String, () throws -> Void)] = [
+      ("unlisted regular file", "extra", { try Data([5]).write(to: URL(fileURLWithPath: stage + "/extra")) }),
+      ("unlisted empty temp", "d/" + temp, { try Data().write(to: URL(fileURLWithPath: stage + "/d/" + temp)) }),
+      ("unknown symlink", "e/link", { precondition(symlink("/", stage + "/e/link") == 0) }),
+      ("extra directory", "x", { try FileManager.default.createDirectory(atPath: stage + "/x", withIntermediateDirectories: false) })]
+    for (label, path, plant) in plants {
+      try plant()
+      let before = try FileManager.default.subpathsOfDirectory(atPath: stage).sorted()
+      folderThrows(label + " refused", { ($0 as? FolderTransferError) == .conflict(path) }) { try store.publish {} }
+      let after = try FileManager.default.subpathsOfDirectory(atPath: stage).sorted()
+      folderExpect(!store.published && !FileManager.default.fileExists(atPath: dest.path) && after == before, label + " kept, not published")
+      precondition(unlink(stage + "/" + path) == 0 || rmdir(stage + "/" + path) == 0)
+    }
+    try FileManager.default.removeItem(atPath: stage + "/d/f"); try Data([9, 9, 9]).write(to: URL(fileURLWithPath: stage + "/d/f"))
+    folderThrows("same-size wrong known file", { ($0 as? FolderTransferError) == .conflict("d/f") }) { try store.publish {} }
+    let wrong = try Data(contentsOf: URL(fileURLWithPath: stage + "/d/f"))
+    folderExpect(!FileManager.default.fileExists(atPath: dest.path) && wrong == Data([9, 9, 9]), "wrong known file kept")
+    try bytes.write(to: URL(fileURLWithPath: stage + "/d/f"))
+    FolderReceiverStore.crashPoint = "afterPublish"
+    folderThrows("crash after publish", { $0 is FolderReceiverStore.Crash }) { try store.publish {} }
+    folderExpect(FileManager.default.fileExists(atPath: dest.path + "/d/f"), "exact tree published")
+    }
+    try Data([5]).write(to: dest.appendingPathComponent("e/finder-extra"))
+    folderThrows("published recovery with extra file", { ($0 as? FolderTransferError) == .unconfirmed }) {
+      _ = try FolderReceiverStore.open(destination: dest, manifest: manifest, identity: folderIdentity)
+    }
+    let extra = try Data(contentsOf: dest.appendingPathComponent("e/finder-extra"))
+    folderExpect(extra == Data([5]), "extra file in final kept")
+    try FileManager.default.removeItem(at: dest.appendingPathComponent("e/finder-extra"))
+    let reopened = try FolderReceiverStore.open(destination: dest, manifest: manifest, identity: folderIdentity)
+    folderExpect(reopened.published && reopened.skippedFiles == 2, "exact published tree recovered")
+    print("PASS exact tree before publish and at published recovery: extra file, empty temp, link, extra dir, wrong known file")
   }
 
   static func heartbeats(_ base: URL) throws {

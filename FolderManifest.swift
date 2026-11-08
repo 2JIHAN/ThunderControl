@@ -51,6 +51,10 @@ struct FolderFileStat: Equatable {
   }
   var fields: [UInt64] { [device, inode, size, UInt64(bitPattern: mtime), UInt64(bitPattern: mtimeNS), UInt64(bitPattern: ctime), UInt64(bitPattern: ctimeNS)] }
   var version: Data { var d = Data(); for f in fields { d.appendBE(f) }; return Data(SHA256.hash(data: d)) }
+  /// Directory identity only. Directory ctime, size and mtime move on metadata-only events such as
+  /// `com.apple.macl` from NSOpenPanel or Finder xattrs; the namespace is already bound by the
+  /// captured entry names and file versions, and a swapped directory changes dev/inode.
+  var directoryIdentity: FolderFileStat { FolderFileStat(device: device, inode: inode, size: 0, mtime: 0, mtimeNS: 0, ctime: 0, ctimeNS: 0) }
 }
 
 extension Data {
@@ -232,7 +236,7 @@ final class FolderSourcePlan {
         let path = prefix + [child], shown = path.joined(separator: "/")
         guard folderNameIsValid(child), shown.utf8.count <= FolderLimits.pathBytes, path.count <= FolderLimits.depth else { throw FolderTransferError.invalidName(shown) }
         var info = stat(); guard fstatat(dir, child, &info, AT_SYMLINK_NOFOLLOW) == 0 else { throw FolderTransferError.sourceChanged }
-        let snapshot = FolderFileStat(info)
+        var snapshot = FolderFileStat(info)
         switch info.st_mode & S_IFMT {
         case S_IFREG:
           guard snapshot.size <= FileOffer.maximum else { throw FolderTransferError.fileTooLarge(shown) }
@@ -240,6 +244,7 @@ final class FolderSourcePlan {
         case S_IFDIR:
           let sub = try folderOpenDirectory(dir, child); defer { close(sub) }
           var opened = stat(); guard fstat(sub, &opened) == 0, FolderFileStat(opened).device == snapshot.device, opened.st_ino == info.st_ino else { throw FolderTransferError.sourceChanged }
+          snapshot = snapshot.directoryIdentity
           entries.append(FolderEntry(path: path, kind: .directory, size: 0, version: snapshot.version)); stats.append(snapshot); parents.append(parent)
           try walk(sub, path, entries.count - 1)
         default: throw FolderTransferError.unsupportedEntry(shown)
@@ -247,7 +252,7 @@ final class FolderSourcePlan {
       }
     }
     try walk(root, [], -1)
-    var rootStat = FolderFileStat(rootInfo); rootStat = FolderFileStat(device: rootStat.device, inode: rootStat.inode, size: 0, mtime: rootStat.mtime, mtimeNS: rootStat.mtimeNS, ctime: rootStat.ctime, ctimeNS: rootStat.ctimeNS)
+    let rootStat = FolderFileStat(rootInfo).directoryIdentity
     return Scan(manifest: try FolderManifest(rootName: name, rootVersion: rootStat.version, entries: entries), stats: stats, parents: parents)
   }
 

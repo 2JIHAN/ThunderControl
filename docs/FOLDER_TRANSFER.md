@@ -54,9 +54,11 @@ try FolderTransferEngine.receive(offer, over: channel, identity: FolderPeerIdent
 2. 임시 파일을 만든 직후 이름과 inode를 `begin`으로 기록한 뒤 데이터를 받습니다.
 3. SHA가 맞으면 `expect`(SHA와 임시 inode)를 먼저 기록하고 격리 속성, fsync와 RENAME_EXCL로 게시합니다.
 4. 게시 후 stat을 `done`으로 fsync한 다음 fileDone을 보냅니다.
-5. 모두 받으면 `publishIntent`를 기록하고 stage identity를 확인한 뒤 폴더를 RENAME_EXCL로 바꾸고 `published`를 기록합니다.
+5. 모두 받으면 `publishIntent`를 기록하고, stage 트리가 manifest와 정확히 같은지(숨김 파일과 폴더 포함, 링크를 따라가지 않음) 확인하고, stage identity를 확인한 뒤 폴더를 RENAME_EXCL로 바꾸고 `published`를 기록합니다.
 
-재개할 때 journal은 신뢰하지 않는 metadata로 읽습니다. `done` 파일은 stat이 같으면 건너뛰고, 다르면 기록한 SHA로 다시 해시합니다. `expect`만 있으면 같은 inode와 SHA일 때만 채택합니다. 기록과 identity가 맞는 임시 파일만 지우고, 모르는 항목은 지우거나 채택하지 않고 충돌로 멈춥니다. 최종 이름의 폴더는 기록한 stage inode와 모든 receipt가 맞을 때만 완료로 인정합니다.
+재개할 때 journal은 신뢰하지 않는 metadata로 읽습니다. `done` 파일은 stat이 같으면 건너뛰고, 다르면 기록한 SHA로 다시 해시합니다. `expect`만 있으면 같은 inode와 SHA일 때만 채택합니다. 기록과 identity가 맞는 임시 파일만 지우고, 모르는 항목은 지우거나 채택하지 않고 충돌로 멈춥니다. 최종 이름의 폴더는 기록한 stage inode와 모든 receipt가 맞고 manifest에 없는 항목이 하나도 없을 때만 완료로 인정합니다. manifest에 없는 파일, 링크, 폴더, 기록되지 않은 `.thundercontrol-UUID.partial`은 옮기거나 지우지 않고 충돌로 멈춥니다. 알려진 한계: 임시 파일을 만든 직후 `begin` 기록 전에 종료되면 그 빈 임시 파일이 남고, 이어받기는 게시 전에 그 이름으로 충돌을 알립니다. 사용자가 직접 지워야 합니다.
+
+원본 스냅샷에서 폴더(루트 포함)는 dev/inode만 버전으로 씁니다. NSOpenPanel이 붙이는 `com.apple.macl` 같은 xattr은 폴더 ctime을 바꾸지만 내용은 바꾸지 않기 때문입니다. 항목 추가, 삭제, 이름 변경은 manifest의 이름 목록으로, 폴더 교체는 inode로, 파일 변경은 파일의 전체 stat(ctime 포함)으로 잡습니다.
 
 ### 검사
 

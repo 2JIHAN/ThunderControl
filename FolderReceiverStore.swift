@@ -133,10 +133,10 @@ final class FolderReceiverStore {
     let store = FolderReceiverStore(manifest: manifest, parent: parent, finalName: name, root: root, rootID: stageID, journal: journal, journalID: folderIdentity(jinfo))
     cleanup = false
     if atFinal {
-      // The stage inode now sits at the final name. Accept it only if every receipt still verifies.
-      for (index, entry) in manifest.entries.enumerated() where entry.kind == .file {
-        guard let r = parsed.done[index], try store.verifyReceipt(index, r, check: check, pulse: pulse) else { throw FolderTransferError.unconfirmed }
-      }
+      // The stage inode now sits at the final name. Accept it only if it is exactly the manifest tree
+      // and every receipt still verifies; an extra or unknown entry is never claimed as completed.
+      do { try store.verifyExactTree(parsed.done, check: check, pulse: pulse) }
+      catch FileTransferError.cancelled { throw FileTransferError.cancelled } catch { throw FolderTransferError.unconfirmed }
       store.published = true
       if !parsed.publishedRecord { try store.append(.published, Data()) }
       return store
@@ -248,6 +248,37 @@ final class FolderReceiverStore {
     try recordDone(index, Receipt(stat: FolderFileStat(now), sha: digest)); return true
   }
 
+  /// Exact tree check through the held root: every manifest entry with its kind and receipt, nothing else.
+  /// Hidden files, orphan temps, links and extra directories are refused, never moved or deleted.
+  /// Reads at most one unexpected name per directory, never follows links, and unchanged stats skip the rehash.
+  private func verifyExactTree(_ done: [Int: Receipt], check: () throws -> Void, pulse: FolderPulse) throws {
+    var children: [[String]: [Data: Int]] = [:]
+    for (index, entry) in manifest.entries.enumerated() { children[Array(entry.path.dropLast()), default: [:]][Data(entry.path.last!.utf8)] = index }
+    func walk(_ dir: Int32, _ prefix: [String]) throws {
+      try check()
+      let expected = children[prefix] ?? [:]
+      let handle = dup(dir); guard handle >= 0, let stream = fdopendir(handle) else { if handle >= 0 { close(handle) }; throw FileTransferError.io }
+      defer { closedir(stream) }
+      rewinddir(stream)
+      while let item = readdir(stream) {
+        let raw = withUnsafeBytes(of: item.pointee.d_name) { Data($0.prefix(Int(item.pointee.d_namlen))) }
+        if raw == Data(".".utf8) || raw == Data("..".utf8) { continue }
+        guard expected[raw] != nil else { throw FolderTransferError.conflict((prefix + [String(decoding: raw, as: UTF8.self)]).joined(separator: "/")) }
+      }
+      for index in expected.values.sorted() {
+        let entry = manifest.entries[index]; pulse.add(1)
+        if entry.kind == .directory {
+          let sub: Int32; do { sub = try folderOpenDirectory(dir, entry.path.last!) } catch { throw FolderTransferError.conflict(entry.displayPath) }
+          defer { close(sub) }
+          try walk(sub, entry.path)
+        } else {
+          guard let receipt = done[index], try verifyReceipt(index, receipt, check: check, pulse: pulse) else { throw FolderTransferError.conflict(entry.displayPath) }
+        }
+      }
+    }
+    try walk(root, [])
+  }
+
   private func recover(_ parsed: ParsedJournal, check: () throws -> Void, pulse: FolderPulse) throws {
     for (index, entry) in manifest.entries.enumerated() where entry.kind == .file {
       try check()
@@ -320,6 +351,8 @@ final class FolderReceiverStore {
     try append(.publishIntent, Data())
     try point("afterIntent")
     try admit()
+    // Nothing outside the manifest is published: unknown entries pause with a conflict and stay in place.
+    try verifyExactTree(receipts, check: {}, pulse: FolderPulse())
     // Checked after the intent and admission, immediately before the exclusive rename.
     var info = stat()
     guard fstatat(parent, stageName, &info, AT_SYMLINK_NOFOLLOW) == 0, (info.st_mode & S_IFMT) == S_IFDIR, folderIdentity(info) == rootID else { throw FolderTransferError.unconfirmed }
