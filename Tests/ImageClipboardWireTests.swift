@@ -21,6 +21,17 @@ func runImageClipboardWireTests()->Int {
   check(!ImageClipboardWirePolicy.validEnvelope(extra),"no input ownership token piggyback")
   extra=wire;extra.data=Data([1]);check(!ImageClipboardWirePolicy.validEnvelope(extra),"no opaque input piggyback")
   extra=wire;extra.imageClipboardCodec=1;check(!ImageClipboardWirePolicy.validEnvelope(extra),"hello capability not on image data")
+  extra=wire;extra.folderTransferCodec=1;check(!ImageClipboardWirePolicy.validEnvelope(extra),"folder hello capability not on image data")
+  // folderTransferCodec is a hello-only capability, separate from fileTransferCodec.
+  var hello=Wire(kind:"hello",session:session,sequence:0);hello.fileTransferCodec=1;hello.folderTransferCodec=1
+  do{var v=Validator();try v.accept(hello);check(true,"folder hello codec 1 accepted")}catch{check(false,"folder hello codec 1 accepted")}
+  var unknown=hello;unknown.folderTransferCodec=2
+  do{var v=Validator();try v.accept(unknown);check(false,"unknown folder codec rejected")}catch{check(true,"unknown folder codec rejected")}
+  var event=Wire(kind:"event",session:session,sequence:1);event.folderTransferCodec=1
+  do{var v=Validator();try v.accept(hello);try v.accept(event);check(false,"folder codec on event rejected")}catch{check(true,"folder codec on event rejected")}
+  var peerEvent=Wire(kind:"ping",session:session,sequence:1);peerEvent.folderTransferCodec=1
+  var peerValidator=PeerValidator(senderPeer:true,session:session)
+  do{try peerValidator.accept(peerEvent);check(false,"folder codec on peer event rejected")}catch{check(peerValidator.next==1,"folder codec on peer event rejected")}
   extra=wire;extra.kind="ping"
   do{var v=PeerValidator(senderPeer:true,session:session,imageClipboardSupported:true);try v.accept(extra);check(false,"image on other kind denied")}catch{check(true,"image on other kind denied")}
   let chunk=ImageClipboardPacket(op:.chunk,epoch:epoch,peerEpoch:UUID().uuidString,id:UUID().uuidString,offset:0,totalBytes:32768,bytes:Data(repeating:0,count:32768))

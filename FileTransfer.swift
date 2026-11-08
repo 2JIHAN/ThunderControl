@@ -11,6 +11,16 @@ struct FileSession {
   let peerIP: String
   let cancelled: () -> Bool
   let onCancel: (@escaping () -> Void) -> Void
+  /// Authenticated stable device IDs from the confirmed pairing. Folder resume is bound to these,
+  /// never to the per-connection inputIDs or root key.
+  var localDeviceID: UUID? = nil
+  var peerDeviceID: UUID? = nil
+  /// Peer advertised folderTransferCodec 1 in its authenticated hello.
+  var folderTransferSupported = false
+  var folderIdentity: FolderPeerIdentity? {
+    guard folderTransferSupported, let localDeviceID, let peerDeviceID, localDeviceID != peerDeviceID else { return nil }
+    return FolderPeerIdentity(local: localDeviceID, peer: peerDeviceID)
+  }
   #if FILE_TRANSFER_SELF_TEST
   var localPort: UInt16 = 49179
   var peerPort: UInt16 = 49179
@@ -19,9 +29,22 @@ struct FileSession {
     HKDF<SHA256>.deriveKey(inputKeyMaterial: root, salt: Data([local, peer].sorted().joined(separator: "|").utf8), info: Data("ThunderControl.file.root.v1".utf8), outputByteCount: 32)
   }
 }
+/// One file or one folder. The UI remaps `id` to a local approval ID.
+enum TransferItem: Equatable {
+  case file(FileOffer), folder(FolderOffer)
+  var id: UUID { switch self { case .file(let o): return o.id; case .folder(let o): return o.id } }
+  var name: String { switch self { case .file(let o): return o.name; case .folder(let o): return o.name } }
+  var byteCount: UInt64 { switch self { case .file(let o): return o.byteCount; case .folder(let o): return o.totalBytes } }
+  func withID(_ id: UUID) -> TransferItem {
+    switch self {
+    case .file(let o): return .file(FileOffer(id: id, name: o.name, byteCount: o.byteCount))
+    case .folder(let o): return .folder(FolderOffer(id: id, name: o.name, totalBytes: o.totalBytes, fileCount: o.fileCount, entryCount: o.entryCount, manifestBytes: o.manifestBytes, digest: o.digest))
+    }
+  }
+}
 enum FileTransferState {
-  case unavailable(String), idle, preparing, awaitingPeer(FileOffer), incomingOffer(FileOffer)
-  case transferring(FileOffer, UInt64), verifying(FileOffer), completed(FileOffer), failed(String), cancelled
+  case unavailable(String), idle, preparing, awaitingPeer(TransferItem), incomingOffer(TransferItem)
+  case transferring(FileOffer, UInt64), folderProgress(FolderOffer, FolderProgress), verifying(FileOffer), completed(TransferItem), failed(String), cancelled
 }
 
 final class FileSocket {
@@ -93,16 +116,20 @@ private struct FilePacket: Codable {
   var offer: FileOffer? = nil
   var offset: UInt64? = nil
   var bytes: Data? = nil
+  /// Typed folder message, encoded once inside the unchanged authenticated packet. Absent in file v1.
+  var folder: FolderMessage? = nil
   func validate() throws {
     switch kind {
     case "proof", "accept", "busy", "decline":
-      guard offer == nil, offset == nil, bytes == nil else { throw FileTransferError.invalid }
+      guard offer == nil, offset == nil, bytes == nil, folder == nil else { throw FileTransferError.invalid }
     case "offer":
-      guard let offer, offset == nil, bytes == nil else { throw FileTransferError.invalid }; try offer.validate()
+      guard let offer, offset == nil, bytes == nil, folder == nil else { throw FileTransferError.invalid }; try offer.validate()
     case "chunk":
-      guard offer == nil, offset != nil, let bytes, !bytes.isEmpty, bytes.count <= 65536 else { throw FileTransferError.invalid }
+      guard offer == nil, offset != nil, let bytes, !bytes.isEmpty, bytes.count <= 65536, folder == nil else { throw FileTransferError.invalid }
     case "finish", "success":
-      guard offer == nil, offset != nil, bytes?.count == 32 else { throw FileTransferError.invalid }
+      guard offer == nil, offset != nil, bytes?.count == 32, folder == nil else { throw FileTransferError.invalid }
+    case "folder":
+      guard let folder, offer == nil, offset == nil, bytes == nil else { throw FileTransferError.invalid }; try folder.validate()
     default: throw FileTransferError.invalid
     }
   }
@@ -147,6 +174,19 @@ private final class FileChannel {
     let box = try AES.GCM.SealedBox(nonce: n, ciphertext: data.dropLast(16), tag: data.suffix(16))
     let plain = try AES.GCM.open(box, using: incoming, authenticating: aad); received += 1
     guard plain.count <= 100000 else { throw FileTransferError.invalid }; let packet = try JSONDecoder().decode(FilePacket.self, from: plain); try packet.validate(); return packet
+  }
+}
+
+/// Folder messages over the existing authenticated file channel; keys stay private to FileChannel.
+private final class FileFolderChannel: FolderChannel {
+  private let channel: FileChannel
+  init(_ channel: FileChannel) { self.channel = channel }
+  func send(_ message: FolderMessage) throws { try channel.send(FilePacket(kind: "folder", folder: message)) }
+  func receive() throws -> FolderMessage {
+    let packet = try channel.receive()
+    if packet.kind == "busy" { throw FileTransferError.busy }
+    guard packet.kind == "folder", let message = packet.folder else { throw FileTransferError.invalid }
+    return message
   }
 }
 
@@ -215,7 +255,15 @@ final class FileTransferService {
           defer { lock.lock(); if handshake === run { handshake = nil }; lock.unlock() }
           do {
             let channel = try FileChannel(socket: accepted, session: session, run: run, initiator: false)
-            let packet = try channel.receive(); guard packet.kind == "offer", let offer = packet.offer else { throw FileTransferError.invalid }; try offer.validate()
+            let packet = try channel.receive()
+            if packet.kind == "folder", case .offer(let offer)? = packet.folder {
+              guard let identity = session.folderIdentity else { throw FileTransferError.invalid }
+              guard reserve(run) else { try channel.send(FilePacket(kind: "busy")); continue }
+              defer { release(run) }
+              do { try receiveFolder(channel, offer: offer, identity: identity) } catch { reportFailure(error, folder: true); throw error }
+              continue
+            }
+            guard packet.kind == "offer", let offer = packet.offer else { throw FileTransferError.invalid }; try offer.validate()
             guard reserve(run) else { try channel.send(FilePacket(kind: "busy")); continue }
             defer { release(run) }
             do { try receive(channel, offer: offer) } catch { reportFailure(error); throw error }
@@ -226,10 +274,46 @@ final class FileTransferService {
   }
   func sendURL(_ url: URL) {
     let run = FileRun(); guard reserve(run) else { return }; report(.preparing)
+    var info = stat()
+    let isFolder = lstat(url.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFDIR
     DispatchQueue.global(qos: .utility).async { [self] in
       defer { release(run) }
       do {
-        try run.check(); let source = try FileSource(url); let socket = try fileSocket(session, run: run)
+        try run.check()
+        if isFolder { try sendFolder(url, run: run); return }
+        if (info.st_mode & S_IFMT) == S_IFREG, UInt64(max(0, info.st_size)) > FileOffer.maximum { throw FolderTransferError.fileTooLarge(url.lastPathComponent) }
+        let source = try FileSource(url); let channel = try openChannel(run)
+        report(.awaitingPeer(.file(source.offer))); try channel.send(FilePacket(kind: "offer", offer: source.offer))
+        var approvalTimeout = timeval(tv_sec: 130, tv_usec: 0); _ = setsockopt(channel.socket.fd, SOL_SOCKET, SO_RCVTIMEO, &approvalTimeout, socklen_t(MemoryLayout<timeval>.size))
+        let response = try channel.receive(); approvalTimeout.tv_sec = 15; _ = setsockopt(channel.socket.fd, SOL_SOCKET, SO_RCVTIMEO, &approvalTimeout, socklen_t(MemoryLayout<timeval>.size)); guard response.kind == "accept" else { throw response.kind == "busy" ? FileTransferError.busy : FileTransferError.declined }
+        try streamFile(source, over: channel)
+      } catch { run.cancel(); reportFailure(error, folder: isFolder) }
+    }
+  }
+  private func sendFolder(_ url: URL, run: FileRun) throws {
+    guard session.folderIdentity != nil else { throw FolderTransferError.peerUnsupported }
+    let plan = try FolderSourcePlan.capture(url, check: { try run.check() })
+    let channel = try openChannel(run)
+    report(.awaitingPeer(.folder(plan.offer)))
+    let offer = plan.offer, report = self.report
+    let outcome = try FolderTransferEngine.send(plan, over: FileFolderChannel(channel), check: { try channel.check() }, report: { report(.folderProgress(offer, $0)) })
+    report(outcome == .declined ? .failed(TCText("The receiving Mac declined the folder.")) : .completed(.folder(offer)))
+  }
+  private func receiveFolder(_ channel: FileChannel, offer: FolderOffer, identity: FolderPeerIdentity) throws {
+    try offer.validate()
+    report(.incomingOffer(.folder(offer)))
+    let run = channel.run, report = self.report
+    let outcome = try FolderTransferEngine.receive(offer, over: FileFolderChannel(channel), identity: identity, choose: { check in
+      let deadline = ProcessInfo.processInfo.systemUptime + 120
+      while run.wake.wait(timeout: .now() + 0.1) != .success {
+        try check(); guard ProcessInfo.processInfo.systemUptime < deadline else { throw FileTransferError.declined }
+      }
+      return try run.choice()
+    }, check: { try channel.check() }, report: { report(.folderProgress(offer, $0)) })
+    report(outcome == .declined ? .idle : .completed(.folder(offer)))
+  }
+  private func openChannel(_ run: FileRun) throws -> FileChannel {
+        let socket = try fileSocket(session, run: run)
         var local = try fileAddress(session.localIP, 0)
         guard withUnsafePointer(to: &local, { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(socket.fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) } }) == 0 else { throw FileTransferError.io }
         var remote = try fileAddress(session.peerIP, peerPort)
@@ -247,10 +331,9 @@ final class FileTransferService {
           }
           var error: Int32 = 0; var size: socklen_t = 4; guard getsockopt(socket.fd, SOL_SOCKET, SO_ERROR, &error, &size) == 0, error == 0 else { throw FileTransferError.io } }
         guard fcntl(socket.fd, F_SETFL, flags) == 0 else { throw FileTransferError.io }
-        let channel = try FileChannel(socket: socket, session: session, run: run, initiator: true)
-        report(.awaitingPeer(source.offer)); try channel.send(FilePacket(kind: "offer", offer: source.offer))
-        var approvalTimeout = timeval(tv_sec: 130, tv_usec: 0); _ = setsockopt(socket.fd, SOL_SOCKET, SO_RCVTIMEO, &approvalTimeout, socklen_t(MemoryLayout<timeval>.size))
-        let response = try channel.receive(); approvalTimeout.tv_sec = 15; _ = setsockopt(socket.fd, SOL_SOCKET, SO_RCVTIMEO, &approvalTimeout, socklen_t(MemoryLayout<timeval>.size)); guard response.kind == "accept" else { throw response.kind == "busy" ? FileTransferError.busy : FileTransferError.declined }
+        return try FileChannel(socket: socket, session: session, run: run, initiator: true)
+  }
+  private func streamFile(_ source: FileSource, over channel: FileChannel) throws {
         var hash = SHA256(); var offset: UInt64 = 0; var last = 0.0
         while true {
           try channel.check(); let chunk = try source.chunk(); if chunk.isEmpty { break }
@@ -262,12 +345,10 @@ final class FileTransferService {
         let digest = Data(hash.finalize())
         report(.verifying(source.offer)); try channel.send(FilePacket(kind: "finish", offset: offset, bytes: digest))
         do { let response = try channel.receive(); guard response.kind == "success", response.offset == offset, response.bytes == digest else { throw FileTransferError.unconfirmed } } catch { throw FileTransferError.unconfirmed }
-        report(.completed(source.offer))
-      } catch { run.cancel(); reportFailure(error) }
-    }
+        report(.completed(.file(source.offer)))
   }
   private func receive(_ channel: FileChannel, offer: FileOffer) throws {
-    report(.incomingOffer(offer))
+    report(.incomingOffer(.file(offer)))
     let approvalDeadline = ProcessInfo.processInfo.systemUptime + 120
     while channel.run.wake.wait(timeout: .now() + 0.1) != .success {
       try channel.check()
@@ -289,17 +370,36 @@ final class FileTransferService {
       if packet.kind == "finish" {
         guard packet.offset == offset, offset == offer.byteCount, packet.bytes == Data(hash.finalize()) else { throw FileTransferError.authentication }
         report(.verifying(offer)); try destination.commit { try channel.check(); try channel.run.admitCommit() }
-        report(.completed(offer)); try? channel.send(FilePacket(kind: "success", offset: offset, bytes: packet.bytes)); return
+        report(.completed(.file(offer))); try? channel.send(FilePacket(kind: "success", offset: offset, bytes: packet.bytes)); return
       }
       guard packet.kind == "chunk", packet.offset == offset, let bytes = packet.bytes, !bytes.isEmpty, bytes.count <= 65536, UInt64(bytes.count) <= offer.byteCount-offset else { throw FileTransferError.invalid }
       try destination.write(bytes); hash.update(data: bytes); offset += UInt64(bytes.count)
       let now = ProcessInfo.processInfo.systemUptime; if now-last >= 0.1 { report(.transferring(offer, offset)); last = now }
     }
   }
-  private func reportFailure(_ error: Error) {
-    if case FileTransferError.cancelled = error { report(.cancelled) }
-    else if case FileTransferError.unconfirmed = error { report(.failed("Delivery unconfirmed. Check the receiving Mac before sending again.")) }
-    else { report(.failed("File transfer failed or was declined. No existing destination was replaced.")) }
+  private func reportFailure(_ error: Error, folder: Bool = false) { report(Self.failureState(error, folder: folder)) }
+  /// User-facing, localized failure text. Folder stops keep completed files for resume.
+  static func failureState(_ error: Error, folder: Bool) -> FileTransferState {
+    let resume = "Completed files were kept. To resume, send the same unchanged folder again and choose the same location and name on the receiving Mac."
+    let rename = "Choose a different name on the receiving Mac. Nothing was replaced."
+    func text(_ key: String, _ values: String...) -> FileTransferState { .failed(TCLocalization.localized(key, values: values)) }
+    switch error {
+    case FileTransferError.cancelled: return folder ? text("Folder transfer stopped. " + resume) : .cancelled
+    case FileTransferError.unconfirmed, FolderTransferError.unconfirmed: return text("Delivery unconfirmed. Check the receiving Mac before sending again.")
+    case FileTransferError.busy where folder: return text("The other Mac is busy with another transfer. Try again later.")
+    case FolderTransferError.peerUnsupported: return text("Folder transfer requires ThunderControl 0.9.10 or later on both Macs.")
+    case FolderTransferError.unsupportedEntry(let path): return text("Cannot send “{0}”. Folders can contain only regular files and folders, not links or special files.", path)
+    case FolderTransferError.invalidName(let path): return text("Cannot send “{0}”. This name is not supported.", path)
+    case FolderTransferError.fileTooLarge(let path): return text("Cannot send “{0}”. Each file can be at most 64 GiB.", path)
+    case FolderTransferError.tooManyEntries: return text("Folders can contain at most 100,000 items.")
+    case FolderTransferError.manifestTooLarge, FolderTransferError.totalTooLarge: return text("This folder's file list is too large to send.")
+    case FolderTransferError.sourceChanged: return text("The folder changed while sending. " + resume)
+    case FolderTransferError.destinationExists, FolderTransferError.peerFailed(.exists): return text("An item with that name already exists. " + rename)
+    case FolderTransferError.resumeMismatch, FolderTransferError.peerFailed(.resumeMismatch): return text("The partial folder belongs to a different transfer or Mac. " + rename)
+    case FolderTransferError.conflict, FolderTransferError.peerFailed(.conflict): return text("A partially received item was changed on the receiving Mac. " + rename)
+    case FolderTransferError.insufficientSpace, FolderTransferError.peerFailed(.space): return text("Not enough free space on the receiving Mac.")
+    default: return folder ? text("Folder transfer failed. " + resume) : text("File transfer failed or was declined. No existing destination was replaced.")
+    }
   }
 }
 
@@ -313,8 +413,8 @@ final class FileTransferService {
   private(set) var state: FileTransferState = .unavailable("Connect both Macs with file transfer support.")
   var sessionToken: UUID { generation }
   private func publish(_ value: FileTransferState) {
-    if case .incomingOffer(let offer) = value {
-      let local = FileOffer(id: UUID(), name: offer.name, byteCount: offer.byteCount)
+    if case .incomingOffer(let item) = value {
+      let local = item.withID(UUID())
       offerID = local.id; state = .incomingOffer(local)
     } else { offerID = nil; state = value }
     onChange?(state)
@@ -382,6 +482,12 @@ func runFileTransferGuardFixtures() throws {
   for packet in [FilePacket(kind: "proof", offset: 0), FilePacket(kind: "offer"), FilePacket(kind: "accept", bytes: Data()), FilePacket(kind: "busy", offer: FileOffer(id: UUID(), name: "x", byteCount: 0)), FilePacket(kind: "decline", offset: 1), FilePacket(kind: "chunk", offset: 0, bytes: Data()), FilePacket(kind: "chunk", offset: 0, bytes: Data(count: 65537)), FilePacket(kind: "finish", offset: 0, bytes: Data(count: 31)), FilePacket(kind: "success"), FilePacket(kind: "unknown")] {
     do { try packet.validate(); throw FileTransferError.authentication } catch FileTransferError.invalid {}
   }
+  for packet in [FilePacket(kind: "folder"), FilePacket(kind: "folder", offset: 0, folder: .accept), FilePacket(kind: "folder", bytes: Data([1]), folder: .accept),
+                 FilePacket(kind: "accept", folder: .accept), FilePacket(kind: "chunk", offset: 0, bytes: Data([1]), folder: .closed), FilePacket(kind: "folder", folder: .data(Data()))] {
+    do { try packet.validate(); throw FileTransferError.authentication } catch FileTransferError.invalid {}
+  }
+  guard String(data: try JSONEncoder().encode(FilePacket(kind: "accept")), encoding: .utf8) == #"{"kind":"accept"}"#,
+    try JSONEncoder().encode(FilePacket(kind: "folder", folder: .data(Data(count: 65536)))).count + 16 <= 100000 else { throw FileTransferError.invalid }
   var pair: [Int32] = [0, 0]
   guard socketpair(AF_UNIX, SOCK_STREAM, 0, &pair) == 0 else { throw FileTransferError.io }
   let sender = FileSocket(pair[0]), receiver = FileSocket(pair[1]); let run = FileRun(); try run.add(sender)
@@ -391,6 +497,6 @@ func runFileTransferGuardFixtures() throws {
   usleep(100000); run.cancel(); run.cancel()
   guard done.wait(timeout: .now() + 1) == .success else { throw FileTransferError.invalid }
   withExtendedLifetime(receiver) {}
-  print("PASS strict packet shapes and blocked write promptly canceled")
+  print("PASS strict packet shapes incl folder field, legacy encoding unchanged, blocked write promptly canceled")
 }
 #endif

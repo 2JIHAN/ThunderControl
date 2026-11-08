@@ -21,6 +21,7 @@ import Darwin
     close(replacement)
     print("PASS stop repeated and port reuse while service retained")
     try serviceFixtures()
+    try folderServiceFixtures()
 
     for count in [0, 65536, 150001] {
       let bytes = Data((0..<count).map { UInt8($0 % 251) })
@@ -63,13 +64,18 @@ final class FixturePeer {
   var completed = 0
   var terminal = 0
   var idle = 0
+  var folder: FolderProgress?
+  var maxSkipped = 0
+  var lastFailure = ""
   func report(_ state: FileTransferState) {
     lock.lock()
     var choose = false
     switch state {
     case .incomingOffer: incoming += 1; choose = !hold
     case .completed: completed += 1; terminal += 1
-    case .failed, .cancelled: terminal += 1
+    case .folderProgress(_, let p): folder = p; maxSkipped = max(maxSkipped, p.skippedFiles)
+    case .failed(let text): lastFailure = text; terminal += 1
+    case .cancelled: terminal += 1
     case .idle: idle += 1
     default: break
     }
@@ -194,4 +200,109 @@ func fifoSourceFixture() throws {
   }
   guard result.value() else { throw FileTransferError.invalid }
   print("PASS FIFO source rejected without blocking regular-file validation")
+}
+
+func folderServiceTree(_ url: URL) throws -> [String: Data?] {
+  var out: [String: Data?] = [:]
+  for rel in try FileManager.default.subpathsOfDirectory(atPath: url.path) {
+    var dir: ObjCBool = false; _ = FileManager.default.fileExists(atPath: url.appendingPathComponent(rel).path, isDirectory: &dir)
+    out[rel] = dir.boolValue ? nil : try Data(contentsOf: url.appendingPathComponent(rel))
+    if !dir.boolValue { precondition(getxattr(url.appendingPathComponent(rel).path, "com.apple.quarantine", nil, 0, 0, 0) > 0, "quarantine on " + rel) }
+  }
+  return out
+}
+func folderServiceSource(_ root: URL, files: Int, size: Int) throws {
+  try FileManager.default.createDirectory(at: root.appendingPathComponent("nested/empty"), withIntermediateDirectories: true)
+  try Data("hidden".utf8).write(to: root.appendingPathComponent(".hidden"))
+  try Data().write(to: root.appendingPathComponent("nested/zero"))
+  for i in 0..<files { try Data((0..<size).map { UInt8(($0 &+ i) % 251) }).write(to: root.appendingPathComponent(String(format: "nested/part-%03d.bin", i))) }
+}
+/// Real localhost services over the authenticated file channel: both directions, stop and resume across
+/// new session keys and input IDs with the same stable devices, a different peer, busy and old peers.
+func folderServiceFixtures() throws {
+  let folder = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("ThunderControl-folder-service-" + UUID().uuidString)
+  try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+  defer { try? FileManager.default.removeItem(at: folder) }
+  let deviceA = UUID(), deviceB = UUID(), deviceC = UUID()
+  var bPort: UInt16 = 0 // the sender A listener: busy while A owns an active folder run
+  var aSession: FileSession?
+  func pair(_ peerOfB: UUID = deviceA) -> (FixturePeer, FixturePeer) {
+    let p = freeFixturePort(); var q = freeFixturePort(); while q == p { q = freeFixturePort() }
+    let root = SymmetricKey(size: .bits256), ids = UUID().uuidString + "|" + UUID().uuidString
+    var sa = FileSession(root: root, inputIDs: ids, localIP: "127.0.0.1", interfaceIndex: if_nametoindex("lo0"), peerIP: "127.0.0.1", cancelled: { false }, onCancel: { _ in },
+                         localDeviceID: deviceA, peerDeviceID: deviceB, folderTransferSupported: true)
+    sa.localPort = p; sa.peerPort = q; bPort = p; aSession = sa
+    var sb = sa; sb.localPort = q; sb.peerPort = p; sb.localDeviceID = deviceB; sb.peerDeviceID = peerOfB
+    let a = FixturePeer(), b = FixturePeer()
+    a.service = FileTransferService(session: sa, report: a.report); b.service = FileTransferService(session: sb, report: b.report)
+    a.service.start(); b.service.start()
+    waitFixture("folder listeners") { a.value { $0.idle } > 0 && b.value { $0.idle } > 0 }
+    return (a, b)
+  }
+  let source = folder.appendingPathComponent("source")
+  try folderServiceSource(source, files: 3, size: 150001)
+  let expected = try folderServiceTree(source)
+  do {
+    let (a, b) = pair(); defer { a.service.stop(); b.service.stop() }
+    for (direction, (sender, receiver)) in [(a, b), (b, a)].enumerated() {
+      let target = folder.appendingPathComponent("received-\(direction)"); receiver.destination(target)
+      let sent = sender.value { $0.completed }, got = receiver.value { $0.completed }
+      sender.service.sendURL(source)
+      waitFixture("folder direction \(direction)") { sender.value { $0.completed } == sent + 1 && receiver.value { $0.completed } == got + 1 }
+      let tree = try folderServiceTree(target); precondition(tree == expected, "folder bytes")
+      precondition(!FileManager.default.fileExists(atPath: target.path + ".partial") && !FileManager.default.fileExists(atPath: target.path + ".partial.journal"))
+      print("PASS folder service direction \(direction): exact tree, empty and hidden entries, quarantine, no sidecars")
+    }
+  }
+  // Stop mid-way, try from a different peer identity, then resume with fresh keys and input IDs.
+  let big = folder.appendingPathComponent("big"); try folderServiceSource(big, files: 30, size: 2_000_000)
+  let bigExpected = try folderServiceTree(big)
+  let target = folder.appendingPathComponent("resume-target")
+  do {
+    let (a, b) = pair(); defer { a.service.stop(); b.service.stop() }
+    b.destination(target); a.service.sendURL(big)
+    waitFixture("partial progress") { (b.value { $0.folder?.doneFiles ?? 0 }) >= 3 }
+    a.service.cancel()
+    waitFixture("stop both") { a.value { $0.terminal } > 0 && b.value { $0.terminal } > 0 }
+    precondition(a.value { $0.completed } == 0 && a.lock.withLock { a.lastFailure.contains("same location") }, "stop explains resume: " + a.lastFailure)
+    precondition(FileManager.default.fileExists(atPath: target.path + ".partial.journal"))
+  }
+  do {
+    let (a, b) = pair(deviceC); defer { a.service.stop(); b.service.stop() }
+    b.destination(target); a.service.sendURL(big)
+    waitFixture("different peer rejected") { a.value { $0.terminal } > 0 }
+    precondition(a.value { $0.completed } == 0 && !FileManager.default.fileExists(atPath: target.path))
+  }
+  do {
+    let (a, b) = pair(); defer { a.service.stop(); b.service.stop() }
+    b.destination(target); a.service.sendURL(big)
+    waitFixture("resumed") { a.value { $0.completed } == 1 && b.value { $0.completed } == 1 }
+    let skipped = a.value { $0.maxSkipped }
+    precondition(skipped >= 3 && skipped < 30, "skipped \(skipped)")
+    let tree = try folderServiceTree(target); precondition(tree == bigExpected)
+    print("PASS folder service stop keeps \(skipped) completed files, different peer rejected, resume with new session keys")
+  }
+  do {
+    let (a, b) = pair(); defer { a.service.stop(); b.service.stop() }
+    b.destination(nil, hold: true); a.service.sendURL(source)
+    waitFixture("folder approval pending") { b.value { $0.incoming } > 0 }
+    let c = FixturePeer(); var sc = aSession!
+    sc.localPort = freeFixturePort(); sc.peerPort = bPort
+    c.service = FileTransferService(session: sc, report: c.report)
+    c.service.sendURL(source)
+    waitFixture("folder busy") { c.value { $0.terminal } > 0 }
+    precondition(c.lock.withLock { c.lastFailure.contains("busy") }, "busy reported: " + c.lastFailure)
+    c.service.stop()
+    a.service.cancel()
+    waitFixture("pending folder cancel") { a.value { $0.terminal } > 0 && b.value { $0.terminal } > 0 }
+  }
+  do {
+    let old = FixturePeer()
+    var s = FileSession(root: SymmetricKey(size: .bits256), inputIDs: "old", localIP: "127.0.0.1", interfaceIndex: if_nametoindex("lo0"), peerIP: "127.0.0.1", cancelled: { false }, onCancel: { _ in })
+    s.localPort = freeFixturePort(); s.peerPort = freeFixturePort()
+    old.service = FileTransferService(session: s, report: old.report); old.service.sendURL(source)
+    waitFixture("old peer folder") { old.value { $0.terminal } > 0 }
+    precondition(old.lock.withLock { old.lastFailure.contains("0.9.10") }, old.lastFailure); old.service.stop()
+  }
+  print("PASS folder service approval cancel and 0.9.10 requirement for older peers")
 }
