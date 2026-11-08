@@ -113,6 +113,7 @@ func folderEntry(_ path: String, _ kind: FolderEntry.Kind = .file, _ size: UInt6
     try resumeAndIdentity(base)
     try crashRecovery(base)
     try destinationSafety(base)
+    try admitReplacement(base)
     try heartbeats(base)
     try largeSynthetic(base)
     print("PASS all folder module checks")
@@ -324,6 +325,34 @@ func folderEntry(_ path: String, _ kind: FolderEntry.Kind = .file, _ size: UInt6
     let temps = try FileManager.default.subpathsOfDirectory(atPath: hashDest.path + ".partial").filter { $0.contains(".thundercontrol-") }
     folderExpect(temps.isEmpty, "wrong hash temp removed")
     print("PASS no merge with user .partial, planted stage link, wrong digest rejected")
+  }
+
+  /// Same-user replacement of the temp file or stage inside the admission callback is never published.
+  static func admitReplacement(_ base: URL) throws {
+    let v = Data(count: 32)
+    let manifest = try FolderManifest(rootName: "r", rootVersion: v, entries: [folderEntry("d", .directory), folderEntry("d/f", .file, 3)])
+    let dest = base.appendingPathComponent("admit")
+    let store = try FolderReceiverStore.open(destination: dest, manifest: manifest, identity: folderIdentity)
+    let file = try store.begin(1); try file.write(Data([1, 2, 3]))
+    let dir = dest.path + ".partial/d/"
+    folderThrows("temp replaced in admit") {
+      try store.commit(1, file, sha: Data(SHA256.hash(data: Data([1, 2, 3])))) {
+        try FileManager.default.moveItem(atPath: dir + file.staged.name, toPath: dir + "moved-temp")
+        try Data([6, 6, 6]).write(to: URL(fileURLWithPath: dir + file.staged.name))
+      }
+    }
+    folderExpect(!FileManager.default.fileExists(atPath: dir + "f") && (try? Data(contentsOf: URL(fileURLWithPath: dir + file.staged.name))) == Data([6, 6, 6]), "foreign temp not published or removed")
+    let empty = try FolderManifest(rootName: "r", rootVersion: v, entries: [folderEntry("d", .directory)])
+    let dest2 = base.appendingPathComponent("admit-stage")
+    let store2 = try FolderReceiverStore.open(destination: dest2, manifest: empty, identity: folderIdentity)
+    folderThrows("stage replaced in admit", { ($0 as? FolderTransferError) == .unconfirmed }) {
+      try store2.publish {
+        try FileManager.default.moveItem(atPath: dest2.path + ".partial", toPath: base.appendingPathComponent("admit-moved").path)
+        try FileManager.default.createDirectory(atPath: dest2.path + ".partial", withIntermediateDirectories: false)
+      }
+    }
+    folderExpect(!store2.published && !FileManager.default.fileExists(atPath: dest2.path) && FileManager.default.fileExists(atPath: dest2.path + ".partial"), "foreign stage not published")
+    print("PASS temp and stage replaced during admission are not published, replacements untouched")
   }
 
   static func heartbeats(_ base: URL) throws {

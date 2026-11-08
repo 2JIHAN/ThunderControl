@@ -317,11 +317,12 @@ final class FolderReceiverStore {
   func publish(admit: () throws -> Void) throws {
     if published { return }
     for (index, entry) in manifest.entries.enumerated() where entry.kind == .file { guard receipts[index] != nil else { throw FolderTransferError.invalidManifest } }
-    var info = stat()
-    guard fstatat(parent, stageName, &info, AT_SYMLINK_NOFOLLOW) == 0, (info.st_mode & S_IFMT) == S_IFDIR, folderIdentity(info) == rootID else { throw FolderTransferError.unconfirmed }
     try append(.publishIntent, Data())
     try point("afterIntent")
     try admit()
+    // Checked after the intent and admission, immediately before the exclusive rename.
+    var info = stat()
+    guard fstatat(parent, stageName, &info, AT_SYMLINK_NOFOLLOW) == 0, (info.st_mode & S_IFMT) == S_IFDIR, folderIdentity(info) == rootID else { throw FolderTransferError.unconfirmed }
     guard renameatx_np(parent, stageName, parent, finalName, UInt32(RENAME_EXCL)) == 0 else { throw errno == EEXIST ? FolderTransferError.destinationExists : FileTransferError.io }
     _ = fsync(parent)
     try point("afterPublish")

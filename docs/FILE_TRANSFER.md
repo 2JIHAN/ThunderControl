@@ -12,7 +12,7 @@
 ## 첫 버전의 범위
 
 - 방향과 관계없이 한 번에 일반 파일 하나를 보냅니다. 빈 파일도 허용하며 크기 한도는 64GiB입니다.
-- 폴더와 심볼릭 링크는 보내지 않습니다. 폴더는 먼저 ZIP 파일로 묶어 보내세요.
+- 심볼릭 링크는 보내지 않습니다. 0.9.10부터는 폴더도 보낼 수 있습니다. [폴더 보내기](FOLDER_TRANSFER.md)를 참고하세요.
 - Finder의 파일 복사와 다른 Mac에 붙여넣기, 여러 파일 동시 전송과 이어받기는 지원하지 않습니다.
 - 내용과 파일 이름을 전송합니다. 원래 실행 권한과 확장 속성을 그대로 복제하지 않습니다. 받은 파일에는 macOS 격리 보안을 적용합니다.
 - 마지막 저장 확인이 오기 전에 연결이 끊기면 완료로 표시하지 않습니다. 상대가 이미 저장했을 수 있으므로 다시 보내기 전에 확인하세요.
@@ -29,8 +29,9 @@
 소스 폴더에서 다음 독립 실행 검사를 빌드하세요. 기본 앱 빌드에는 검사 전용 localhost 포트 주입이 포함되지 않습니다.
 
 ```sh
-xcrun swiftc -swift-version 5 -D FILE_TRANSFER_SELF_TEST \
-  FileTransferStorage.swift FileTransfer.swift Tests/FileTransferTests.swift \
+xcrun swiftc -swift-version 5 -parse-as-library -D FILE_TRANSFER_SELF_TEST \
+  Localization.swift FileTransferStorage.swift FolderManifest.swift FolderReceiverStore.swift \
+  FolderTransferEngine.swift FileTransfer.swift Tests/FileTransferTests.swift \
   -framework CryptoKit -framework Security -o /tmp/thundercontrol-file-tests
 /tmp/thundercontrol-file-tests
 ```
