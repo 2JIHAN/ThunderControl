@@ -111,6 +111,7 @@ func folderEntry(_ path: String, _ kind: FolderEntry.Kind = .file, _ size: UInt6
     try destinationSafety(base)
     try admitReplacement(base)
     try exactTree(base)
+    try publicationCancellation(base)
     try heartbeats(base)
     try largeSynthetic(base)
     print("PASS all folder module checks")
@@ -413,6 +414,22 @@ func folderEntry(_ path: String, _ kind: FolderEntry.Kind = .file, _ size: UInt6
     let reopened = try FolderReceiverStore.open(destination: dest, manifest: manifest, identity: folderIdentity)
     folderExpect(reopened.published && reopened.skippedFiles == 2, "exact published tree recovered")
     print("PASS exact tree before publish and at published recovery: extra file, empty temp, link, extra dir, wrong known file")
+  }
+
+  static func publicationCancellation(_ base: URL) throws {
+    let manifest = try FolderManifest(rootName: "r", rootVersion: Data(count: 32), entries: [folderEntry("a", .directory), folderEntry("a/b", .directory), folderEntry("c", .directory)])
+    let dest = base.appendingPathComponent("cancel-publication")
+    let store = try FolderReceiverStore.open(destination: dest, manifest: manifest, identity: folderIdentity)
+    let pulse = FolderPulse()
+    var checks = 0, admitted = false
+    folderThrows("cancel while checking exact tree", { ($0 as? FileTransferError) == .cancelled }) {
+      try store.publish(check: { checks += 1; if checks >= 2 { throw FileTransferError.cancelled } }, pulse: pulse, admit: { admitted = true })
+    }
+    folderExpect(checks >= 2 && !admitted && !store.published && !FileManager.default.fileExists(atPath: dest.path), "verification cancellation precedes final admission")
+    try store.publish(check: {}, pulse: pulse, admit: { admitted = true })
+    folderExpect(admitted && store.published && pulse.value >= UInt64(manifest.entries.count), "verification advances shared heartbeat progress")
+    store.finish()
+    print("PASS exact-tree verification propagates cancellation and heartbeat progress before final admission")
   }
 
   static func heartbeats(_ base: URL) throws {

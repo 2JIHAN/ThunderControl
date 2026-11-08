@@ -156,7 +156,7 @@ enum FolderTransferEngine {
         if case .finish(let digest) = next {
           guard digest == manifest.digest, store.receipts.count == manifest.fileCount else { throw FileTransferError.invalid }
           progress.currentPath = nil; progress.verifying = true; emit(progress, force: true)
-          try heartbeat(channel, timing, check) { _, c in try store.publish(admit: c) }
+          try heartbeat(channel, timing, check) { pulse, c in try store.publish(check: c, pulse: pulse, admit: c) }
           try channel.send(.complete(digest))
           if (try? wait(channel, budget: timing.stall, extends: false, check: check, { $0 == .closed ? () : nil })) != nil { store.finish() }
           progress.verifying = false; emit(progress, force: true)

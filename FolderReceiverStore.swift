@@ -338,14 +338,15 @@ final class FolderReceiverStore {
   }
 
   /// Durable intent, stage identity check, then RENAME_EXCL of the whole folder.
-  func publish(admit: () throws -> Void) throws {
+  func publish(check: () throws -> Void = {}, pulse: FolderPulse = FolderPulse(), admit: () throws -> Void) throws {
     if published { return }
+    try check()
     for (index, entry) in manifest.entries.enumerated() where entry.kind == .file { guard receipts[index] != nil else { throw FolderTransferError.invalidManifest } }
     try append(.publishIntent, Data())
     try point("afterIntent")
+    try verifyExactTree(receipts, check: check, pulse: pulse)
     try admit()
-    // Nothing outside the manifest is published: unknown entries pause with a conflict and stay in place.
-    try verifyExactTree(receipts, check: {}, pulse: FolderPulse())
+    try check()
     var info = stat()
     guard fstatat(parent, stageName, &info, AT_SYMLINK_NOFOLLOW) == 0, (info.st_mode & S_IFMT) == S_IFDIR, folderIdentity(info) == rootID else { throw FolderTransferError.unconfirmed }
     guard renameatx_np(parent, stageName, parent, finalName, UInt32(RENAME_EXCL)) == 0 else { throw errno == EEXIST ? FolderTransferError.destinationExists : FileTransferError.io }
