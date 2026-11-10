@@ -197,6 +197,35 @@ struct DesktopSystemGestureTarget:Equatable {
   }
 }
 // Pure adapter shared by production routing and no-input-post tests.
+struct DesktopReturnPressure {
+  enum Boundary:Equatable { case desktop(DesktopPortal), legacy(Edge) }
+  struct Key:Equatable {
+    let boundary:Boundary
+    let token:String
+    let session:String
+    let revision:UInt64
+    let epoch:UInt64
+  }
+  let key:Key
+  let startedAt:Double
+  var lastOutwardAt:Double
+  var outwardDistance:Double
+  static let duration=0.250
+  static let maximumGap=0.150
+  // Only posted outward movement advances an episode. No timer can return control.
+  static func advance(_ episode:inout Self?,key:Key?,now:Double,distance:Double=0)->Bool {
+    guard let key,now.isFinite else{episode=nil;return false}
+    let added=distance.isFinite ? min(10_000,max(0,distance)):0
+    guard var current=episode,current.key==key,now>=current.lastOutwardAt,
+      now-current.lastOutwardAt<=maximumGap else {
+      episode=Self(key:key,startedAt:now,lastOutwardAt:now,outwardDistance:added);return false
+    }
+    current.lastOutwardAt=now
+    current.outwardDistance=min(10_000,current.outwardDistance+added)
+    if now-current.startedAt>=duration {episode=nil;return true}
+    episode=current;return false
+  }
+}
 enum DesktopHandoffRouting {
   static func beginFrame(session:String,token:String,portal:DesktopPortal,entry:CGPoint,revision:UInt64)->Wire {
     Wire(kind:"begin",session:session,sequence:0,y:0,token:token,edge:.right,
@@ -262,6 +291,18 @@ enum DesktopHandoffRouting {
     switch portal.sourceSide {case .left:edge=portal.sourceRect.minX;case .right:edge=portal.sourceRect.maxX;case .top:edge=portal.sourceRect.minY;case .bottom:edge=portal.sourceRect.maxY}
     let u=(edge-(vertical ? previous.x:previous.y))/(vertical ? delta.dx:delta.dy)
     return portal.sourcePoint(fromTargetEdge:CGPoint(x:previous.x+delta.dx*u,y:previous.y+delta.dy*u))
+  }
+  static func outwardDistance(portal:DesktopPortal,previous:CGPoint,delta:CGVector)->Double {
+    let intended=CGPoint(x:previous.x+delta.dx,y:previous.y+delta.dy)
+    guard ReceiverDesktop.finite(intended) else{return 0}
+    let distance:CGFloat
+    switch portal.sourceSide {
+    case .left:distance=intended.x-portal.sourceRect.minX
+    case .right:distance=portal.sourceRect.maxX-intended.x
+    case .top:distance=intended.y-portal.sourceRect.minY
+    case .bottom:distance=portal.sourceRect.maxY-intended.y
+    }
+    return min(10_000,max(0,Double(distance)))
   }
   static func localReturn(portal:DesktopPortal,point:CGPoint,bounds:CGRect)->CGPoint {
     let p=portal.sourcePoint(fromTargetEdge:point)
@@ -403,8 +444,9 @@ struct EdgeHandoff {
   enum Phase: Equatable {
     case local, pending, committed, remote, targetReady, targetActive, returning
   }
-  var phase: Phase = .local
-  var token: String?
+  var phase: Phase = .local {didSet {if oldValue != phase {returnPressure=nil}}}
+  var token: String? {didSet {if oldValue != token {returnPressure=nil}}}
+  var returnPressure:DesktopReturnPressure?
   var edge: Edge = .right
   var offset = 0.5
   var width = 1.0
@@ -439,24 +481,29 @@ struct EdgeHandoff {
   ) -> EdgeAction {
     guard Self.dimensions(w, h), px.isFinite, py.isFinite, dx.isFinite, px >= 0, px < w,
       py >= 0, py < h
-    else { return .none }
-    guard phase == .local || phase == .targetActive else { return .none }
+    else { returnPressure=nil;return .none }
+    guard phase == .local || phase == .targetActive else { returnPressure=nil;return .none }
     let distance = edge.distance(px, w)
     if distance >= rearmDistance { latched = false }
     if let arrangement {
       let connected =
         phase == .local ? arrangement.remoteY(sourceY: py) : arrangement.sourceY(remoteY: py)
       guard connected != nil else {
-        dwell = nil
+        dwell = nil;returnPressure=nil
         return .none
       }
     }
     guard !latched, !held, distance <= activationDistance, edge.outward(dx) else {
-      dwell = nil
+      dwell = nil;returnPressure=nil
       return .none
     }
-    if dwell == nil { dwell = now }
-    guard now - dwell! >= activationDelay else { return .none }
+    if phase == .targetActive {
+      let key=token.map{DesktopReturnPressure.Key(boundary:.legacy(edge),token:$0,session:"",revision:0,epoch:0)}
+      guard DesktopReturnPressure.advance(&returnPressure,key:key,now:now) else{return .none}
+    } else {
+      if dwell == nil { dwell = now }
+      guard now - dwell! >= activationDelay else { return .none }
+    }
     dwell = nil
     latched = true
     if phase == .targetActive {
@@ -1164,7 +1211,7 @@ final class Relay {
   var sessionTransitionSuspended:((UInt64)->Void)?
   var auto = false
   var selectedEdge: Edge = .right
-  private var handoff = EdgeHandoff()
+  private var handoff = EdgeHandoff() {didSet {if oldValue.phase != handoff.phase || oldValue.token != handoff.token {clearDesktopReturnPressure()}}}
   private var ownership = RemoteInputOwnership()
   private(set) var systemControlKeysCompatible=false
   private var sourceSystemKeys=SystemControlKeyState()
@@ -1855,7 +1902,14 @@ final class Relay {
   }
   private var desktopPortal:DesktopPortal?
   private var desktopGlobalPointer:CGPoint?
-  private var desktopHandoffRevision:UInt64?
+  var onReturnBoundaryFeedback:((ReturnBoundaryFeedback)->Void)?
+  private func clearDesktopReturnPressure() {
+    guard desktopReturnPressure != nil else{return}
+    desktopReturnPressure=nil
+    onReturnBoundaryFeedback?(.released(crossed:false))
+  }
+  private var desktopReturnPressure:DesktopReturnPressure?
+  private var desktopHandoffRevision:UInt64? {didSet {if oldValue != desktopHandoffRevision {clearDesktopReturnPressure()}}}
   private var desktopEntryPolicy=DesktopEntryPolicy()
   // Receiver side: previous global pointer used by portal.isReverseCrossing
   // to detect the user crossing back through the authenticated edge. Caching
@@ -2201,9 +2255,9 @@ final class Relay {
   private var recoveryNonce = UUID()
   private var recoveryNotice = ""
   private var topology: DisplayTopologySnapshot?
-  private var localKeys = Set<CGKeyCode>()
-  private var localButtons = Set<Int64>()
-  private var localFlags: CGEventFlags = []
+  private var localKeys = Set<CGKeyCode>() {didSet {if !localKeys.isEmpty {clearDesktopReturnPressure()}}}
+  private var localButtons = Set<Int64>() {didSet {if !localButtons.isEmpty {clearDesktopReturnPressure()}}}
+  private var localFlags: CGEventFlags = [] {didSet {if !localFlags.isEmpty {clearDesktopReturnPressure()}}}
   private var gestureUntil = 0.0
   private var lastBridgeCheck = 0.0
   private var bridgeGrace=BridgeLinkGrace()
@@ -2222,7 +2276,7 @@ final class Relay {
   private var tap: CFMachPort?
   private var source: CFRunLoopSource?
   private var key: SymmetricKey?
-  private var session = ""
+  private var session = "" {didSet {if oldValue != session {clearDesktopReturnPressure();handoff.returnPressure=nil}}}
   private var seq: UInt64 = 1
   private var keys = Set<CGKeyCode>()
   private var buttons = Set<UInt32>()
@@ -2965,6 +3019,69 @@ final class Relay {
     let receiver=Relay();receiver.connection=OwnedSocket(-1);receiver.key=SymmetricKey(size:.bits256)
     return receiver.boundaryBlockedReason == .receiverInputDisabled
   }
+  static func verifyDesktopReturnPressureForTests()->Bool {
+    final class Mock:CursorRecoveryAPI {
+      func associate(_ value:Bool)->CGError{.success}
+      func hide(display:CGDirectDisplayID)->CGError{.success}
+      func show(display:CGDirectDisplayID)->CGError{.success}
+      func warp(to point:CGPoint)->CGError{.success}
+    }
+    let map=ReceiverDesktop(revision:7,mainID:1,displays:[ReceiverDisplay(id:1,bounds:CGRect(x:0,y:0,width:200,height:200)),ReceiverDisplay(id:2,bounds:CGRect(x:200,y:0,width:200,height:200))])
+    let r=Relay(cursorResources:CursorRecoveryController(api:Mock()))
+    let ctx=SessionContext(OwnedSocket(-1));defer{ctx.cancel(reason:"return-pressure fixture end")}
+    r.connection=OwnedSocket(-1);r.context=ctx;r.key=SymmetricKey(size:.bits256)
+    r.safetyObserversInstalled=true;r.gestureTrace.setEnabled(false)
+    r.sessionSnapshot=SessionSafetySnapshot(onConsole:true,loginDone:true,screenLocked:false);r.lastSessionPoll=Double.greatestFiniteMagnitude
+    var now=10.0,posts=0,reads=0,frames=[Wire](),feedback=[ReturnBoundaryFeedback]()
+    r.onReturnBoundaryFeedback={feedback.append($0)}
+    r.desktopClockForTests={now};r.desktopMapReadForTests={_,_ in reads+=1;return map}
+    r.desktopEpochForTests={0};r.desktopInputPermissionForTests={true}
+    r.desktopInputPostForTests={_ in posts+=1};r.desktopEnqueueForTests={frames.append($0);return true}
+    let token=UUID().uuidString
+    r.prepareDesktopSystemGestureForTests(map:map,point:CGPoint(x:0,y:100),token:token)
+    func move(_ dx:Double,_ dy:Double=0)->Bool {
+      guard let previous=r.desktopReceiverPreviousPointer,let event=CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:previous,mouseButton:.left) else{return false}
+      event.flags=[];event.setDoubleValueField(.mouseEventDeltaX,value:dx);event.setDoubleValueField(.mouseEventDeltaY,value:dy)
+      let next=map.moved(from:previous,delta:CGVector(dx:dx,dy:dy))
+      guard let bytes=event.data else{return false}
+      let beforeReads=reads,beforePosts=posts
+      r.receive(Wire(kind:"event",session:r.session,sequence:1,raw:5,data:bytes as Data,token:token,desktopMapRevision:7,desktopGlobalX:next.x,desktopGlobalY:next.y))
+      return reads==beforeReads+1 && posts==beforePosts+1
+    }
+    guard move(-10000),posts==1,frames.isEmpty,r.handoff.phase == .targetActive else{return false}
+    now+=0.1;guard move(-1) else{return false}
+    let feedbackBeforePing=feedback.count
+    r.receive(Wire(kind:"ping",session:r.session,sequence:1))
+    guard feedback.count==feedbackBeforePing else{return false}
+    now+=0.1;guard move(-1),frames.filter({$0.kind=="return"}).isEmpty else{return false}
+    now+=0.1;r.localKeys=[0];guard move(-1),r.desktopReturnPressure==nil else{return false};r.localKeys=[]
+    now+=0.1;guard move(-1) else{return false}
+    now+=0.1;guard move(0,1),r.desktopReturnPressure==nil else{return false}
+    now+=0.1;guard move(-1) else{return false}
+    now+=0.1;guard move(1),r.desktopReturnPressure==nil else{return false}
+    now+=0.1;guard move(-10) else{return false}
+    guard let scroll=CGEvent(scrollWheelEvent2Source:nil,units:.pixel,wheelCount:1,wheel1:1,wheel2:0,wheel3:0),let point=r.desktopReceiverPreviousPointer else{return false}
+    scroll.flags=[];guard let scrollBytes=scroll.data else{return false}
+    r.receive(Wire(kind:"event",session:r.session,sequence:1,raw:22,data:scrollBytes as Data,token:token,desktopMapRevision:7,desktopGlobalX:point.x,desktopGlobalY:point.y))
+    guard r.desktopReturnPressure==nil else{return false}
+    now+=0.1;guard move(-1) else{return false}
+    now+=0.2;guard move(-1),r.desktopReturnPressure?.startedAt==now else{return false}
+    for _ in 0..<2 {now+=0.1;guard move(-1),r.handoff.phase == .targetActive else{return false}}
+    r.receive(Wire(kind:"ping",session:r.session,sequence:1))
+    r.receive(Wire(kind:"inputLease",session:r.session,sequence:1,token:UUID().uuidString))
+    now+=0.06;guard move(-1),r.handoff.phase == .returning,frames.filter({$0.kind=="return"}).count==1 else{return false}
+    guard case .released(crossed:true)? = feedback.last else{return false}
+    guard feedback.contains(where:{if case .released(crossed:false)=$0{return true};return false}),
+      feedback.contains(where:{if case .pushing(_,_,let distance)=$0{return distance>0 && distance<=10_000};return false}) else{return false}
+    let feedbackBeforeInternal=feedback.count
+    r.prepareDesktopSystemGestureForTests(map:map,point:CGPoint(x:199,y:100),token:UUID().uuidString)
+    guard let event=CGEvent(mouseEventSource:nil,mouseType:.mouseMoved,mouseCursorPosition:CGPoint(x:209,y:100),mouseButton:.left) else{return false}
+    event.flags=[];event.setDoubleValueField(.mouseEventDeltaX,value:10);event.setDoubleValueField(.mouseEventDeltaY,value:0)
+    guard let bytes=event.data else{return false}
+    let beforeReads=reads,beforePosts=posts
+    r.receive(Wire(kind:"event",session:r.session,sequence:1,raw:5,data:bytes as Data,token:r.handoff.token,desktopMapRevision:7,desktopGlobalX:209,desktopGlobalY:100))
+    return r.desktopReceiverPreviousPointer==CGPoint(x:209,y:100) && r.handoff.phase == .targetActive && r.desktopReturnPressure==nil && reads==beforeReads+1 && posts==beforePosts+1 && feedback.count==feedbackBeforeInternal
+  }
   static func verifyReceiverSingleMapReadForTests()->Bool {
     final class Mock:CursorRecoveryAPI {
       func associate(_ associated:Bool)->CGError{.success}
@@ -3226,6 +3343,7 @@ final class Relay {
     return result
   }
   func releaseInputs() {
+    clearDesktopReturnPressure();handoff.returnPressure=nil
     guard receiverCleanupAllowed else {
       receiverCleanupPending = !keys.isEmpty || !modifiers.isEmpty || !buttons.isEmpty || !receiverSystemKeys.pressed.isEmpty || hidInputPoster.hasGlobalStateToRestore
       return
@@ -4974,6 +5092,7 @@ final class Relay {
   }
   func receive(_ w: Wire) {
     let inputStartedAt=ProcessInfo.processInfo.systemUptime
+    if (w.kind == "event" && w.raw != 5) || ["dock","appGesture"].contains(w.kind) {clearDesktopReturnPressure();handoff.returnPressure=nil}
     if lockedTransportOnly {lastInput=ProcessInfo.processInfo.systemUptime;return}
     if let reason = currentSessionBlockReason() {
       sessionBecameUnsafe(reason,origin:polledSessionSuspensionOrigin)
@@ -5060,6 +5179,7 @@ final class Relay {
     }
     var desktopDestination:CGPoint?=nil
     var desktopReverse:(DesktopPortal,CGPoint)?=nil
+    var desktopOutwardDistance=0.0
     if multiDisplayDesktopCompatible {
       // Drop before modifier reconciliation or any other OS event posting.
       guard let desktop=eventDesktop,let revision=desktopHandoffRevision,
@@ -5072,6 +5192,10 @@ final class Relay {
         desktopReverse=DesktopHandoffRouting.reverse(desktop:desktop,sourceRect:portal.sourceRect,previous:previous,
           delta:CGVector(dx:e.getDoubleValueField(.mouseEventDeltaX),dy:e.getDoubleValueField(.mouseEventDeltaY)),
           held:!receiverSystemKeys.pressed.isEmpty || !keys.isEmpty || !buttons.isEmpty || !modifiers.isEmpty || !localKeys.isEmpty || !localButtons.isEmpty || !localFlags.isEmpty || !e.flags.intersection(heldModifierMask).isEmpty || dockReceiver.active || receiverAppGesture.active)
+        if let back=desktopReverse {
+          desktopOutwardDistance=DesktopHandoffRouting.outwardDistance(portal:back.0,previous:previous,
+            delta:CGVector(dx:e.getDoubleValueField(.mouseEventDeltaX),dy:e.getDoubleValueField(.mouseEventDeltaY)))
+        }
       }
     }
     let inputGeneration=generation
@@ -5171,10 +5295,21 @@ final class Relay {
     guard result == .posted else {if case .failed(let code,_) = result {stop(reason:"HID input failed (\(code))")};return}
     noteMousePost(t,startedAt:inputStartedAt)
     if multiDisplayDesktopCompatible {
-      if let back=desktopReverse,let token=handoff.token,let revision=desktopHandoffRevision,handoff.phase == .targetActive {
-        handoff.phase = .returning;handoff.deadline=ProcessInfo.processInfo.systemUptime+1.5
-        receiverReturnRequestAt=ProcessInfo.processInfo.systemUptime
-        _ = enqueue(DesktopHandoffRouting.returnFrame(session:session,token:token,portal:back.0,point:back.1,revision:revision))
+      let now=desktopNow
+      let pressureKey:DesktopReturnPressure.Key?
+      if let back=desktopReverse,let token=handoff.token,let revision=desktopHandoffRevision,let epoch=desktopValidatedEpoch,handoff.phase == .targetActive {
+        pressureKey=DesktopReturnPressure.Key(boundary:.desktop(back.0),token:token,session:session,revision:revision,epoch:epoch)
+      } else {pressureKey=nil}
+      let hadPressure=desktopReturnPressure != nil
+      let crossed=DesktopReturnPressure.advance(&desktopReturnPressure,key:pressureKey,now:now,distance:desktopOutwardDistance)
+      if crossed {onReturnBoundaryFeedback?(.released(crossed:true))}
+      else if let pressure=desktopReturnPressure,case .desktop(let portal)=pressure.key.boundary,let point=desktopDestination {
+        onReturnBoundaryFeedback?(.pushing(portal:portal,point:point,distance:pressure.outwardDistance))
+      } else if hadPressure {onReturnBoundaryFeedback?(.released(crossed:false))}
+      if crossed,let back=desktopReverse,let token=handoff.token,let revision=desktopHandoffRevision {
+        handoff.phase = .returning;handoff.deadline=now+1.5
+        receiverReturnRequestAt=now
+        _ = (desktopEnqueueForTests ?? enqueue)(DesktopHandoffRouting.returnFrame(session:session,token:token,portal:back.0,point:back.1,revision:revision))
       }
       return
     }
@@ -5183,8 +5318,8 @@ final class Relay {
       let action = handoff.motion(
         x: e.location.x - b.minX, y: e.location.y - b.minY,
         dx: decoded.getDoubleValueField(.mouseEventDeltaX),
-        now: ProcessInfo.processInfo.systemUptime,
-        held: !receiverSystemKeys.pressed.isEmpty || !keys.isEmpty || !buttons.isEmpty || !modifiers.isEmpty || !streamFlags.isEmpty || dockReceiver.active || receiverAppGesture.active,
+        now: desktopNow,
+        held: !receiverSystemKeys.pressed.isEmpty || !keys.isEmpty || !buttons.isEmpty || !modifiers.isEmpty || !streamFlags.isEmpty || !localKeys.isEmpty || !localButtons.isEmpty || !localFlags.isEmpty || dockReceiver.active || receiverAppGesture.active,
         w: b.width, h: b.height)
       if action == .requestReturn {receiverReturnRequestAt=ProcessInfo.processInfo.systemUptime;connectionLog("Return boundary reached; request queued");_ = control("return", token: handoff.token)}
     }
@@ -5196,6 +5331,7 @@ final class PasteCommandProbe: NSResponder {
   @objc func paste(_ sender: Any?) { calls += 1 }
 }
 @MainActor final class App: NSObject, NSApplicationDelegate, NSTabViewDelegate {
+  let returnBoundaryOverlay=ReturnBoundaryOverlay()
   lazy var appearance=AppAppearanceController(nativeEffectsEnabled:!isAutomationTest)
   let appUpdateCheck=AppUpdateCheck()
   var pendingDockVisibility:Bool?
@@ -5387,6 +5523,9 @@ final class PasteCommandProbe: NSResponder {
     relay.displayGeometryChanged = { [weak self] _ in self?.refreshLayout() }
     relay.layoutEligibilityChanged = { [weak self] in self?.refreshLayout() }
     relay.onReceiverDesktopChanged = { [weak self] in self?.refreshLayout() }
+    relay.onReturnBoundaryFeedback = { [weak self] feedback in
+      MainActor.assumeIsolated {self?.returnBoundaryOverlay.receive(feedback)}
+    }
     // Diagnostic details are recorded to bounded files, never rendered in the UI.
     let permissionStack = NSStackView()
     permissionStack.orientation = .vertical
@@ -6324,7 +6463,8 @@ func ownershipTests() {
   check(gate.motion(x: 0, y: 100, dx: -2, now: 1, held: held, w: 1000, h: 800) == .none)
   check(gate.phase == .targetActive)
   _ = gate.motion(x: 0, y: 100, dx: -2, now: 2, held: false, w: 1000, h: 800)
-  check(gate.motion(x: 0, y: 100, dx: -2, now: 2.2, held: false, w: 1000, h: 800) == .requestReturn)
+  for time in [2.1,2.2] {check(gate.motion(x:0,y:100,dx:-2,now:time,held:false,w:1000,h:800) == .none)}
+  check(gate.motion(x:0,y:100,dx:-2,now:2.26,held:false,w:1000,h:800) == .requestReturn)
   print(
     "PASS pure ownership drain, quarantine, fresh press, manual mirror, stale tokens, returning input, timeout cancellation policy and side-specific paired modifier release orders, ambiguity recovery and modifier motion gate"
   )
@@ -6395,9 +6535,8 @@ func edgeTests() throws {
   check(alignedTarget.motion(x: 0, y: 100, dx: -1, now: 3, held: false, w: 2560, h: 1440) == .none)
   check(alignedTarget.phase == .targetActive)
   check(!alignedTarget.latched)
-  check(
-    alignedTarget.motion(x: 0, y: 700, dx: -1, now: 3.1, held: false, w: 2560, h: 1440)
-      == .requestReturn)
+  for time in [3.1,3.2,3.3] {check(alignedTarget.motion(x:0,y:700,dx:-1,now:time,held:false,w:2560,h:1440) == .none)}
+  check(alignedTarget.motion(x:0,y:700,dx:-1,now:3.36,held:false,w:2560,h:1440) == .requestReturn)
   print(
     "PASS aligned entry preserves global Y and return uses current remote Y; non-overlap does not handoff"
   )
@@ -6483,8 +6622,8 @@ func edgeTests() throws {
   check(target.motion(x: 0, y: 500, dx: -2, now: 0.2, held: false, w: 2000, h: 1000) == .none)
   _ = target.motion(x: 40, y: 500, dx: 2, now: 0.3, held: false, w: 2000, h: 1000)
   _ = target.motion(x: 0, y: 500, dx: -2, now: 0.5, held: false, w: 2000, h: 1000)
-  check(
-    target.motion(x: 0, y: 500, dx: -2, now: 0.7, held: false, w: 2000, h: 1000) == .requestReturn)
+  for time in [0.6,0.7] {check(target.motion(x:0,y:500,dx:-2,now:time,held:false,w:2000,h:1000) == .none)}
+  check(target.motion(x:0,y:500,dx:-2,now:0.76,held:false,w:2000,h:1000) == .requestReturn)
   check(target.tick(3) == .restore && target.phase == .local)
   var left = EdgeHandoff(edge: .left)
   _ = left.motion(x: 50, y: 100, dx: 1, now: 0, held: false, w: 1000, h: 800)

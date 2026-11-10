@@ -25,7 +25,8 @@ expect(abs(source.x-121)<0.0001 && abs(source.y-239.75)<0.0001,"relative virtual
 expect(target.motion(x:1,y:200,dx:-2,now:1.3,held:false,w:1280,h:800) == .none,"entry latch prevents immediate return")
 expect(target.motion(x:40,y:200,dx:2,now:1.4,held:false,w:1280,h:800) == .none,"move inward to rearm")
 expect(target.motion(x:1,y:200,dx:-2,now:1.5,held:false,w:1280,h:800) == .none,"return dwell starts")
-expect(target.motion(x:1,y:200,dx:-2,now:1.7,held:false,w:1280,h:800) == .requestReturn,"return request after rearm and dwell")
+for time in [1.6,1.7] {expect(target.motion(x:1,y:200,dx:-2,now:time,held:false,w:1280,h:800) == .none,"continuous return pressure below threshold")}
+expect(target.motion(x:1,y:200,dx:-2,now:1.76,held:false,w:1280,h:800) == .requestReturn,"return request after sustained outward pressure")
 expect(target.phase == .returning,"bounded return phase")
 expect(target.tick(3.3) == .restore && target.phase == .local,"missing return ack times out local")
 expect(source.reset() == .restore && source.phase == .local,"disconnect reset local")
