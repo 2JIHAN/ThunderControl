@@ -607,7 +607,16 @@ private func runLocalTCPNegotiatedLifecycle(sides: LocalTCPSides) throws {
         try f.send(f.packet(dx: 20, dy: 0), acceptedMotion: true)
         try localTCPRequire(!f.input.plans.isEmpty, "negotiated input reaches HID recorder")
         if cycle == 0 { f.sender.desktopLocalKeysForTests = [0] }
-        try f.send(f.packet(dx: -40, dy: 0))
+        var returnNow=ProcessInfo.processInfo.systemUptime
+        f.receiver.desktopClockForTests={returnNow}
+        try f.send(f.packet(dx: -4000, dy: 0), acceptedMotion: true)
+        try localTCPRequire(f.receiver.localTCPPhaseForTests == "targetActive" && f.sender.desktopFocusRemoteForTests, "one huge return swipe stays remote")
+        for step in 1...3 {
+            returnNow += 0.1
+            try f.send(f.packet(dx: -10, dy: 0), acceptedMotion: true)
+            if step < 3 {try localTCPRequire(f.receiver.localTCPPhaseForTests == "targetActive", "outward pressure below return duration")}
+        }
+        f.receiver.desktopClockForTests=nil
         if cycle == 0 {
             try localTCPPump(until: { f.receiver.localTCPPhaseForTests == "returning" && f.reverseKinds["return", default: 0] > 0 }, "held source key defers return ACK")
             try localTCPRequire(f.sender.desktopFocusRemoteForTests && f.forwardKinds["returnAck", default: 0] == 0, "no premature ACK while held")
