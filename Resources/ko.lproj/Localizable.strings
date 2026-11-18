@@ -341,3 +341,16 @@
 "Text clipboard received" = "텍스트 클립보드 받음";
 "Both Macs need 0.9.11 or later and text sharing enabled. Only newly copied plain text is shared, up to 1 MiB. Formatting, file paths and files are not shared." = "두 Mac 모두 0.9.11 이상이고 텍스트 공유가 켜져 있어야 합니다. 새로 복사한 일반 텍스트만 최대 1MiB까지 공유합니다. 서식, 파일 경로와 파일은 공유하지 않습니다.";
 "Text clipboard ready" = "텍스트 클립보드 사용 가능";
+
+"Screen sharing and input connection stopped." = "화면 공유와 입력 연결을 중지했습니다.";
+"Screen sharing and input connection stopped. The previous display configuration could not be verified. Check Displays settings before reconnecting." = "화면 공유와 입력 연결을 중지했습니다. 이전 화면 구성을 확인하지 못했습니다. 다시 연결하기 전에 디스플레이 설정을 확인하세요.";
+
+"Connection interrupted. Input is local. Reconnecting..." = "연결이 잠시 끊겼습니다. 입력은 이 Mac에서 사용할 수 있으며 다시 연결하는 중입니다.";
+"Still waiting for a Thunderbolt connection. Check both Macs." = "Thunderbolt 연결을 계속 기다리고 있습니다. 두 Mac의 연결 상태를 확인하세요.";
+"Input recovery is pending. Release held inputs and click Stop to retry." = "입력 복구가 필요합니다. 키와 버튼에서 손을 떼고 중지를 눌러 재시도하세요.";
+
+"Connection quality is poor." = "연결 상태가 좋지 않습니다";
+"Keeping the last screen while reconnecting." = "화면을 유지한 채 다시 연결하고 있습니다.";
+"Close screen" = "화면 종료";
+
+"Connecting" = "연결중입니다";

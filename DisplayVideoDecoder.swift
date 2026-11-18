@@ -726,6 +726,93 @@ struct DisplayLatestDecodedFrame {
     var videoLayer: AVSampleBufferDisplayLayer? { layer as? AVSampleBufferDisplayLayer }
 }
 
+struct DisplayConnectionWarningProgress {
+    let startedAt: Double
+    static let closeDelay = 5.0
+    private func elapsed(at now: Double) -> Double? {
+        guard startedAt.isFinite, now.isFinite, now >= startedAt else { return nil }
+        let value = now - startedAt
+        return value.isFinite ? value : nil
+    }
+    func dots(at now: Double) -> Int {
+        guard let elapsed = elapsed(at: now) else { return 1 }
+        return min(2, Int(elapsed.truncatingRemainder(dividingBy: 1.5) / 0.5)) + 1
+    }
+    func canClose(at now: Double) -> Bool { elapsed(at: now).map { $0 >= Self.closeDelay } ?? false }
+}
+
+@MainActor private final class DisplayConnectionCloseButton: NSButton {
+    override func draw(_ dirtyRect: NSRect) {
+        let color = isEnabled
+            ? NSColor(calibratedRed: isHighlighted ? 0.66 : 0.79, green: 0.205, blue: 0.205, alpha: 1)
+            : NSColor(calibratedWhite: 0.42, alpha: 0.35)
+        color.setFill(); NSBezierPath(roundedRect: bounds, xRadius: 5, yRadius: 5).fill()
+        let style = NSMutableParagraphStyle(); style.alignment = .center
+        (title as NSString).draw(in: NSRect(x: 0, y: (bounds.height - 17) / 2, width: bounds.width, height: 17),
+            withAttributes: [.font: NSFont.systemFont(ofSize: 13, weight: .medium),
+                .foregroundColor: NSColor.white.withAlphaComponent(isEnabled ? 1 : 0.45), .paragraphStyle: style])
+    }
+    override func drawFocusRingMask() { NSBezierPath(roundedRect: bounds, xRadius: 5, yRadius: 5).fill() }
+    override var focusRingMaskBounds: NSRect { bounds }
+}
+
+@MainActor private final class DisplayConnectionWarningCard: NSView {
+    private let progress = DisplayConnectionWarningProgress(startedAt: ProcessInfo.processInfo.systemUptime)
+    private let detail = NSTextField(wrappingLabelWithString: "")
+    private let button: DisplayConnectionCloseButton
+    private var timer: Timer?
+    var closeAllowed: Bool { progress.canClose(at: ProcessInfo.processInfo.systemUptime) }
+    var closeButtonEnabled: Bool { button.isEnabled }
+    var message: String { detail.stringValue }
+    var startedAt: Double { progress.startedAt }
+    init(target: AnyObject, action: Selector) {
+        button = DisplayConnectionCloseButton(title: TCText("Close screen"), target: target, action: action)
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(calibratedRed: 0.13, green: 0.115, blue: 0.12, alpha: 0.84).cgColor
+        layer?.cornerRadius = 10
+        let icon = NSImageView(image: NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: TCText("Connection quality is poor."))!)
+        icon.contentTintColor = NSColor(calibratedRed: 1, green: 0.48, blue: 0.48, alpha: 1)
+        let title = NSTextField(wrappingLabelWithString: TCText("Connection quality is poor."))
+        title.font = .systemFont(ofSize: 15, weight: .medium); title.textColor = .white
+        detail.font = .systemFont(ofSize: 12); detail.textColor = NSColor(calibratedWhite: 0.85, alpha: 1)
+        button.isBordered = false; button.focusRingType = .exterior; button.isEnabled = false
+        for view in [icon, title, detail, button] { view.translatesAutoresizingMaskIntoConstraints = false; addSubview(view) }
+        NSLayoutConstraint.activate([
+            icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 24),
+            icon.centerYAnchor.constraint(equalTo: title.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 18), icon.heightAnchor.constraint(equalToConstant: 18),
+            title.topAnchor.constraint(equalTo: topAnchor, constant: 24),
+            title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 12),
+            title.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -24),
+            detail.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 8),
+            detail.leadingAnchor.constraint(equalTo: title.leadingAnchor), detail.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            button.topAnchor.constraint(equalTo: detail.bottomAnchor, constant: 26),
+            button.centerXAnchor.constraint(equalTo: centerXAnchor), button.widthAnchor.constraint(equalToConstant: 128),
+            button.heightAnchor.constraint(equalToConstant: 32), button.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -22)
+        ])
+        refresh()
+    }
+    private func refresh() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let message = TCText("Connecting") + String(repeating: ".", count: progress.dots(at: now))
+        if detail.stringValue != message { detail.stringValue = message }
+        let allowed = progress.canClose(at: now)
+        if button.isEnabled != allowed { button.isEnabled = allowed; button.needsDisplay = true }
+    }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow(); timer?.invalidate(); timer = nil
+        guard window != nil else { return }
+        refresh()
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.refresh() }
+        }
+        self.timer = timer; RunLoop.main.add(timer, forMode: .common)
+    }
+    deinit { timer?.invalidate() }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
 @MainActor private final class DisplayViewerWindow: NSWindow {
     var escapeCloses=true
     override func cancelOperation(_ sender: Any?) {if escapeCloses{performClose(sender)}}
@@ -858,6 +945,7 @@ struct DisplayViewerStartup {
     var isVideoPresentationReadyForTests: Bool { startup.mayPresentVideo }
     var acceptsViewerInput=true
     var onClose: (() -> Void)?
+    var onConnectionRecovered: (() -> Void)?
     var onWillClose: (() -> Void)?
     /// Only explicit native-window close or locally handled Escape, never codec teardown.
     var onUserClose: (() -> Void)?
@@ -976,6 +1064,14 @@ struct DisplayViewerStartup {
     private var cadenceLoggedAt = ProcessInfo.processInfo.systemUptime
     private(set) var presentationStats = DisplayPresentationStats()
     private var decoder: DisplayH264Decoder?
+    private var decodeGeneration: UInt64 = 0
+    private var connectionInterrupted = false
+    private var waitingForConnectionFrame = false
+    private var connectionWarning: DisplayConnectionWarningCard?
+    var connectionWarningVisibleForTests: Bool { connectionWarning?.superview != nil }
+    var connectionCloseEnabledForTests: Bool { connectionWarning?.closeButtonEnabled == true }
+    var connectionMessageForTests: String? { connectionWarning?.message }
+    var connectionWarningStartForTests: Double? { connectionWarning?.startedAt }
     private var closing = false
     private(set) var receivedFrameCount = 0
     var cursorVisibleForTests: Bool { cursorOverlay.superlayer != nil && cursorOverlay.contents != nil && !cursorOverlay.isHidden }
@@ -1103,9 +1199,16 @@ struct DisplayViewerStartup {
     }
     func accept(_ payload: Data, guardMilliseconds: Double? = nil) throws {
         let preAcceptStartedAt = ProcessInfo.processInfo.systemUptime
-        guard viewerWindow != nil, !closing else { throw DisplayVideoError.decoderFailed }
+        guard viewerWindow != nil, !closing, !connectionInterrupted else { throw DisplayVideoError.decoderFailed }
         if decoder == nil {
-            decoder = DisplayH264Decoder(format: self.format, trace: frameTrace, tracedOutput: { [weak self] pixel, identity in self?.present(pixel, identity: identity) }, output: { _ in }, failure: { [weak self] in self?.close() })
+            let generation = decodeGeneration
+            decoder = DisplayH264Decoder(format: self.format, trace: frameTrace, tracedOutput: { [weak self] pixel, identity in
+                guard let self, self.decodeGeneration == generation, !self.connectionInterrupted else { return }
+                self.present(pixel, identity: identity)
+            }, output: { _ in }, failure: { [weak self] in
+                guard let self, self.decodeGeneration == generation, !self.connectionInterrupted else { return }
+                self.close()
+            })
         }
         var video = payload
         var packetSequence: UInt64?
@@ -1201,14 +1304,14 @@ struct DisplayViewerStartup {
         return true
     }
 #endif
-    private func stopPacingLink() {
+    private func stopPacingLink(preservingDisplayedImage: Bool = false) {
         pacingGeneration &+= 1
         if #available(macOS 14.0, *) { (pacingLink as? CADisplayLink)?.invalidate() }
         pacingLink=nil; pacingTarget=nil
 #if TC_TIMED_PRESENTATION
         // Flush relative-PTS samples before removing their interpreting timebase.
         if #available(macOS 14.0, *) {
-            surface?.videoLayer?.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
+            surface?.videoLayer?.sampleBufferRenderer.flush(removingDisplayedImage: !preservingDisplayedImage, completionHandler: nil)
         }
         surface?.videoLayer?.controlTimebase = nil
         presentationTimebase = nil; scheduledTimeline.reset()
@@ -1321,6 +1424,7 @@ struct DisplayViewerStartup {
             let enqueueCA = CACurrentMediaTime(), enqueueHost = CMClockGetTime(CMClockGetHostTimeClock())
 #endif
             renderer.enqueue(sample)
+            connectionFramePresented()
             var enqueueFields = ["time": ProcessInfo.processInfo.systemUptime, "decodedMainToEnqueueMs": (ProcessInfo.processInfo.systemUptime-frame.decodedMainAt)*1000]
 #if TC_TIMED_PRESENTATION
             enqueueFields["scheduled"] = 1
@@ -1384,6 +1488,7 @@ struct DisplayViewerStartup {
                 guard deadlinePlan.commit(target: target, now: enqueueCA) else { break }
                 deadlineFrames.removeFirst()
                 renderer.enqueue(sample)
+            connectionFramePresented()
                 let end = CACurrentMediaTime()
                 deadlineMaximumFutureCount = max(deadlineMaximumFutureCount, deadlinePlan.futureCount)
                 deadlineLastEnqueue = ["target": target, "enqueueCA": enqueueCA, "enqueueEndCA": end,
@@ -1461,6 +1566,7 @@ struct DisplayViewerStartup {
             let traceTarget = 0.0
 #endif
             renderer.enqueue(sample)
+            connectionFramePresented()
             let now = ProcessInfo.processInfo.systemUptime
             frameTrace.record("renderer_enqueue", identity: frame.identity, fields: [
                 "time": now, "decodedMainToEnqueueMs": (now-frame.decodedMainAt)*1000, "immediate": 1, "target": traceTarget])
@@ -1622,7 +1728,7 @@ struct DisplayViewerStartup {
     }
     func acceptCursor(_ payload: Data) throws {
         let next = try DisplayCursorMetadata(payload)
-        guard !closing, viewerWindow != nil, lastCursorSequence.map({next.sequence > $0}) ?? true else { throw DisplayVideoError.malformed }
+        guard !closing, !connectionInterrupted, viewerWindow != nil, lastCursorSequence.map({next.sequence > $0}) ?? true else { throw DisplayVideoError.malformed }
         lastCursorSequence = next.sequence; cursorMetadata = next
         cursorExpiry?.cancel()
         let token = windowEpoch, cursorSequence = next.sequence
@@ -1654,9 +1760,14 @@ struct DisplayViewerStartup {
         cursorOverlay.zPosition = 100; cursorOverlay.isHidden = !m.visible
         CATransaction.commit()
     }
-    func clear() {
+    func clear(preservingDisplayedImage: Bool = false) {
+        decodeGeneration &+= 1
+        if !preservingDisplayedImage {
+            connectionWarning?.removeFromSuperview(); connectionWarning = nil
+            connectionInterrupted = false; waitingForConnectionFrame = false
+        }
         forwardedButtons.removeAll()
-        stopReadiness(); stopPacingLink()
+        stopReadiness(); stopPacingLink(preservingDisplayedImage: preservingDisplayedImage)
         rendererMetricsSample = nil
         logCadence(force: true)
         pacedFrames.clear(); displayLinkCadence=DisplayCadenceStats()
@@ -1690,9 +1801,39 @@ struct DisplayViewerStartup {
         presentationStats = DisplayPresentationStats()
 #if !TC_TIMED_PRESENTATION
         if #available(macOS 14.0, *), let layer = surface?.videoLayer {
-            layer.sampleBufferRenderer.flush(removingDisplayedImage: true, completionHandler: nil)
+            layer.sampleBufferRenderer.flush(removingDisplayedImage: !preservingDisplayedImage, completionHandler: nil)
         }
 #endif
+    }
+    func showConnectionWarning() {
+        guard !closing, let surface else { return }
+        if !connectionInterrupted { clear(preservingDisplayedImage: true) }
+        connectionInterrupted = true; waitingForConnectionFrame = false
+        onFocusLost?()
+        guard connectionWarning == nil else { return }
+        let warning = DisplayConnectionWarningCard(target: self, action: #selector(closeInterruptedScreen))
+        warning.translatesAutoresizingMaskIntoConstraints = false; surface.addSubview(warning)
+        let width = warning.widthAnchor.constraint(equalToConstant: 344); width.priority = .defaultHigh
+        NSLayoutConstraint.activate([warning.centerXAnchor.constraint(equalTo: surface.centerXAnchor),
+            warning.centerYAnchor.constraint(equalTo: surface.centerYAnchor), width,
+            warning.widthAnchor.constraint(lessThanOrEqualTo: surface.widthAnchor, constant: -24)])
+        connectionWarning = warning
+    }
+    func resumeConnection() {
+        guard !closing else { return }
+        clear(preservingDisplayedImage: true)
+        connectionInterrupted = false; waitingForConnectionFrame = true
+    }
+    private func connectionFramePresented() {
+        guard waitingForConnectionFrame else { return }
+        waitingForConnectionFrame = false
+        connectionWarning?.removeFromSuperview(); connectionWarning = nil
+        onConnectionRecovered?()
+    }
+    @objc private func closeInterruptedScreen() {
+        guard connectionWarning?.closeAllowed == true else { return }
+        onUserClose?()
+        close()
     }
     func close() {
         guard !closing else { return }; onWillClose?(); closing = true

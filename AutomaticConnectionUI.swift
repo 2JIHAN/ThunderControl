@@ -39,9 +39,13 @@ import AppKit
   var adaptiveReconnectEnabled:Bool {UserDefaults.standard.bool(forKey:"adaptiveReconnectBackoffEnabled")}
 
   func automaticConnectionTick() {
+    if connectionRecoveryWait.startedAt != nil {updateConnectionState()}
     sharingRestoreTick()
     guard !displayMode.cleaning else{return}
-    if displayMode.active && !relay.hasSession {return}
+    if displayMode.active && !relay.hasSession {
+      guard displayMode.reconnecting,let binding=displayMode.retainedInputBinding,
+        binding.inputIsSender==(mode.selectedSegment==0) else{return}
+    }
     // Unlock recovery owns its own safety checks and must run before the gates.
     tryResumeAfterVerifiedUnlock()
     guard !isAutomationTest,!applicationIsQuitting else{return}

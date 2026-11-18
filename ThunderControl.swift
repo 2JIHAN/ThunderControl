@@ -1311,6 +1311,26 @@ final class Relay {
   private var displayBarrier:ConcurrentDisplayBarrier?
   private var displayBarrierCompletion:((Result<Void,Error>)->Void)?
   private var displayLease:ConcurrentDisplayLease?
+  var retainedInputBinding:(()->(pair:LayoutDevicePair,inputIsSender:Bool)?)?
+
+  static func retainedReconnectStartAllowed(binding:(pair:LayoutDevicePair,inputIsSender:Bool)?,hasLease:Bool,hasBarrier:Bool,sendMode:Bool,expectedPair:LayoutDevicePair?)->Bool {
+    guard !hasBarrier else{return false}
+    guard let binding else{return !hasLease}
+    return binding.inputIsSender==sendMode && (!hasLease || !sendMode) && (expectedPair==nil || expectedPair==binding.pair)
+  }
+  static func retainedReconnectIdentityAllowed(_ confirmed:LayoutDevicePair,binding:(pair:LayoutDevicePair,inputIsSender:Bool)?,sendMode:Bool)->Bool {
+    guard let binding else{return true}
+    return binding.pair==confirmed && binding.inputIsSender==sendMode
+  }
+  func configureRetainedReconnectForTests(lease:ConcurrentDisplayLease?,barrier:Bool=false) {
+    displayLease=lease
+    displayBarrier=barrier ? ConcurrentDisplayBarrier(phase:.paused,now:0):nil
+  }
+  func retainedDisplayLeaseValid(ownedID:CGDirectDisplayID,original:DisplayBaseline)->Bool {
+    guard let lease=displayLease,lease.ownedID==ownedID,lease.original==original,
+      let first=freshDisplayBaseline(),let second=freshDisplayBaseline(),first==second else{return false}
+    return lease.matches(first) && lease.matches(second)
+  }
   private var sourceBarrierMapReady=false
   private var desktopFocusIntent:DesktopMapFocusIntent?
   private var sourceBarrierRevision:UInt64=0
@@ -3703,7 +3723,9 @@ final class Relay {
   }
   @discardableResult func start(name: String, peer: String, pass: String, port: UInt16, sendMode: Bool,automaticStart:Bool=false,lockedTransport:Bool=false,lockedPermitEpoch:UInt64?=nil,expectedRoutePair:LayoutDevicePair?=nil,fastRouteAttempt:Bool=false) throws -> Bridge {
     let attemptStartedAt=ProcessInfo.processInfo.systemUptime
-    guard displayLease == nil,displayBarrier == nil else{throw Failure("Stop the owned display before reconnecting input")}
+    let retainedBinding=retainedInputBinding?()
+    guard Self.retainedReconnectStartAllowed(binding:retainedBinding,hasLease:displayLease != nil,hasBarrier:displayBarrier != nil,sendMode:sendMode,expectedPair:expectedRoutePair) else{throw Failure("Stop the owned display before changing the input peer or role")}
+    if let lease=displayLease {guard retainedDisplayLeaseValid(ownedID:lease.ownedID,original:lease.original) else{throw Failure("Retained display identity could not be verified")}}
     stop()
     guard !receiverCleanupPending else{throw Failure("Input cleanup must finish before reconnecting; use Stop to retry recovery")}
     guard expectedRoutePair==nil || automaticStart else{throw Failure("Remembered peer binding is restricted to automatic reconnect")}
@@ -3735,7 +3757,7 @@ final class Relay {
         // Receiver may already be multi-display at connect time. Anchor the
         // input coordinate space on the main display identity+bounds, and
         // use the ReceiverDesktop map protocol for anything else.
-        let desktop = try readReceiverDesktop(revision:1,virtualDisplayID:nil)
+        let desktop = try readReceiverDesktop(revision:1,virtualDisplayID:displayLease?.ownedID)
         guard desktop.valid, let main = desktop.displays.first(where: { $0.id == desktop.mainID }) else {
           throw Failure("receiver desktop enumeration unstable")
         }
@@ -3890,7 +3912,7 @@ final class Relay {
         let k:SymmetricKey
         var verifiedPairingIDs:(String,String)?
         do {defer{pendingPIN=nil}
-        k=try performTrustedPairing(isSender:sendMode,senderPIN:pendingPIN,sessionID:pairingScope,localName:BridgeDiscoveryValidation.displayName(Host.current().localizedName ?? "ThunderControl Mac"),transport:io,allowNewTrust:expectedRoutePair == nil && !lockedTransport && (!automaticStart || !sendMode),allowKeychainInteraction:!automaticStart,authenticatedIdentity:{local,peer in verifiedPairingIDs=(local,peer)},receiverApproval:{request in
+        k=try performTrustedPairing(isSender:sendMode,senderPIN:pendingPIN,sessionID:pairingScope,localName:BridgeDiscoveryValidation.displayName(Host.current().localizedName ?? "ThunderControl Mac"),transport:io,allowNewTrust:retainedBinding == nil && expectedRoutePair == nil && !lockedTransport && (!automaticStart || !sendMode),allowKeychainInteraction:!automaticStart,authenticatedIdentity:{local,peer in verifiedPairingIDs=(local,peer)},receiverApproval:{request in
           guard let approval=self.approvePIN else{throw Failure("Receiver approval unavailable")}
           return try approval(request,{sessionContext.cancelled})
         })
@@ -3931,7 +3953,8 @@ final class Relay {
         var v = Validator()
         try v.accept(remoteHello)
         guard let ids=verifiedPairingIDs,let confirmedLayoutPair=LayoutDevicePair(localID:ids.0,peerID:ids.1) else{throw Failure("Authenticated device identity unavailable")}
-        guard routeIdentityMatches(confirmedLayoutPair,expected:expectedRoutePair) else{throw TrustedPairingError.failed}
+        guard routeIdentityMatches(confirmedLayoutPair,expected:expectedRoutePair),
+          Self.retainedReconnectIdentityAllowed(confirmedLayoutPair,binding:retainedBinding,sendMode:sendMode) else{throw TrustedPairingError.failed}
         let senderNonce = sendMode ? localSession : remoteHello.session
         let receiverNonce = sendMode ? remoteHello.session : localSession
         let sessionKey = connectionKey(
@@ -3946,6 +3969,9 @@ final class Relay {
         setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         DispatchQueue.main.async {
           guard self.generation == g, !sessionContext.cancelled else { return }
+          guard Self.retainedReconnectIdentityAllowed(confirmedLayoutPair,binding:self.retainedInputBinding?(),sendMode:sendMode) else{self.automaticReconnectSuspended=true;self.stop(reason:"Retained display peer or role changed");return}
+          guard self.displayBarrier == nil else{self.stop(reason:"Display transition began during input reconnect");return}
+          if let lease=self.displayLease {guard !sendMode,self.retainedDisplayLeaseValid(ownedID:lease.ownedID,original:lease.original) else{self.stop(reason:"Retained display identity changed during input reconnect");return}}
           guard sessionContext.finishAuthentication(now:ProcessInfo.processInfo.systemUptime) else{sessionContext.cancel(reason:sessionContext.authenticationTimeoutReason);self.stop(reason:sessionContext.authenticationTimeoutReason);return}
           self.lastInput = ProcessInfo.processInfo.systemUptime
           connectionLog(String(format:"Connection timing route=%@ transportWaitMs=%.1f trustMs=%.1f roleAndQueueMs=%.1f totalMs=%.1f",fastRouteAttempt ? "cached":(expectedRoutePair == nil ? "normal":"discovered-bound"),(transportReadyAt-attemptStartedAt)*1000,(proofFinishedAt-proofStartedAt)*1000,(self.lastInput-proofFinishedAt)*1000,(self.lastInput-attemptStartedAt)*1000))
@@ -5343,6 +5369,9 @@ final class PasteCommandProbe: NSResponder {
   let sharingStore:SavedSharingStateStore
   var sharingNewPairVideoPreference:()->Bool? = {UserDefaults.standard.object(forKey:"ThunderControl.virtualDisplayPreferred") as? Bool}
   var sharingExplicitResumePending:(generation:UUID,sender:Bool)?
+  var sharingDeferredExplicitResume:(pair:LayoutDevicePair,sender:Bool)?
+  var connectionRecoveryWait=ConnectionRecoveryWait()
+  var hadAuthenticatedConnection=false
   var sharingLastGateDiagnostic=""
   var sharingBlockedReason:String?
   var sharingResume=AutomaticSharingResume()
@@ -5631,9 +5660,21 @@ final class PasteCommandProbe: NSResponder {
       guard let self else{return}
       _ = self.verifiedBridgeRecovery.observe(nil)
     }
+    relay.retainedInputBinding = {[weak self] in
+      guard let self,self.displayMode.active else{return nil}
+      return self.displayMode.retainedInputBinding
+    }
     relay.automaticInputSharingPermitted = {[weak self] pair,sender in self?.sharingInputPermitted(pair:pair,sender:sender) ?? false}
-    relay.sharingEmergencyStopped = {[weak self] in self?.sharingUserStoppedAll()}
+    relay.sharingEmergencyStopped = {[weak self] in self?.sharingUserStoppedAll(reason:.emergencyStop)}
     relay.changed = { [weak self] s in
+      if let self {
+        if self.relay.authenticated {self.connectionRecoveryWait.clear()}
+        else if self.hadAuthenticatedConnection && !self.automaticConnectionPaused && !self.relay.automaticReconnectSuspended && !self.sharingInputRestoreBlocked && self.relay.sessionAllowed {
+          self.connectionRecoveryWait.begin(now:ProcessInfo.processInfo.systemUptime)
+        }
+        if self.relay.automaticReconnectSuspended {self.sharingDeferredExplicitResume=nil;self.connectionRecoveryWait.clear()}
+        self.hadAuthenticatedConnection=self.relay.authenticated
+      }
       self?.sharingObserveAuthenticatedBinding()
       if let self {if self.relay.authenticated {self.connectionNotifications.connected(peerName:self.relay.authenticatedPeerDisplayName ?? TCText("Bridge peer"),localIsSender:self.relay.authenticatedLocalIsSender)}else{self.connectionNotifications.disconnected()}}
       if let self,!self.isAutomationTest,self.appearanceInstalled {self.updateAutomaticWindowVisibility(connected:self.relay.authenticated);self.appearance.setConnected(self.relay.authenticated);self.flushDockVisibilityIfSafe()}
@@ -6202,6 +6243,8 @@ final class PasteCommandProbe: NSResponder {
     UserDefaults.standard.set(mode.selectedSegment==0 ? "send":"receive",forKey:"preferredRole")
     dockOutputTestGeneration=UUID()
     window.endEditing(for:nil);window.makeFirstResponder(nil)
+    let explicitRetryBinding=sharingResume.lastBinding
+    sharingDeferredExplicitResume=nil
     do {
       let sending=mode.selectedSegment==0
       let p:UInt16=49177
@@ -6213,12 +6256,19 @@ final class PasteCommandProbe: NSResponder {
       sharingDidStartExplicitConnection(sending:sending)
       automaticSessionVerified=true;manualPairingAttempt=sending;refreshModeUI()
       if !sending {advertiseVerifiedReceiver(verified,port:p)}
-    } catch {relay.status(safeConnectionError(error));if !relay.hasSession {discovery.stop()}}
+    } catch {
+      let reason=safeConnectionError(error)
+      if ["Bridge IPv4 unavailable; no fallback","Bridge is inactive; no fallback"].contains(reason),
+        let binding=explicitRetryBinding,binding.inputIsSender==(mode.selectedSegment==0) {
+        sharingDeferExplicitConnection(pair:binding.pair,sender:binding.inputIsSender)
+      }
+      relay.status(reason);if !relay.hasSession {discovery.stop()}
+    }
   }
   @objc func stop() {tearDownConnection(userStop:true)}
   func tearDownConnection(userStop:Bool,updateUI:Bool=true) {
-    if userStop {sharingUserStoppedAll()}
-    displayMode.stop()
+    if userStop {connectionRecoveryWait.clear();sharingUserStoppedAll(reason:.uiStop)}
+    displayMode.stop(disconnectInput:true)
     dockOutputTestGeneration=UUID()
     if let alert=pairingAlert {window.endSheet(alert.window,returnCode:.abort);pairingAlert=nil;pairingAlertToken=nil}
     automaticConnectionPaused=true;discoveryIsBrowsing=false;sessionAutoResume.revoke()
@@ -6227,7 +6277,7 @@ final class PasteCommandProbe: NSResponder {
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     applicationIsQuitting=true // Preserve sharing intent, but never restart video while quitting.
     if displayMode.active || displayMode.cleaning {
-      if displayMode.active {displayMode.stop()}
+      displayMode.stop(disconnectInput:true)
       finishQuitAfterDisplayCleanup()
       return .terminateCancel
     }
@@ -6258,9 +6308,8 @@ final class PasteCommandProbe: NSResponder {
       if !self.displayMode.active && !self.displayMode.cleaning {
         timer.invalidate();self.quitAfterDisplayCleanupTimer=nil;NSApp.terminate(nil);return
       }
-      // A cleanup whose display restoration was unconfirmed stays in cleaning
-      // until stop() is requested again; stop() itself skips while one runs.
-      if !self.displayMode.active && self.displayMode.cleaning {self.displayMode.stop()}
+      // Retry only unresolved owned-display removal; full quit never resumes input.
+      if !self.displayMode.active && self.displayMode.cleaning {self.displayMode.stop(disconnectInput:true)}
       if ProcessInfo.processInfo.systemUptime>deadline {
         timer.invalidate();self.quitAfterDisplayCleanupTimer=nil;self.applicationIsQuitting=false
         self.displayStatus.stringValue=TCText("Quit paused: screen sharing cleanup did not finish. Choose Quit again after it finishes.")
@@ -6882,6 +6931,9 @@ struct ThunderControlMain {
         let format=try displayTestFormat(arguments:CommandLine.arguments,after:i+2)
         try runDisplayPipelineTests(path:CommandLine.arguments[i+1],format:format)
       }catch{fputs("Display offline pipeline failed\n",stderr);exit(1)}
+    } else if CommandLine.arguments.contains("--display-retirement-self-test") {
+      guard CommandLine.arguments.contains("--self-test") else {exit(2)}
+      exit(DisplayModeController.verifyStopRetirementForTests() ? 0:1)
     } else if CommandLine.arguments.contains("--local-tcp-relay-integration-test") {
       guard CommandLine.arguments.contains("--self-test") else {
         fputs("--local-tcp-relay-integration-test requires --self-test; refusing to launch the normal app.\n",stderr); exit(2)
@@ -6913,7 +6965,7 @@ struct ThunderControlMain {
       check(runDisplayRuntimePresentationTests()==0)
       check(runDisplayRuntimeViewerModeTests()==0)
       #endif
-      do { try tests();check(runLocalizationTests()==0);check(runConcurrentDisplayTests()==0);check(runReceiverDesktopRelayTests()==0);check(runReceiverDesktopTests()==0);check(runSavedDesktopPlacementTests()==0);check(runReceiverDesktopUITests()==0);check(runDesktopMapTransitionTests()==0);check(runDesktopHandoffRoutingTests() + runBoundaryReadinessTests()==0);check(runDesktopEntryPolicyTests()==0);check(runDisplayHeartbeatTests()==0);check(runDisplayTrustTests()==0);check(runDisplayRemoteInputTests()==0);check(runDisplayTransportTests()==0);check(runDisplayCadenceTests()==0);check(runDisplayFramePacingTests()==0);check(runDisplayVideoFormatTests()==0);check(runSavedSharingStateTests()==0);check(runAutomaticSharingResumeTests()==0);check(runSharingLifecycleIntegrationTests()==0);check(runDisplayPreferenceTests()==0);check(runUpdateReleaseTests()==0);check(runSavedVirtualDisplayPlacementTests()==0);check(runVirtualDisplayPlacementSessionTests()==0);check(runPhysicalDisplayMirroringTests()==0);check(runDisplayVideoDecoderTests()==0);check(runDisplayDecodeWorkerTests()==0);check(runScrollReplayTests()==0);check(runDiscoveryRecoveryPolicyTests()==0);check(runNativeGestureTests()==0);check((runDockTransferStateTests()+runDesktopSystemGestureTests())==0);check(runTransitionMotionTests()==0);check(Relay.verifyDesktopReplayForTests());check(runGestureTraceTests()==0);check(runCursorVisibilityTests()==0);check(runConnectedLayoutTests()==0);check(runCursorModeProtocolTests()==0);ReceiverCursorFocusTests.run();check(runAutomaticConnectionPolicyTests()==0);check(runBridgeLinkRecoveryTests()==0);check(runCableReconnectPolicyTests()==0);check(runReceiverFocusRetryTests()==0);check(runReturnWarpResumeTests()==0);check(runDiagnosticStoreTests()==0);check(runDevelopmentDiagnosticsTests()==0);check(runDevelopmentFrameTraceTests()==0);check(runDisplayDiagnosticLinesTests()==0);check(runTrustedPairingTests()==0);check(runConnectionNotificationTests()==0);check(runSingleConnectionNotificationTests()==0);check(runAppAppearancePreferencesTests()==0);check(runSourcePreferencesConnectionTests()==0);check(runAppWindowPresentationPolicyTests()==0);check(runConnectedWindowVisibilityTests()==0);check(runSavedScreenLayoutTests()==0);check(Relay.verifyDeviceLayoutPersistenceForTests());check(runSessionAutoResumeTests()==0);check(runSessionSuspensionOriginTests()==0);check(Relay.verifySessionSuspensionOriginsForTests());check(runAutomaticReconnectBackoffTests()==0);check(runBridgeRecoverySchedulingTests()==0);check(runLockedTransportPolicyTests()==0);check(runAuthenticatedRouteHintTests()==0);check(runFastReconnectPolicyTests()==0);check(Relay.verifyLockedTransportInputBarrierForTests());check(!Relay().receiverWantsCursorHidden);ScreenArrangementDragTests.run();check(Relay.verifyReceiverRecoveryBlocksStartForTests());check(Relay.verifyReceiverInputCleanupBlocksLifecycleForTests());check(Relay.verifyReceiverPhysicalInputCancelsActivationForTests());check(Relay.verifyReceiverLocalInputClassificationForTests());try dockProtocolTests();try appGesturePacketTests();print("PASS gesture memory classification and system stream ordering; no posting") } catch {
+      do { try tests();check(runLocalizationTests()==0);check(runConcurrentDisplayTests()==0);check(runReceiverDesktopRelayTests()==0);check(runReceiverDesktopTests()==0);check(runSavedDesktopPlacementTests()==0);check(runReceiverDesktopUITests()==0);check(runDesktopMapTransitionTests()==0);check(runDesktopHandoffRoutingTests() + runBoundaryReadinessTests()==0);check(runDesktopEntryPolicyTests()==0);check(runDisplayHeartbeatTests()==0);check(runDisplayTrustTests()==0);check(runDisplayRemoteInputTests()==0);check(runDisplayTransportTests()==0);check(runDisplayCadenceTests()==0);check(runDisplayFramePacingTests()==0);check(runDisplayVideoFormatTests()==0);check(runSavedSharingStateTests()==0);check(runAutomaticSharingResumeTests()==0);check(runSharingLifecycleIntegrationTests()==0);check(runRetainedDisplayReconnectTests()==0);check(runDisplayRetentionTests()==0);check(runDisplayPreferenceTests()==0);check(runUpdateReleaseTests()==0);check(runSavedVirtualDisplayPlacementTests()==0);check(runVirtualDisplayPlacementSessionTests()==0);check(runPhysicalDisplayMirroringTests()==0);check(runDisplayVideoDecoderTests()==0);check(runDisplayDecodeWorkerTests()==0);check(runScrollReplayTests()==0);check(runDiscoveryRecoveryPolicyTests()==0);check(runNativeGestureTests()==0);check((runDockTransferStateTests()+runDesktopSystemGestureTests())==0);check(runTransitionMotionTests()==0);check(Relay.verifyDesktopReplayForTests());check(runGestureTraceTests()==0);check(runCursorVisibilityTests()==0);check(runConnectedLayoutTests()==0);check(runCursorModeProtocolTests()==0);ReceiverCursorFocusTests.run();check(runAutomaticConnectionPolicyTests()==0);check(runBridgeLinkRecoveryTests()==0);check(runCableReconnectPolicyTests()==0);check(runReceiverFocusRetryTests()==0);check(runReturnWarpResumeTests()==0);check(runDiagnosticStoreTests()==0);check(runDevelopmentDiagnosticsTests()==0);check(runDevelopmentFrameTraceTests()==0);check(runDisplayDiagnosticLinesTests()==0);check(runTrustedPairingTests()==0);check(runConnectionNotificationTests()==0);check(runSingleConnectionNotificationTests()==0);check(runAppAppearancePreferencesTests()==0);check(runSourcePreferencesConnectionTests()==0);check(runAppWindowPresentationPolicyTests()==0);check(runConnectedWindowVisibilityTests()==0);check(runSavedScreenLayoutTests()==0);check(Relay.verifyDeviceLayoutPersistenceForTests());check(runSessionAutoResumeTests()==0);check(runSessionSuspensionOriginTests()==0);check(Relay.verifySessionSuspensionOriginsForTests());check(runAutomaticReconnectBackoffTests()==0);check(runBridgeRecoverySchedulingTests()==0);check(runLockedTransportPolicyTests()==0);check(runAuthenticatedRouteHintTests()==0);check(runFastReconnectPolicyTests()==0);check(Relay.verifyLockedTransportInputBarrierForTests());check(!Relay().receiverWantsCursorHidden);ScreenArrangementDragTests.run();check(Relay.verifyReceiverRecoveryBlocksStartForTests());check(Relay.verifyReceiverInputCleanupBlocksLifecycleForTests());check(Relay.verifyReceiverPhysicalInputCancelsActivationForTests());check(Relay.verifyReceiverLocalInputClassificationForTests());try dockProtocolTests();try appGesturePacketTests();print("PASS gesture memory classification and system stream ordering; no posting") } catch {
         fputs("FAIL \(error)\n", stderr)
         exit(1)
       }

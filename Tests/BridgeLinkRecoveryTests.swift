@@ -75,6 +75,29 @@ import CryptoKit
     check(!BridgeInputRecovery.validEnvelope(packet),"lease does not authorize reset envelope")
   }
   check(Relay.verifyBridgeInputRecoveryForTests(),"production quarantine, held-key release, stale packet discard, exact identity and timeouts")
+  var wait=ConnectionRecoveryWait()
+  check(wait.phase(now:100)==nil,"no interruption has no recovery warning")
+  wait.begin(now:100)
+  check(wait.phase(now:100) == .waiting,"first interruption starts waiting")
+  check(wait.phase(now:159.999) == .waiting,"warning waits through 59.999 seconds")
+  check(wait.phase(now:160) == .prolonged,"warning becomes prolonged at 60 seconds")
+  check(wait.phase(now:1000) == .prolonged,"prolonged warning remains nonterminal")
+  wait.begin(now:159)
+  check(wait.startedAt==100 && wait.phase(now:160) == .prolonged,"duplicate interruption cannot extend waiting")
+  wait.clear()
+  check(wait.startedAt==nil && wait.phase(now:160)==nil,"authentication or Stop clears recovery warning")
+  wait.clear();wait.begin(now:200)
+  check(wait.phase(now:200) == .waiting,"clear permits a fresh interruption")
+  for invalid in [Double.nan,Double.infinity,-Double.infinity,-1] {
+    check(wait.phase(now:invalid)==nil,"invalid query clock suppresses warning")
+    var invalidStart=ConnectionRecoveryWait();invalidStart.begin(now:invalid)
+    check(invalidStart.phase(now:200)==nil,"invalid interruption clock cannot start waiting")
+    wait.begin(now:invalid)
+    check(wait.startedAt==200,"invalid duplicate cannot change first interruption")
+  }
+  check(wait.phase(now:199.999)==nil,"backward clock suppresses warning")
+  wait.begin(now:199)
+  check(wait.startedAt==200 && wait.phase(now:260) == .prolonged,"backward duplicate cannot restart waiting")
   print("Bridge link recovery: \(checks) checks, failures=\(failures); no physical cable manipulation or OS input posting")
   return failures
 }

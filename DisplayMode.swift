@@ -77,11 +77,54 @@ struct OwnedDisplayMonitor {
 #else
   private(set) var active=false,cleaning=false
 #endif
+  private(set) var reconnecting=false
+  private(set) var waitingForFreshFrame=false
+  var inputReadyAfterRecovery:Bool {!reconnecting && !waitingForFreshFrame}
+  var retentionSessionPermitted:(()->Bool)?
+  var retainedDisplayLeaseValid:((CGDirectDisplayID,DisplayBaseline)->Bool)?
+  var retainedInputBinding:(pair:LayoutDevicePair,inputIsSender:Bool)? {
+    guard active,let expectedPair else{return nil};return(expectedPair,!sending)
+  }
+  private var attempt=UUID(),retainedPeer="",retryAfter=0.0
+  private let attachmentLock=NSLock()
+  private var attachment:(transport:DisplayTransport,epoch:UUID,attempt:UUID,ownedID:UInt32?,freshAfter:UInt64,format:DisplayVideoFormat)?
+  private func publishAttachment(_ t:DisplayTransport?,freshAfter:UInt64=0) {
+    attachmentLock.lock();defer{attachmentLock.unlock()}
+    attachment=t.map{($0,epoch,attempt,virtualID,freshAfter,videoFormat)}
+  }
+  private func currentAttachment(_ token:UUID)->(transport:DisplayTransport,epoch:UUID,attempt:UUID,ownedID:UInt32?,freshAfter:UInt64,format:DisplayVideoFormat)? {
+    attachmentLock.lock();defer{attachmentLock.unlock()}
+    guard attachment?.epoch==token else{return nil};return attachment
+  }
+  private var localRetentionSafety:()->Bool = {sessionBlockReason(snapshot:readSystemSessionSnapshot(),lockedSignal:false,sleeping:false,secureInput:isSystemSecureInputEnabled()) == nil}
+  private var locallySafe:Bool {retentionSessionPermitted?()==true && localRetentionSafety()}
+  func inputConnectionInterrupted() {
+    guard active else{return}
+    guard inputBindingConflicts?() != true,locallySafe else{stop();return}
+    if sending,helper != nil,virtualID==nil {stop();return}
+    reconnecting=true;waitingForFreshFrame=true
+    if !sending {receivedFirstFrame=false}
+    attempt=UUID();publishAttachment(nil)
+    transport?.stop();transport=nil;authenticatedAt=nil;networkRTT=nil
+    #if TC_FRESH_RECEIVER_SAFETY
+    safetyTicket=nil
+    #endif
+    viewer?.showConnectionWarning();retryAfter=ProcessInfo.processInfo.systemUptime+1
+    report(TCText("Screen connection interrupted. Waiting to reconnect."))
+  }
+  func resumeRetainedConnection(peer:String,expectedPair:LayoutDevicePair) {
+    guard active,reconnecting,transport==nil else{return}
+    guard self.expectedPair==expectedPair,inputBindingConflicts?() != true else{stop();return}
+    guard locallySafe,safe,inputBindingValid?()==true else{return}
+    if sending,let id=virtualID,let original=baseline,retainedDisplayLeaseValid?(id,original) != true {stop(message:TCText("The retained display identity could not be verified."));return}
+    retainedPeer=peer
+    do{try startTransport(peer:peer,expectedPair:expectedPair,resuming:true)}catch{stop(message:safeConnectionError(error))}
+  }
   var status:((String)->Void)?
   var userStopped:(()->Void)?
   var viewerOwnershipLost:(()->Void)?
   var sourceOwnershipViewer:DisplayViewer? {
-    guard active,!sending,authenticatedAt != nil,inputBindingValid?()==true,let viewer,viewer.isOpenForSourceOwnership else{return nil}
+    guard active,inputReadyAfterRecovery,!sending,authenticatedAt != nil,inputBindingValid?()==true,let viewer,viewer.isOpenForSourceOwnership else{return nil}
     return viewer
   }
   var sharingSending:Bool? {active ? sending:nil}
@@ -117,6 +160,7 @@ struct OwnedDisplayMonitor {
   private var videoFormat=DisplayVideoFormat.standard
   private let virtualPlacementStore=SavedVirtualDisplayPlacementStore()
   private var placementSession:VirtualDisplayPlacementSession?
+  private var disconnectingInput=false
   private var finalMessage=TCText("Screen connection ended. The existing input connection remains active.")
   var connected:Bool {active && authenticatedAt != nil && (sending ? sourceReady:receivedFirstFrame)}
   private var safe:Bool {sessionPermitted?() == true && sessionBlockReason(snapshot:readSystemSessionSnapshot(),lockedSignal:false,sleeping:false,secureInput:isSystemSecureInputEnabled()) == nil}
@@ -162,13 +206,31 @@ struct OwnedDisplayMonitor {
     if sending {guard DisplayPeerRoute.valid(peer) else{throw Failure(TCText("Check the MacBook's Thunderbolt IPv4 address."))}}
     guard let original=DisplayBaseline.read(),original.supported else{throw Failure(TCText("Verify a valid receiving display configuration, then restart."))}
     if sending {guard CGPreflightScreenCaptureAccess() else{throw Failure(TCText("Allow Screen Recording on the Mac mini."))}}
-    self.sending=sending;self.expectedPair=expectedPair;baseline=original;active=true;epoch=UUID();ownedMonitor=OwnedDisplayMonitor();placementSession=nil
+    self.sending=sending;self.expectedPair=expectedPair;baseline=original;disconnectingInput=false;active=true;epoch=UUID();ownedMonitor=OwnedDisplayMonitor();placementSession=nil
     let token=epoch;sourceReady=false;transitionEngaged=false;transitionFailed=false;receivedFirstFrame=false;authenticatedAt=nil;networkRTT=nil;receivedVideo=0;lastReceivedVideo=0;started=ProcessInfo.processInfo.systemUptime;lastStatsAt=started
-    let viewerTarget = sending ? nil : DisplayViewerTarget.read()
+    retainedPeer=peer;reconnecting=false;waitingForFreshFrame=false
+    do{try startTransport(peer:peer,expectedPair:expectedPair,resuming:false)}catch{stop(message:safeConnectionError(error));throw error}
+    for name in [NSWorkspace.willSleepNotification,NSWorkspace.sessionDidResignActiveNotification,NSWorkspace.screensDidSleepNotification] {
+      let center=NSWorkspace.shared.notificationCenter
+      let observer=center.addObserver(forName:name,object:nil,queue:.main){[weak self] _ in MainActor.assumeIsolated{guard let self,self.epoch==token else{return};self.stop(message:TCText("Screen transmission stopped due to sleep or a session change."))}}
+      observers.append((center,observer))
+    }
+    let center=DistributedNotificationCenter.default()
+    let observer=center.addObserver(forName:NSNotification.Name("com.apple.screenIsLocked"),object:nil,queue:.main){[weak self] _ in MainActor.assumeIsolated{guard let self,self.epoch==token else{return};self.stop(message:TCText("Screen transmission stopped because the screen locked."))}}
+    observers.append((center,observer))
+    timer=Timer.scheduledTimer(withTimeInterval:0.5,repeats:true){[weak self] _ in MainActor.assumeIsolated{guard let self,self.epoch==token else{return};self.tick()}}
+    if let timer {RunLoop.main.add(timer,forMode:.common)}
+
+    report(sending ? TCText("Authenticating the same MacBook as the existing input connection on the screen channel."):TCText("Waiting for a screen connection. The existing input connection remains active."))
+  }
+  private func startTransport(peer:String,expectedPair:LayoutDevicePair,resuming:Bool)throws {
+    let token=epoch,attemptToken=UUID(),sending=self.sending
+    attempt=attemptToken
+    let viewerTarget = sending || resuming ? nil : DisplayViewerTarget.read()
     let t=DisplayTransport();transport=t
 #if TC_QUALITY_TIERS
     currentDisplayCodecName=nil;qualityCommandPending=false;qualityCommandDirty=false;lastRequestedCeiling=DisplayQualityPreferences.maximumTier.rawValue;t.qualityExtensionEnabled=qualityExtensionEnabled
-    t.onQualityLimitChange={[weak self] ceiling in self?.sendQualityCommand(ceiling,token:token)}
+    t.onQualityLimitChange={[weak self] ceiling in guard let self,self.active,self.epoch==token,self.attempt==attemptToken else{return};self.sendQualityCommand(ceiling,token:token)}
 #endif
     #if TC_FRESH_RECEIVER_SAFETY
     // Fixed immutable ticket is captured before transport start, not per packet.
@@ -177,26 +239,42 @@ struct OwnedDisplayMonitor {
     }
     safetyTicket=fixedSafetyTicket
     #endif
-    t.onAuthenticated = {[weak self] format in
-      guard let self,self.active,self.epoch==token else{return}
+    t.onAuthenticated = {[weak self,weak t] format in
+      guard let self,let t,self.active,self.epoch==token,self.attempt==attemptToken else{return}
       guard self.inputBindingValid?()==true else{self.stop(message:TCText("Screen startup canceled because the authenticated input peer changed."));return}
       guard format.valid else {self.stop(message:TCText("Could not agree on a video resolution."));return}
+      guard !resuming || format==self.videoFormat else{self.stop(message:TCText("The retained screen format changed."));return}
+      self.reconnecting=false
       self.videoFormat=format
       self.authenticatedAt=ProcessInfo.processInfo.systemUptime
+      if sending,resuming,let pipe=self.heartbeat,self.virtualID != nil {
+        let freshAfter=UInt64(ProcessInfo.processInfo.systemUptime*1_000_000)
+        self.publishAttachment(t,freshAfter:freshAfter)
+        DispatchQueue.global(qos:.utility).async {try? pipe.write(contentsOf:Data([0x24]))}
+        return
+      }
       if sending {
+        self.publishAttachment(t)
         self.report(TCText("Preparing to add a screen while keeping the input connection. Release all keys and buttons, and lift your fingers off the trackpad."))
         self.requestInputPause {[weak self] in
           guard let self else{return}
-          guard self.active,self.epoch==token else{if self.cleaning{self.cleanUpHelper()};return}
+          guard self.active,self.epoch==token,self.attempt==attemptToken else{if self.cleaning{self.cleanUpHelper()};return}
           guard !self.transitionFailed else{self.stop(message:TCText("Screen startup canceled because input release could not be confirmed. Check the input connection."));return}
           do {try self.launchHelper(token:token)}catch{self.stop(message:TCText("Could not start the extended display helper."))}
         }
       } else {
-        let v=DisplayViewer(format:format,targetScreen:viewerTarget?.screen,diagnosticStream:self.transport?.diagnosticStreamID);v.acceptsViewerInput=false
+        let v:DisplayViewer
+        if resuming,let retained=self.viewer {v=retained;v.resumeConnection()}
+        else {v=DisplayViewer(format:format,targetScreen:viewerTarget?.screen,diagnosticStream:self.transport?.diagnosticStreamID)}
+        v.acceptsViewerInput=false
+        v.onConnectionRecovered={[weak self,weak t] in
+          guard let self,let t,self.active,self.epoch==token,self.attempt==attemptToken,self.transport === t,!self.reconnecting else{return}
+          self.waitingForFreshFrame=false;self.receivedFirstFrame=true
+        }
 #if TC_DEADLINE_PRESENTATION
         v.maySubmitPresentation = { [weak owner = self, weak transport = t] in
           guard let owner, let transport else { return false }
-          return owner.active && owner.epoch == token && owner.transport === transport &&
+          return owner.active && !owner.reconnecting && owner.epoch == token && owner.attempt == attemptToken && owner.transport === transport &&
             owner.safetyTicket == fixedSafetyTicket && owner.currentSafetyTicket?(fixedSafetyTicket) == true
         }
 #endif
@@ -209,7 +287,7 @@ struct OwnedDisplayMonitor {
     }
     #if TC_FRESH_RECEIVER_SAFETY
     t.onPayload = {[weak self,weak t] data,sample in
-      guard let self,let t,self.active,self.epoch==token,self.transport === t,
+      guard let self,let t,self.active,self.epoch==token,self.attempt==attemptToken,self.transport === t,
         self.safetyTicket==fixedSafetyTicket else{return}
       let guardStartedAt=ProcessInfo.processInfo.systemUptime
       let payloadSafe=self.sampledSessionPermitted?(sample,fixedSafetyTicket,guardStartedAt)==true
@@ -223,7 +301,7 @@ struct OwnedDisplayMonitor {
       }
       // Recheck epoch, transport and current latches immediately before both
       // acceptance and an unsafe stop, so old completions cannot stop a new run.
-      guard self.active,self.epoch==token,self.transport === t,self.safetyTicket==fixedSafetyTicket else{return}
+      guard self.active,self.epoch==token,self.attempt==attemptToken,self.transport === t,self.safetyTicket==fixedSafetyTicket else{return}
       guard payloadSafe,self.currentSafetyTicket?(fixedSafetyTicket)==true,sample.valid(at:guardFinishedAt),guardFinishedAt>=guardStartedAt else {
         self.stop(message:TCText("Screen transmission stopped because the session's safety state changed."));return
       }
@@ -241,7 +319,7 @@ struct OwnedDisplayMonitor {
     }
     #else
     t.onPayload = {[weak self] data in
-      guard let self,self.active,self.epoch==token else{return}
+      guard let self,self.active,self.epoch==token,self.attempt==attemptToken else{return}
       // Keep the safety query and gate in their original order, once per payload.
       let guardStartedAt=ProcessInfo.processInfo.systemUptime
       let payloadSafe=self.safe
@@ -265,20 +343,10 @@ struct OwnedDisplayMonitor {
       }
     }
     #endif
-    t.onLatency = {[weak self] value in guard let self,self.active,self.epoch==token else{return};self.networkRTT=value.flatMap{$0.isFinite ? $0:nil}}
-    t.onFailure = {[weak self] text in guard let self,self.epoch==token else{return};self.stop(message:text)}
-    for name in [NSWorkspace.willSleepNotification,NSWorkspace.sessionDidResignActiveNotification,NSWorkspace.screensDidSleepNotification] {
-      let center=NSWorkspace.shared.notificationCenter
-      let observer=center.addObserver(forName:name,object:nil,queue:.main){[weak self] _ in MainActor.assumeIsolated{guard let self,self.epoch==token else{return};self.stop(message:TCText("Screen transmission stopped due to sleep or a session change."))}}
-      observers.append((center,observer))
-    }
-    let center=DistributedNotificationCenter.default()
-    let observer=center.addObserver(forName:NSNotification.Name("com.apple.screenIsLocked"),object:nil,queue:.main){[weak self] _ in MainActor.assumeIsolated{guard let self,self.epoch==token else{return};self.stop(message:TCText("Screen transmission stopped because the screen locked."))}}
-    observers.append((center,observer))
-    timer=Timer.scheduledTimer(withTimeInterval:0.5,repeats:true){[weak self] _ in MainActor.assumeIsolated{guard let self,self.epoch==token else{return};self.tick()}}
-    if let timer {RunLoop.main.add(timer,forMode:.common)}
-    do {try t.start(sending:sending,peer:peer,expectedPair:expectedPair,viewerFormat:viewerTarget?.format ?? .standard)}catch{stop(message:safeConnectionError(error));throw error}
-    report(sending ? TCText("Authenticating the same MacBook as the existing input connection on the screen channel."):TCText("Waiting for a screen connection. The existing input connection remains active."))
+    t.onLatency = {[weak self] value in guard let self,self.active,self.epoch==token,self.attempt==attemptToken else{return};self.networkRTT=value.flatMap{$0.isFinite ? $0:nil}}
+    t.onInterruption = {[weak self] _ in guard let self,self.active,self.epoch==token,self.attempt==attemptToken else{return};self.inputConnectionInterrupted()}
+    t.onFailure = {[weak self] text in guard let self,self.epoch==token,self.attempt==attemptToken else{return};self.stop(message:text)}
+    try t.start(sending:sending,peer:peer,expectedPair:expectedPair,viewerFormat:resuming ? videoFormat : (viewerTarget?.format ?? .standard))
   }
   private func requestInputPause(_ completion:@escaping()->Void) {
     guard let prepareInputTransition else{transitionFailed=true;completion();return}
@@ -374,6 +442,12 @@ struct OwnedDisplayMonitor {
   #endif
   private func tick() {
     guard active else{return}
+    if inputBindingConflicts?()==true {stop(message:TCText("The input peer changed. Closing the previous peer's video connection."));return}
+    if !reconnecting,inputBindingValid?() != true {inputConnectionInterrupted();if !active{return}}
+    if reconnecting {
+      guard locallySafe else{stop(message:TCText("Screen transmission stopped due to locking or a safety state change."));return}
+      if transport==nil,ProcessInfo.processInfo.systemUptime>=retryAfter,let pair=expectedPair,inputBindingValid?()==true {resumeRetainedConnection(peer:retainedPeer,expectedPair:pair)}
+    } else {
     #if TC_FRESH_RECEIVER_SAFETY
     if sending {
       guard safe else{stop(message:TCText("Screen transmission stopped due to locking or a safety state change."));return}
@@ -386,14 +460,14 @@ struct OwnedDisplayMonitor {
     #else
     guard safe else{stop(message:TCText("Screen transmission stopped due to locking or a safety state change."));return}
     #endif
-    if inputBindingConflicts?()==true {stop(message:TCText("The input peer changed. Closing the previous peer's video connection."));return}
+    }
     let now=ProcessInfo.processInfo.systemUptime
     if connected,now-lastStatsAt>=2 {
       let rate=Double(receivedVideo-lastReceivedVideo)/(now-lastStatsAt);lastReceivedVideo=receivedVideo;lastStatsAt=now
       let latency=networkRTT.map{String(format:TCText("Video channel round trip %.1fms"),$0)} ?? TCText("Measuring video latency")
       status?(sending ? TCText("Sending Mac mini → MacBook screen / ")+latency : String(format:TCText("Receiving Mac mini screen / %@ / recent %.0f fps"),latency,rate))
     }
-    if !sending,let authenticatedAt,!receivedFirstFrame,now-authenticatedAt>30 {stop(message:TCText("Video connection stopped because the first video frame did not arrive."));return}
+    if !sending,let authenticatedAt,!receivedFirstFrame,now-authenticatedAt>30 {firstFrameTimedOut();return}
     if sending,helper != nil {
       guard CGPreflightScreenCaptureAccess() else{stop(message:TCText("Video transmission stopped because Screen Recording permission is missing."));return}
       if let id=virtualID {
@@ -406,6 +480,10 @@ struct OwnedDisplayMonitor {
       } else if now-started>25 {stop(message:TCText("Extended display creation timed out."));return}
       do{try heartbeat?.write(contentsOf:Data([1]))}catch{stop(message:TCText("The extended display helper exited."))}
     }
+  }
+  private func firstFrameTimedOut() {
+    if waitingForFreshFrame {inputConnectionInterrupted()}
+    else {stop(message:TCText("Video connection stopped because the first video frame did not arrive."))}
   }
   private func launchHelper(token:UUID)throws {
     guard active,safe,inputBindingValid?()==true,let url=Bundle.main.url(forAuxiliaryExecutable:"ThunderDisplaySender") else{throw Failure(TCText("Could not verify the display helper or input connection."))}
@@ -463,7 +541,6 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
       }) == true {}
       lines.finish(now:ProcessInfo.processInfo.systemUptime,emit:connectionLog,raw:raw)
     }
-    let t=transport
     DispatchQueue.global(qos:.userInitiated).async {[weak self] in
 #if TC_VIDEO_SOCKETPAIR
       let handle=output;defer{try? handle.close()}
@@ -481,7 +558,8 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
       let handle=output.fileHandleForReading;defer{try? handle.close()}
       func exact(_ size:Int)throws->Data {var data=Data();while data.count<size {guard let part=try handle.read(upToCount:size-data.count),!part.isEmpty else{throw Failure("Video pipe ended")};data.append(part)};return data}
 #endif
-      var deliveryFailed=false
+      var attachedAttempt:UUID?
+      var awaitingFresh=false,recoveryNotificationPending=false
 #if TC_QUALITY_TIERS
       var lastTier:Int?
 #endif
@@ -494,16 +572,25 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
         }
         // Keep draining the helper even after its independent video socket closes.
         // Removing the owned display must wait for the raw-input pause barrier.
-#if TC_VIDEO_OFFMAIN
-        let deliver=self?.deliveryAllowed(token)==true
-#else
-        let deliver=DispatchQueue.main.sync {self?.active==true && self?.epoch==token}
-#endif
-        if !deliver || deliveryFailed {continue}
+        // Drain/drop while detached. A new attachment never borrows the old cipher/socket.
+        guard let attachment=self?.currentAttachment(token) else{continue}
+        let t=attachment.transport
+        if attachedAttempt != attachment.attempt {
+          attachedAttempt=attachment.attempt;awaitingFresh=attachment.freshAfter>0;recoveryNotificationPending=awaitingFresh
+          if let id=attachment.ownedID {
+            let preamble=Data([1,UInt8((id>>24)&255),UInt8((id>>16)&255),UInt8((id>>8)&255),UInt8(id&255)])
+            do{try t.send(preamble)}catch{continue}
+          }
+        }
+        if awaitingFresh {
+          guard let header=try? DisplayStreamFrameHeader(payload),header.capture>=attachment.freshAfter,
+            let packet=try? DisplayH264Packet(Data(payload.dropFirst(DisplayStreamFrameHeader.videoOffset)),format:attachment.format),packet.isKeyFrame else{continue}
+          awaitingFresh=false
+        }
 #if TC_QUALITY_TIERS
         if let tier=DisplayQualityCapabilities.tier(in:payload),tier != lastTier {
           lastTier=tier
-          DispatchQueue.main.async {guard let self,self.active,self.epoch==token else{return};self.observeQuality(payload)}
+          DispatchQueue.main.async {guard let self,self.active,self.epoch==token,self.transport === t else{return};self.observeQuality(payload)}
         }
 #endif
         if payload.first==1 {
@@ -522,8 +609,17 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
             self.report(TCText("Both connections active: MacBook → Mac mini input maintained / Mac mini → MacBook screen transmission"))
           }
         } else {guard payload.first==6 || payload.first==7 else{throw Failure("Unexpected helper packet")}}
-        do {guard let t else{throw Failure("Video transport retired")};try t.send(payload)}
-        catch {deliveryFailed=true;DispatchQueue.main.async{guard let self,self.active,self.epoch==token else{return};self.stop(message:TCText("Video connection ended. Cleaning up the display while keeping the input connection."))}}
+        do {
+          try t.send(payload)
+          if recoveryNotificationPending,payload.first==6,!awaitingFresh {
+            recoveryNotificationPending=false
+            DispatchQueue.main.async {
+              guard let self,self.active,self.epoch==token,self.attempt==attachment.attempt,self.transport === t,!self.reconnecting else{return}
+              self.waitingForFreshFrame=false
+            }
+          }
+        }
+        catch {DispatchQueue.main.async{guard let self,self.active,self.epoch==token,self.transport === t else{return};self.inputConnectionInterrupted()}}
       }}catch{DispatchQueue.main.async{guard let self,self.active,self.epoch==token else{return};self.stop(message:TCText("Screen transmission stopped because the video helper or extended display setup failed."))}}
     }
   }
@@ -533,14 +629,16 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
       let sample=VirtualDisplayPlacementSample(desktop:map,ownedID:id,format:videoFormat) else{return}
     _ = placementSession?.observe(sample,now:now,store:virtualPlacementStore,force:force)
   }
-  func stop(message:String=TCText("Screen connection ended. The existing input connection remains active.")) {
+  func stop(message:String=TCText("Screen connection ended. The existing input connection remains active."),disconnectInput:Bool=false) {
     guard active || cleaning else{return}
+    if disconnectInput {disconnectingInput=true;finalMessage=TCText("Screen sharing and input connection stopped.")}
     if cleaning {if !pausing && !cleanupRunning{cleanUpHelper()};return}
     captureVirtualPlacement(now:ProcessInfo.processInfo.systemUptime,force:true)
 #if TC_QUALITY_TIERS
     currentDisplayCodecName=nil
 #endif
-    finalMessage=message;active=false;cleaning=true;epoch=UUID();timer?.invalidate();timer=nil
+    if !disconnectingInput {finalMessage=message}
+    active=false;reconnecting=false;waitingForFreshFrame=false;attempt=UUID();publishAttachment(nil);cleaning=true;epoch=UUID();timer?.invalidate();timer=nil
     for (center,observer) in observers{center.removeObserver(observer)};observers=[]
     #if TC_FRESH_RECEIVER_SAFETY
     safetyTicket=nil // Do not clear outstanding periodic work until it completes.
@@ -555,10 +653,15 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
       }}
       if let timer {RunLoop.main.add(timer,forMode:.common)}
     }
-    guard sending else{baseline=nil;cleaning=false;report(message);return}
+    guard sending else{baseline=nil;cleaning=false;disconnectingInput=false;report(finalMessage);return}
     if pausing{return}
     if sourceReady {requestInputPause{[weak self] in self?.cleanUpHelper()}}
     else {cleanUpHelper()}
+  }
+  private nonisolated static func ownedDisplayIsAbsent(_ id:CGDirectDisplayID)->Bool {
+    var displays=[CGDirectDisplayID](repeating:0,count:32),count:UInt32=0
+    guard CGGetOnlineDisplayList(32,&displays,&count) == .success,count<=32 else{return false}
+    return !displays.prefix(Int(count)).contains(id)
   }
   private func cleanUpHelper() {
     guard cleaning,!pausing,!cleanupRunning else{return};cleanupRunning=true;timer?.invalidate();timer=nil
@@ -569,7 +672,7 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
       let first=PhysicalDisplayMirroring.read(excluding:id,requireOwned:true)
       let second=PhysicalDisplayMirroring.read(excluding:id,requireOwned:true)
       physicalRetirement=(id,first==second ? second:nil,required)
-      connectionLog("Display physical_mirror_capture owned=\(id) stable=\(physicalRetirement?.snapshot != nil) present=\(required)")
+      connectionLog("Display physical_mirror_capture owned=\(id) stable=\(physicalRetirement?.snapshot != nil) present=\(required) firstRead=\(first != nil) secondRead=\(second != nil) equal=\(first==second)")
     }
     let retirement=physicalRetirement
     try? heartbeat?.close();heartbeat=nil
@@ -577,13 +680,14 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
     if let process,process.isRunning{process.terminate()}
     DispatchQueue.global(qos:.utility).async {[weak self] in
       if let process {for _ in 0..<20{if !process.isRunning{break};Thread.sleep(forTimeInterval:0.1)};if process.isRunning{kill(process.processIdentifier,SIGKILL)};process.waitUntilExit()}
-      var restored=false
+      var ownedRemoved=false,restored=false
       // Adopt the remaining map only after the latest physical mirror graph is
       // preserved. A supported map alone can hide an OS-induced mirror breakup.
       for _ in 0..<40 {
-        if let current=DisplayBaseline.read(),current.supported {
-          if let id=retiredDisplayID {restored = !current.ids.contains(id)}
-          else if let original {restored = Set(current.ids).isSubset(of:Set(original.ids))}
+        if let id=retiredDisplayID {ownedRemoved=Self.ownedDisplayIsAbsent(id)}
+        if let current=DisplayBaseline.read() {
+          if retiredDisplayID==nil,let original {ownedRemoved=Set(current.ids).isSubset(of:Set(original.ids))}
+          restored=ownedRemoved && current.supported
           if restored {break}
         }
         Thread.sleep(forTimeInterval:0.25)
@@ -595,16 +699,99 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
       }
       DispatchQueue.main.async {
         guard let self else{return};self.cleanupRunning=false
+        if self.disconnectingInput && ownedRemoved {
+          self.abortInputTransition?()
+          self.baseline=nil;self.physicalRetirement=nil;self.cleaning=false;self.transitionEngaged=false;self.disconnectingInput=false
+          self.report(restored ? self.finalMessage:TCText("Screen sharing and input connection stopped. The previous display configuration could not be verified. Check Displays settings before reconnecting."))
+          return
+        }
         guard restored,let original else{self.abortInputTransition?();self.report(TCText("Input stopped for safety because restoration of the original display configuration could not be confirmed. Click Stop Screen Sharing again to check."));return}
         if self.transitionEngaged {
           do {guard let finish=self.finishInputDisplay else{throw Failure("Missing input restoration")};try finish(original)}
           catch {self.transitionFailed=true;self.abortInputTransition?();try? self.finishInputDisplay?(original)}
         }
-        self.baseline=nil;self.physicalRetirement=nil;self.cleaning=false;self.transitionEngaged=false
+        self.baseline=nil;self.physicalRetirement=nil;self.cleaning=false;self.transitionEngaged=false;self.disconnectingInput=false
         self.report(self.transitionFailed ? TCText("The display was restored, but the input transition could not be confirmed. Check the input connection again."):self.finalMessage)
       }
     }
   }
+  static func verifyRetentionLifecycleForTests()->Bool {
+    let controller=DisplayModeController()
+    let pair=LayoutDevicePair(localID:UUID().uuidString,peerID:UUID().uuidString)!
+    controller.localRetentionSafety={true};controller.retentionSessionPermitted={true}
+    controller.inputBindingValid={false};controller.inputBindingConflicts={false}
+    controller.active=true;controller.expectedPair=pair;controller.virtualID=123
+    let epoch=controller.epoch,old=DisplayTransport()
+    controller.transport=old;controller.publishAttachment(old)
+    controller.inputConnectionInterrupted()
+    guard controller.active,controller.reconnecting,controller.waitingForFreshFrame,!controller.inputReadyAfterRecovery,controller.epoch==epoch,
+      controller.virtualID==123,controller.transport==nil,controller.currentAttachment(epoch)==nil,
+      controller.retainedInputBinding?.pair==pair,controller.retainedInputBinding?.inputIsSender==true else{return false}
+    // Far beyond socket/grace deadlines, local retention itself has no expiry.
+    controller.started = -100_000;controller.retryAfter = -100_000
+    controller.tick()
+    guard controller.active,controller.reconnecting,controller.waitingForFreshFrame,!controller.inputReadyAfterRecovery,controller.virtualID==123 else{return false}
+    controller.reconnecting=false // Authentication alone must not enable input.
+    guard controller.waitingForFreshFrame,!controller.inputReadyAfterRecovery else{return false}
+    controller.firstFrameTimedOut()
+    guard controller.active,controller.reconnecting,controller.waitingForFreshFrame else{return false}
+    controller.inputBindingConflicts={true};controller.tick()
+    guard !controller.active,!controller.reconnecting,!controller.waitingForFreshFrame,controller.epoch != epoch,controller.retainedInputBinding==nil else{return false}
+    controller.active=true;controller.expectedPair=pair;controller.inputBindingConflicts={false}
+    controller.retentionSessionPermitted={false};controller.inputConnectionInterrupted()
+    return !controller.active && !controller.reconnecting
+  }
+  static func verifyStopRetirementForTests()->Bool {
+    guard let current=DisplayBaseline.read(),current.supported else{return false}
+    var absent=UInt32.max
+    while current.ids.contains(absent){absent-=1}
+    final class Effects {var aborts=0,finishes=0;var messages=[String]()}
+    func fixture(id:UInt32?=nil,required:Bool=true)->(App,Effects) {
+      let app=App(),effects=Effects(),controller=app.displayMode
+      controller.abortInputTransition={effects.aborts+=1}
+      controller.finishInputDisplay={_ in effects.finishes+=1}
+      controller.status={effects.messages.append($0)}
+      controller.cleaning=true;controller.sending=true;controller.transitionEngaged=true
+      controller.baseline=current;controller.physicalRetirement=(id ?? absent,nil,required)
+      return(app,effects)
+    }
+    func wait(_ controller:DisplayModeController)->Bool {
+      let deadline=Date(timeIntervalSinceNow:12)
+      while controller.cleanupRunning && Date()<deadline {_ = RunLoop.current.run(mode:.default,before:Date(timeIntervalSinceNow:0.005))}
+      return !controller.cleanupRunning
+    }
+    var failures=0
+    func expect(_ ok:Bool,_ name:String) {
+      if !ok {failures+=1}
+      print("\(ok ? "PASS":"FAIL") display retirement: \(name)")
+    }
+    let (full,effects)=fixture()
+    full.tearDownConnection(userStop:false,updateUI:false)
+    expect(wait(full.displayMode) && !full.displayMode.cleaning && !full.displayMode.active && effects.aborts>0 && effects.finishes==0,"full stop retires missing-snapshot cleanup with input stopped")
+    let aborts=effects.aborts
+    full.tearDownConnection(userStop:false,updateUI:false)
+    expect(!full.displayMode.cleaning && effects.aborts==aborts && effects.finishes==0,"repeated full stop is idempotent")
+    expect(effects.messages.last==TCText("Screen sharing and input connection stopped. The previous display configuration could not be verified. Check Displays settings before reconnecting."),"unverified restoration is a warning, not a stuck cleanup")
+    let (video,videoEffects)=fixture()
+    video.displayMode.stop()
+    expect(wait(video.displayMode) && video.displayMode.cleaning && videoEffects.aborts>0 && videoEffects.finishes==0,"video-only stop retains strict restoration requirement")
+    video.tearDownConnection(userStop:false,updateUI:false)
+    expect(wait(video.displayMode) && !video.displayMode.cleaning && videoEffects.finishes==0,"full stop reconciles a previous video-only failure")
+    let (escalated,escalatedEffects)=fixture()
+    escalated.displayMode.stop()
+    expect(escalated.displayMode.cleanupRunning,"cleanup is in flight before intent escalation")
+    escalated.tearDownConnection(userStop:false,updateUI:false)
+    expect(wait(escalated.displayMode) && !escalated.displayMode.cleaning && escalatedEffects.aborts>0 && escalatedEffects.finishes==0,"full stop escalates an in-flight video-only cleanup")
+    let (normal,normalEffects)=fixture(required:false)
+    normal.displayMode.stop()
+    expect(wait(normal.displayMode) && !normal.displayMode.cleaning && normalEffects.finishes==1 && normalEffects.aborts==0,"confirmed video-only restoration still finishes input transition")
+    let (present,presentEffects)=fixture(id:current.main)
+    present.tearDownConnection(userStop:false,updateUI:false)
+    expect(wait(present.displayMode) && present.displayMode.cleaning && presentEffects.aborts>0 && presentEffects.finishes==0,"owned ID still online cannot report full-stop completion")
+    expect(ownedDisplayIsAbsent(absent) && !ownedDisplayIsAbsent(current.main),"successful online enumeration distinguishes absent and retained IDs")
+    return failures==0
+  }
+
 }
 
 @MainActor extension App {
@@ -618,6 +805,11 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
     displayMode.sampledSessionPermitted={[weak self] sample,ticket,now in self?.relay.sampledDisplaySessionPermitted(sample,ticket:ticket,now:now)==true}
     #endif
     displayMode.sessionPermitted={[weak self] in guard let self else{return false};return self.relay.sessionAllowed && !self.relay.screenSleeping && !self.relay.systemSleeping && self.relay.multiDisplayDesktopReady}
+    displayMode.retentionSessionPermitted={[weak self] in
+      guard let self else{return false}
+      return !self.applicationIsQuitting && !self.automaticConnectionPaused && !self.sharingInputRestoreBlocked && !self.sharingResume.blocked && !self.relay.automaticReconnectSuspended && self.relay.sessionAllowed && !self.relay.sessionLockedSignal && !self.relay.screenSleeping && !self.relay.systemSleeping
+    }
+    displayMode.retainedDisplayLeaseValid={[weak self] id,original in self?.relay.retainedDisplayLeaseValid(ownedID:id,original:original)==true}
     displayMode.prepareInputTransition={[weak self] completion in guard let self else{completion(.failure(Failure("Input owner unavailable")));return};self.relay.beginDisplayTopologyTransition(completion:completion)}
     displayMode.commitInputDisplay={[weak self] original,id in guard let self else{throw Failure("Input owner unavailable")};try self.relay.commitDisplayTopology(original:original,ownedID:id)}
     displayMode.finishInputDisplay={[weak self] original in guard let self else{throw Failure("Input owner unavailable")};try self.relay.finishDisplayTopologyRemoval(original:original)}

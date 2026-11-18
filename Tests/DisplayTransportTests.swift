@@ -3,6 +3,10 @@ import CryptoKit
 
 func runDisplayTransportTests() -> Int {
   var failures = 0
+  if !displayWriteBackpressureForTests() {failures+=1;print("FAIL bounded backpressure release before helper stall")}
+  if !DisplayTransport.verifyInterruptionDeliveryForTests() {failures+=1}
+  for code in [1,2,4,5,6,8] {if DisplayTransportInterruption(rawValue:code)==nil {failures+=1}}
+  for code in [0,3,7,9] {if DisplayTransportInterruption(rawValue:code) != nil {failures+=1}}
   func verify(_ value: Bool, line: Int = #line) { if !value { failures += 1; print("FAIL transport test line \(line)") } }
   func rejects(line: Int = #line, _ action: () throws -> Void) { do { try action(); failures += 1; print("FAIL transport test line \(line) accepted") } catch {} }
   for sameEpoch in [false, true] {

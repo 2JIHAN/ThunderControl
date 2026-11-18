@@ -18,6 +18,16 @@ import ApplicationServices
     } else if relay.authenticated {
       state.stringValue=relay.isTransferring ? TCText("Controlling remote Mac"):(relay.boundaryBlockedReason?.localized ?? sharingBlockedReason ?? (relay.inputIsSender && !relay.auto ? TCText("Connected. Waiting for input sharing readiness."):TCText("Connected")))
       state.textColor = .labelColor
+    } else if relay.hasUnresolvedLocalRecovery {
+      state.stringValue=TCText("Input recovery is pending. Release held inputs and click Stop to retry.")
+      state.textColor = .secondaryLabelColor
+    } else if inputPermissionsReady(),!automaticConnectionPaused,!relay.automaticReconnectSuspended,
+      !sharingInputRestoreBlocked,relay.sessionAllowed,
+      let recovery=connectionRecoveryWait.phase(now:ProcessInfo.processInfo.systemUptime) {
+      state.stringValue=TCText(recovery == .waiting
+        ? "Connection interrupted. Input is local. Reconnecting..."
+        : "Still waiting for a Thunderbolt connection. Check both Macs.")
+      state.textColor = .secondaryLabelColor
     } else if relay.hasSession {
       state.stringValue=mode.selectedSegment==1 ? TCText("Waiting for connection requests"):TCText("Connecting...")
       state.textColor = .labelColor
@@ -55,6 +65,12 @@ import ApplicationServices
     fixture.relay.sessionLockedSignal=false;fixture.updateConnectionState()
     check(fixture.state.stringValue != TCText("Locked, input sharing stopped"))
     check(fixture.relay.automaticReconnectSuspended && fixture.automaticConnectionPaused)
+    let recovering=App(relay:Relay())
+    recovering.connectionRecoveryWait.begin(now:ProcessInfo.processInfo.systemUptime)
+    recovering.relay.receiverFocusRecoveryPending={true}
+    recovering.updateConnectionState()
+    check(recovering.state.stringValue==TCText("Input recovery is pending. Release held inputs and click Stop to retry."))
+    print("PASS unresolved input recovery overrides reconnect notice; no input/network")
     print("PASS unlocked UI drops stale lock label without unpausing independent Stop; new transition discards both unlock proofs even while paused; no input/network")
   }
   @objc func openDevelopmentDiagnostics() {

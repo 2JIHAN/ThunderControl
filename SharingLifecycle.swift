@@ -12,11 +12,25 @@ import AppKit
     guard sharingApplyExplicitConnectIntent(pair:pair,sender:relay.inputIsSender) else{return}
     sharingRestoreTick();refreshModeUI()
   }
-  func sharingPrepareRoleChange() {sharingExplicitResumePending=nil}
-  func sharingDidStartExplicitConnection(sending:Bool) {sharingExplicitResumePending=(relay.generation,sending)}
+  func sharingPrepareRoleChange() {sharingExplicitResumePending=nil;sharingDeferredExplicitResume=nil}
+  func sharingDidStartExplicitConnection(sending:Bool) {
+    sharingDeferredExplicitResume=nil;sharingExplicitResumePending=(relay.generation,sending)
+  }
+  func sharingDeferExplicitConnection(pair:LayoutDevicePair,sender:Bool) {
+    sharingExplicitResumePending=nil;sharingDeferredExplicitResume=(pair,sender)
+  }
   @discardableResult func sharingApplyExplicitConnectIntent(pair:LayoutDevicePair,sender:Bool)->Bool {
-    guard relay.authenticated,relay.authenticatedDevicePair==pair,relay.inputIsSender==sender,
-      let request=sharingExplicitResumePending,request.generation==relay.generation,
+    guard relay.authenticated,relay.authenticatedDevicePair==pair,relay.inputIsSender==sender else{return false}
+    if let deferred=sharingDeferredExplicitResume {
+      guard deferred.pair==pair,deferred.sender==sender,
+        !applicationIsQuitting,!automaticConnectionPaused,!relay.automaticReconnectSuspended,
+        !displayMode.cleaning,!relay.displayTopologyTransitionActive,!relay.hasUnresolvedLocalRecovery,
+        !relay.bridgeInputSuspended,relay.sessionAllowed,!relay.sessionLockedSignal,
+        !relay.screenSleeping,!relay.systemSleeping,
+        (relay.desktopInputPermissionForTests?() ?? inputPermissionsReady()) else{return false}
+      sharingDidStartExplicitConnection(sending:sender)
+    }
+    guard let request=sharingExplicitResumePending,request.generation==relay.generation,
       request.sender==sender,sharingStore.isReadable else{return false}
     let existing=sharingStore.load(pair:pair,inputIsSender:sender)
     var state=existing ?? .authenticatedDefault(pair:pair,inputIsSender:sender)
@@ -27,9 +41,9 @@ import AppKit
     sharingExplicitResumePending=nil;sharingInputRestoreBlocked=false;sharingResume.manualResume()
     return true
   }
-  func sharingReportGate(_ reason:String?) {
+  func sharingReportGate(_ reason:String?,details:String?=nil) {
     sharingBlockedReason=reason
-    let text="gate=\(reason ?? "ready") inputBlocked=\(sharingInputRestoreBlocked) videoBlocked=\(sharingResume.blocked) paused=\(automaticConnectionPaused) suspended=\(relay.automaticReconnectSuspended) "+relay.sharingReadinessSummary
+    let text="gate=\(reason ?? "ready") inputBlocked=\(sharingInputRestoreBlocked) videoBlocked=\(sharingResume.blocked) paused=\(automaticConnectionPaused) suspended=\(relay.automaticReconnectSuspended) "+relay.sharingReadinessSummary+(details.map{" "+$0} ?? "")
     if text != sharingLastGateDiagnostic {sharingLastGateDiagnostic=text;connectionLog("Sharing startup "+text)}
     updateConnectionState()
   }

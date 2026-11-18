@@ -130,3 +130,18 @@ struct BridgeInputLease {
     return now>=issued.time && now-issued.time<=0.35
   }
 }
+
+/// App status only. Transport teardown and input restoration do not wait.
+struct ConnectionRecoveryWait {
+  enum Phase {case waiting, prolonged}
+  private(set) var startedAt:Double?
+  mutating func begin(now:Double) {
+    guard startedAt==nil,now.isFinite,now>=0 else{return}
+    startedAt=now
+  }
+  mutating func clear() {startedAt=nil}
+  func phase(now:Double)->Phase? {
+    guard let start=startedAt,now.isFinite,now>=start else{return nil}
+    return now-start<60 ? .waiting:.prolonged
+  }
+}

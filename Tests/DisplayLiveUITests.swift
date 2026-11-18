@@ -282,6 +282,52 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     let colorfulSamples = try displayLiveVerifyScreenshot(outputURL.path)
     try displayLiveRequire(closed == 0 && ProcessInfo.processInfo.systemUptime < deadline, "test final state")
     try displayLiveRequire(viewer.readinessCallbacksForTests == readinessBefore+1 && !viewer.readinessRequestedForTests, "no repeated empty readiness callbacks after further native pumping")
+    if ProcessInfo.processInfo.environment["TC_TEST_CONNECTION_RETENTION"] == "1" {
+        viewer.showConnectionWarning()
+        try displayLiveRequire(viewer.connectionWarningVisibleForTests && window.isVisible && closed == 0, "warning preserves same visible viewer")
+        let originalWarningStart = viewer.connectionWarningStartForTests
+        let firstConnectingMessage = viewer.connectionMessageForTests
+        try displayLiveRequire(!viewer.connectionCloseEnabledForTests, "close screen disabled during initial recovery grace")
+        try await pump(until: { viewer.connectionMessageForTests != firstConnectingMessage }, maximum: 1, stage: "live connecting dot animation")
+        try displayLiveRequire(!viewer.connectionCloseEnabledForTests, "dot tick does not prematurely enable close")
+        try displayLiveRequire(!viewer.pacingActiveForTests && viewer.pacingPendingForTests == 0 && !viewer.cursorVisibleForTests, "detached decoder queues and remote cursor retired")
+        do { try viewer.accept(frames[0]); throw DisplayLiveUITestError.failed("detached video accepted") } catch DisplayVideoError.decoderFailed {}
+        let heldURL = outputURL.deletingPathExtension().appendingPathExtension("held.png")
+        let holdCapture = Process(); holdCapture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        holdCapture.arguments = ["-x", "-o", "-l", String(window.windowNumber), "-t", "png", heldURL.path]
+        holdCapture.standardOutput = FileHandle.nullDevice; holdCapture.standardError = FileHandle.nullDevice
+        try await Task.sleep(nanoseconds: 150_000_000)
+        try holdCapture.run(); try await pump(until: { !holdCapture.isRunning }, maximum: 3, stage: "held-frame capture")
+        try displayLiveRequire(holdCapture.terminationStatus == 0, "held-frame capture succeeded")
+        _ = try displayLiveVerifyScreenshot(heldURL.path)
+        guard let before = NSBitmapImageRep(data: try Data(contentsOf: outputURL)), let held = NSBitmapImageRep(data: try Data(contentsOf: heldURL)) else { throw DisplayLiveUITestError.failed("held-frame image decode") }
+        try displayLiveRequire(before.pixelsWide == held.pixelsWide && before.pixelsHigh == held.pixelsHigh, "same native window geometry during outage")
+        for (x,y) in [(0.12,0.22),(0.88,0.22),(0.12,0.78),(0.88,0.78)] {
+            guard let a = before.colorAt(x:Int(Double(before.pixelsWide)*x),y:Int(Double(before.pixelsHigh)*y))?.usingColorSpace(.sRGB),
+                let b = held.colorAt(x:Int(Double(held.pixelsWide)*x),y:Int(Double(held.pixelsHigh)*y))?.usingColorSpace(.sRGB) else { throw DisplayLiveUITestError.failed("held-frame pixel read") }
+            try displayLiveRequire(abs(a.redComponent-b.redComponent)<0.04 && abs(a.greenComponent-b.greenComponent)<0.04 && abs(a.blueComponent-b.blueComponent)<0.04, "last displayed pixels preserved outside warning")
+        }
+        viewer.showConnectionWarning()
+        try displayLiveRequire(viewer.connectionWarningVisibleForTests && closed == 0 && viewer.connectionWarningStartForTests == originalWarningStart, "repeated interruption keeps original close deadline")
+        viewer.resumeConnection()
+        try displayLiveRequire(viewer.connectionWarningVisibleForTests && window.isVisible, "warning remains through authentication until new frame")
+        try viewer.accept(frames[0])
+        try await pump(until: { viewer.presentationStats.submitted == 1 && !viewer.connectionWarningVisibleForTests }, maximum: 2, stage: "fresh keyframe resumes same viewer")
+        try displayLiveRequire(window.isVisible && closed == 0, "recovery did not replace or close native viewer")
+        print("PASS native connection retention: last displayed pixels held; same window; detached payload rejected; fresh keyframe resumes; warning clears only at renderer enqueue; no network or virtual display")
+        if ProcessInfo.processInfo.environment["TC_TEST_RETENTION_NATIVE_CLOSE"] == "1" {
+            var userClosed = 0; viewer.onUserClose = { userClosed += 1 }
+            viewer.showConnectionWarning()
+            try displayLiveRequire(!viewer.connectionCloseEnabledForTests, "new warning starts with disabled close button")
+            print("READY native retention close button (initially disabled for 5 seconds)")
+            fflush(stdout)
+            let closeDeadline = ProcessInfo.processInfo.systemUptime + 60
+            while closed == 0 && ProcessInfo.processInfo.systemUptime < closeDeadline { try await Task.sleep(nanoseconds: 20_000_000) }
+            try displayLiveRequire(closed == 1 && userClosed == 1 && !window.isVisible, "native centered close button stops screen exactly once")
+            print("PASS native centered red close button: explicit user stop exactly once")
+            return
+        }
+    }
     let wasFullscreen=viewer.isFullScreenForTests
     if #available(macOS 14.4, *) {
         // Retire a genuine pending request synchronously before its main-queue

@@ -753,6 +753,8 @@ static unsigned testCodecMask=15,testCodecFailMask=0,testSwitchFailMask=0;
 static BOOL testSwitchFailure=NO;
 static int testCodecSteps[8];static unsigned testCodecStepCount=0;
 static BOOL codecTestHooks=NO,codecSwitching=NO,forceNextKeyframe=NO;
+// Installed and invoked only on the main queue after owned capture setup.
+static void (^requestResumeCapture)(void);
 static int handledCodecTier=-1;
 static atomic_int requestedCodecTier=3;
 static atomic_uint_fast64_t codecSwitchToken=0;
@@ -779,6 +781,12 @@ static BOOL ConfigureCodecs(const char *mode){
 }
 static int ControlByteTier(uint8_t byte){return byte>=0x20&&byte<=0x23?(int)byte-0x20:-1;}
 static void ReceiveControlByte(uint8_t byte){
+  if(byte==0x24){
+    dispatch_async(dispatch_get_main_queue(),^{
+      if(frameQueue)dispatch_async(frameQueue,^{forceNextKeyframe=YES;});
+      if(requestResumeCapture)requestResumeCapture();
+    });return;
+  }
 #if defined(TC_QUALITY_TIERS)
   int tier=ControlByteTier(byte);if(tier>=0){
     if(CodecIndexForCeiling(CodecPreference,codecCount,tier)>=0)atomic_store(&requestedCodecTier,tier);
@@ -2138,6 +2146,17 @@ static int SelfTest(void){
     CHECK(ParseCodecList("lt,proxy",list,&count)&&CodecIndexForCeiling(list,count,1)==-1,"codec-no-unauthorized-fallback");
     CHECK(CodecIndexForCeiling(list,count,-1)==-1&&CodecIndexForCeiling(list,count,4)==-1,"codec-invalid-ceiling");
     CHECK(ControlByteTier(1)==-1&&ControlByteTier(0x20)==0&&ControlByteTier(0x23)==3&&ControlByteTier(0x24)==-1&&ControlByteTier(0xff)==-1,"codec-command-byte-bounds-heartbeat-unchanged");
+    {dispatch_queue_t savedQueue=frameQueue;void (^savedRequest)(void)=requestResumeCapture;
+      BOOL savedForce=forceNextKeyframe;__block unsigned requests=0;
+      frameQueue=dispatch_queue_create("local.ThunderControl.resume.selftest",DISPATCH_QUEUE_SERIAL);
+      requestResumeCapture=^{requests++;};forceNextKeyframe=NO;
+      ReceiveControlByte(1);CHECK(requests==0,"heartbeat-does-not-request-resume-capture");
+      ReceiveControlByte(0x24);
+      double deadline=Now()+1;while(!requests&&Now()<deadline)Pump(.01);
+      dispatch_sync(frameQueue,^{});
+      CHECK(requests==1&&forceNextKeyframe,"resume-requests-fresh-capture-and-serialized-keyframe");
+      requestResumeCapture=savedRequest;frameQueue=savedQueue;forceNextKeyframe=savedForce;
+    }
     {int steps[8];unsigned n=0;CHECK(ParseTierSteps("3,2,1,0",steps,&n)&&n==4&&steps[0]==3&&steps[3]==0&&!ParseTierSteps("3,",steps,&n)&&!ParseTierSteps("0,1,2,3,0,1,2,3,0",steps,&n)&&!ParseTierSteps("4",steps,&n),"codec-synthetic-step-list-bounded");}
     CHECK(ParseTier("0",&tier)&&tier==0&&ParseTier("3",&tier)&&tier==3&&!ParseTier("03",&tier)&&!ParseTier("4",&tier)&&!ParseTier("",&tier),"codec-initial-tier-strict");
     CHECK(ParseCodecMask("15",&mask)&&mask==15&&ParseCodecMask("0",&mask)&&mask==0&&!ParseCodecMask("16",&mask)&&!ParseCodecMask("-1",&mask)&&!ParseCodecMask("1 ",&mask),"codec-test-mask-strict");
@@ -2411,6 +2430,31 @@ int main(int argc,const char **argv){@autoreleasepool {
   FrameSink * __attribute__((objc_precise_lifetime)) sink=[FrameSink new];SCStream * __attribute__((objc_precise_lifetime)) stream=[[SCStream alloc]initWithFilter:filter configuration:cfg delegate:sink];
   frameQueue=dispatch_queue_create("local.ThunderControl.display.capture",DISPATCH_QUEUE_SERIAL);NSError *error=nil;
   if(![stream addStreamOutput:sink type:SCStreamOutputTypeScreen sampleHandlerQueue:frameQueue error:&error])Fail("capture output setup");
+  __block BOOL resumeCapturePending=NO; // Main-queue confined, at most one screenshot in flight.
+  requestResumeCapture=^{
+    if(resumeCapturePending)return;
+    Guard();if(!CGPreflightScreenCaptureAccess())Fail("resume capture permission revoked");
+    if(!CanSubmitFrame())return;
+    resumeCapturePending=YES;
+    double requestedAt=Now();
+    [SCScreenshotManager captureSampleBufferWithFilter:filter configuration:cfg completionHandler:^(CMSampleBufferRef sample,NSError *captureError){
+      Guard();
+      if(captureError||!sample||!CMSampleBufferIsValid(sample))Fail("resume screenshot failed");
+      CVPixelBufferRef pixel=CMSampleBufferGetImageBuffer(sample);
+      if(!pixel)Fail("resume screenshot missing pixels");
+      CVPixelBufferRetain(pixel);
+      dispatch_async(frameQueue,^{@autoreleasepool{
+        Guard();if(!CGPreflightScreenCaptureAccess())Fail("resume capture permission revoked");
+        if(CanSubmitFrame()){
+          // This is a new owned-filter capture, never a retimestamped cached image.
+          forceNextKeyframe=YES;
+          OfferCaptureAt(pixel,CMTimeMake(sink.sequence++,targetFPS),requestedAt);
+        }
+        CVPixelBufferRelease(pixel);
+        dispatch_async(dispatch_get_main_queue(),^{resumeCapturePending=NO;});
+      }});
+    }];
+  };
   [stream startCaptureWithCompletionHandler:^(NSError *err){if(err)Fail("capture start");}];
   // Strong references remain alive for whole process; exit is the cleanup boundary.
   // Capture filter identity is locked to ownedID: non-owned displays are never

@@ -20,7 +20,7 @@ import CryptoKit
     app.sharingPrepareRoleChange();app.tearDownConnection(userStop:false,updateUI:false)
     expect(store.load(pair:pair,inputIsSender:sender)==original,"role preparation preserves intent")
     expect(!app.sharingInputRestoreBlocked && !app.sharingResume.blocked,"normal role change no stop latch")
-    app.sharingUserStoppedAll()
+    app.sharingUserStoppedAll(reason:sender ? .uiStop:.emergencyStop)
     expect(app.sharingInputRestoreBlocked && app.sharingResume.blocked,"actual explicit stop latches")
     app.sharingPrepareRoleChange();app.tearDownConnection(userStop:false,updateUI:false)
     expect(app.sharingInputRestoreBlocked && app.sharingResume.blocked,"role change cannot bypass stop")
@@ -59,6 +59,60 @@ import CryptoKit
       expect(relay.sharingReadinessSummary.contains("receiverAvailable=true"),"actual available updates readiness")
       expect(!relay.auto,"missing geometry never auto arms")
     }
+  }
+  for sender in [false,true] {
+    let relay=Relay(),app=App(relay:relay,sharingStore:store)
+    relay.senderForTests=sender;relay.safetyObserversInstalled=true
+    relay.sessionSnapshotReadForTests={SessionSafetySnapshot(onConsole:true,loginDone:true,screenLocked:false)}
+    relay.desktopInputPermissionForTests={true}
+    let stopped=SavedSharingState.off(pair:pair,inputIsSender:sender)
+    expect(store.save(stopped),"deferred fixture saves OFF")
+    app.sharingInputRestoreBlocked=true;app.sharingResume.manualStop()
+    app.sharingDeferExplicitConnection(pair:pair,sender:sender)
+    expect(store.load(pair:pair,inputIsSender:sender)==stopped,"defer never saves before authentication")
+    expect(!app.sharingApplyExplicitConnectIntent(pair:pair,sender:sender),"deferred rejects unauthenticated peer")
+    expect(app.sharingDeferredExplicitResume != nil && app.sharingExplicitResumePending==nil,"unauthenticated deferred remains unpromoted")
+    relay.connectionForTests=OwnedSocket(-1);relay.keyForTests=SymmetricKey(size:.bits256)
+    relay.sharingLifecyclePairForTests=other
+    expect(!app.sharingApplyExplicitConnectIntent(pair:other,sender:sender),"deferred rejects authenticated wrong pair")
+    relay.sharingLifecyclePairForTests=pair;relay.senderForTests = !sender
+    expect(!app.sharingApplyExplicitConnectIntent(pair:pair,sender:!sender),"deferred rejects authenticated wrong role")
+    relay.senderForTests=sender
+    app.automaticConnectionPaused=true
+    expect(!app.sharingApplyExplicitConnectIntent(pair:pair,sender:sender),"deferred direct call respects paused safety gate")
+    app.automaticConnectionPaused=false;relay.automaticReconnectSuspended=true
+    expect(!app.sharingApplyExplicitConnectIntent(pair:pair,sender:sender),"deferred direct call respects security suspension")
+    relay.automaticReconnectSuspended=false;relay.desktopInputPermissionForTests={false}
+    expect(!app.sharingApplyExplicitConnectIntent(pair:pair,sender:sender),"deferred direct call respects input permission gate")
+    relay.desktopInputPermissionForTests={true};relay.sessionLockedSignal=true
+    expect(!app.sharingApplyExplicitConnectIntent(pair:pair,sender:sender),"deferred direct call respects locked session")
+    relay.sessionLockedSignal=false
+    expect(app.sharingDeferredExplicitResume != nil && app.sharingExplicitResumePending==nil,"safety gates do not consume deferred intent")
+    expect(store.load(pair:pair,inputIsSender:sender)==stopped && app.sharingInputRestoreBlocked && app.sharingResume.blocked,"rejected deferred preserves saved OFF and stop latches")
+    let savedRecords=defaults.data(forKey:SavedSharingStateStore.key)!
+    defaults.set(Data(),forKey:SavedSharingStateStore.key)
+    expect(!app.sharingApplyExplicitConnectIntent(pair:pair,sender:sender),"deferred promotion cannot overwrite unreadable storage")
+    expect(app.sharingDeferredExplicitResume==nil && app.sharingExplicitResumePending?.generation==relay.generation && app.sharingExplicitResumePending?.sender==sender,"deferred promotion creates current generation token before save")
+    defaults.set(savedRecords,forKey:SavedSharingStateStore.key)
+    expect(app.sharingApplyExplicitConnectIntent(pair:pair,sender:sender),"matching safe authentication promotes and saves deferred intent")
+    let resumed=store.load(pair:pair,inputIsSender:sender)!
+    expect(resumed.inputAuto==sender && resumed.receiverConsent == !sender && !resumed.inputForward && !resumed.videoEnabled,"deferred restores input role but preserves video OFF")
+    expect(app.sharingDeferredExplicitResume==nil && app.sharingExplicitResumePending==nil && !app.sharingInputRestoreBlocked && !app.sharingResume.blocked,"deferred promotion consumed once and clears stop latches")
+    expect(!app.sharingApplyExplicitConnectIntent(pair:pair,sender:sender),"consumed deferred cannot replay")
+    for reason in [SharingStopReason.uiStop,.emergencyStop] {
+      app.sharingDeferExplicitConnection(pair:pair,sender:sender)
+      app.sharingUserStoppedAll(reason:reason)
+      expect(app.sharingDeferredExplicitResume==nil && !app.sharingApplyExplicitConnectIntent(pair:pair,sender:sender),"Stop invalidates deferred intent \(reason.rawValue)")
+      expect(store.load(pair:pair,inputIsSender:sender)==stopped,"Stop after defer persists OFF \(reason.rawValue)")
+    }
+    app.sharingDeferExplicitConnection(pair:pair,sender:sender);app.sharingPrepareRoleChange()
+    expect(app.sharingDeferredExplicitResume==nil && !app.sharingApplyExplicitConnectIntent(pair:pair,sender:sender),"role change invalidates deferred intent")
+    app.sharingDeferExplicitConnection(pair:pair,sender:sender);app.sharingDidStartExplicitConnection(sending:sender)
+    expect(app.sharingDeferredExplicitResume==nil,"normal explicit start replaces deferred intent")
+    relay.stop();relay.senderForTests=sender
+    relay.connectionForTests=OwnedSocket(-1);relay.keyForTests=SymmetricKey(size:.bits256);relay.sharingLifecyclePairForTests=pair
+    expect(!app.sharingApplyExplicitConnectIntent(pair:pair,sender:sender),"replaced deferred cannot revive stale generation token")
+    expect(store.load(pair:pair,inputIsSender:sender)==stopped,"stale generation preserves saved OFF")
   }
   let freshPair=LayoutDevicePair(localID:UUID().uuidString,peerID:UUID().uuidString)!
   let freshRelay=Relay(),freshApp=App(relay:freshRelay,sharingStore:store)

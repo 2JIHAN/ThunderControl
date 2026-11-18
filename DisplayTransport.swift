@@ -6,6 +6,9 @@ import Darwin
 // exchanged only after trust confirmation, before streaming. No input packets,
 // new enrollment, PIN, fallback interface, or plaintext format are accepted.
 enum DisplayTransportError: Error { case invalid, stopped, unavailable }
+enum DisplayTransportInterruption: Int {
+  case heartbeat = 1, bridge = 2, send = 4, control = 5, keepalive = 6, preparation = 8
+}
 struct DisplayChannelCipher {
   static let maximumPayload = 4 * 1024 * 1024
   static let maximumFrame = maximumPayload + 128
@@ -139,19 +142,24 @@ private func displayVerifiedBridgeStatus(cancelled: () -> Bool) throws -> Bridge
   return status
 }
 
-private func displayWriteFrame(_ fd: Int32, _ data: Data) throws {
+private func displayWriteFrame(_ fd: Int32, _ data: Data, deadline:Double = ProcessInfo.processInfo.systemUptime+0.75) throws {
   guard !data.isEmpty, data.count <= DisplayChannelCipher.maximumFrame else { throw DisplayTransportError.invalid }
   var n = UInt32(data.count).bigEndian
   let bytes = withUnsafeBytes(of: &n) { Data($0) } + data
-  // Leave headroom beyond the two-second link grace on the existing TCP stream.
-  // A failed write still closes it: never reseal, replay, or restart a partial frame.
-  let deadline = ProcessInfo.processInfo.systemUptime + 4
+  // Keep draining the helper well inside its two-second output-stall limit.
+  // Any partial encrypted write retires this socket; it is never replayed.
   try bytes.withUnsafeBytes { ptr in
     var offset = 0
     while offset < ptr.count {
       guard ProcessInfo.processInfo.systemUptime < deadline else { throw DisplayTransportError.unavailable }
-      let sent = Darwin.send(fd, ptr.baseAddress!.advanced(by: offset), ptr.count - offset, 0)
+      let sent = Darwin.send(fd, ptr.baseAddress!.advanced(by: offset), ptr.count - offset, MSG_DONTWAIT)
       if sent < 0 && errno == EINTR { continue }
+      if sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+        var writable=pollfd(fd:fd,events:Int16(POLLOUT),revents:0)
+        let result=poll(&writable,1,25)
+        if result<0 && errno != EINTR {throw DisplayTransportError.unavailable}
+        continue
+      }
       guard sent > 0 else { throw DisplayTransportError.unavailable }
       offset += sent
     }
@@ -255,7 +263,9 @@ private final class DisplayTransportRun {
     // A synchronous video/control caller and one heartbeat are the only writers.
     // No transport-side backlog is allocated.
     let diagnosticStarted=ProcessInfo.processInfo.systemUptime
-    txLock.lock(); defer { txLock.unlock() }
+    let deadline=diagnosticStarted+0.75
+    guard txLock.lock(before:Date(timeIntervalSinceNow:0.1)) else{throw DisplayTransportError.unavailable}
+    defer { txLock.unlock() }
     let diagnosticLocked=ProcessInfo.processInfo.systemUptime
     state.lock(); let sock = socket; let ready = authenticated; let stream=diagnosticStream;state.unlock()
     guard !context.cancelled, let socket = sock, !requireAuthentication || ready, var cipher = outgoing else { throw DisplayTransportError.stopped }
@@ -274,7 +284,7 @@ private final class DisplayTransportRun {
     let frame = try cipher.seal(data); outgoing = cipher
     if let sequence=diagnosticSequence,let stream{DevelopmentDiagnostics.shared.record(stage:"tx_seal",sequence:sequence,fields:["lockWaitMs":(diagnosticLocked-diagnosticStarted)*1000,"sealMs":(ProcessInfo.processInfo.systemUptime-diagnosticSealStart)*1000,"bytes":Double(frame.count)],stream:stream)}
     let writeStarted = ProcessInfo.processInfo.systemUptime
-    do{try displayWriteFrame(socket.fd, frame)}catch{
+    do{try displayWriteFrame(socket.fd, frame,deadline:deadline)}catch{
       if let sequence=diagnosticSequence,let stream{DevelopmentDiagnostics.shared.record(stage:"tx_write_error",sequence:sequence,fields:["elapsedMs":(ProcessInfo.processInfo.systemUptime-writeStarted)*1000],stream:stream)}
       throw error
     }
@@ -298,6 +308,7 @@ final class DisplayTransport: @unchecked Sendable {
   var onPayload: ((Data) -> Void)?
   #endif
   var onFailure: ((String) -> Void)?
+  var onInterruption: ((DisplayTransportInterruption) -> Void)?
   var onLatency: ((Double?) -> Void)?
   private let lock = NSLock()
 #if TC_QUALITY_TIERS
@@ -444,7 +455,7 @@ final class DisplayTransport: @unchecked Sendable {
     DispatchQueue.main.async { [weak self] in
       guard let self else { return }
       self.lock.lock(); let valid = self.generation == epoch && !self.pendingStart && self.current == nil; self.lock.unlock()
-      if valid { self.onFailure?(TCText("Could not prepare the Thunderbolt screen connection. Check the cable and bridge0 status.")) }
+      if valid { self.onInterruption?(.preparation) }
     }
   }
   func start(sending: Bool, peer: String,expectedPair:LayoutDevicePair,viewerFormat:DisplayVideoFormat = .standard) throws {
@@ -509,6 +520,7 @@ final class DisplayTransport: @unchecked Sendable {
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let self else { run.cancel(); return }
       do { try self.connect(run, remote: remote) }
+      catch DisplayTransportError.unavailable { self.fail(run, TCText("Screen connection interrupted."),diagnosticReason:6) }
       catch { self.fail(run, TCText("Screen connection or authentication failed. Check that both Macs are running 0.8.22 or later, complete the input connection between the same two Macs first, then try again."),diagnosticReason:3) }
     }
   }
@@ -530,6 +542,7 @@ final class DisplayTransport: @unchecked Sendable {
       }
 #endif
     }
+    catch DisplayTransportError.invalid { fail(run, TCText("Invalid screen video protocol."),diagnosticReason:3);throw DisplayTransportError.invalid }
     catch { fail(run, TCText("Screen transmission interrupted. Reconnect to continue."),diagnosticReason:4); throw error }
   }
   func sendInput(_ payload: Data) throws {
@@ -547,8 +560,29 @@ final class DisplayTransport: @unchecked Sendable {
     DispatchQueue.main.async { [weak self] in
       guard let self else { return }
       self.lock.lock(); let noNewSession = self.current == nil && self.generation == failedGeneration; self.lock.unlock()
-      if noNewSession { self.onFailure?(message) }
+      if noNewSession {
+        if let reason=DisplayTransportInterruption(rawValue:Int(diagnosticReason)) {self.onInterruption?(reason)}
+        else {self.onFailure?(message)}
+      }
     }
+  }
+  static func verifyInterruptionDeliveryForTests()->Bool {
+    guard Thread.isMainThread else{return false}
+    let t=DisplayTransport(),pair=LayoutDevicePair(localID:UUID().uuidString,peerID:UUID().uuidString)!
+    var interruptions=[Int](),failures=0
+    t.onInterruption={interruptions.append($0.rawValue)};t.onFailure={_ in failures+=1}
+    func fixture()->DisplayTransportRun {DisplayTransportRun(initial:OwnedSocket(-1),bridge:Bridge(name:"fixture",index:0,ip:"169.254.1.1"),sending:false,remote:nil,expectedPair:pair,viewerFormat:.standard)}
+    func pump(){
+      var returned=false;DispatchQueue.main.async{returned=true}
+      let deadline=Date(timeIntervalSinceNow:1)
+      while !returned && Date()<deadline {_ = RunLoop.current.run(mode:.default,before:Date(timeIntervalSinceNow:0.005))}
+    }
+    for code in [1,2,4,5,6] {let run=fixture();t.current=run;t.fail(run,"fixture",diagnosticReason:Double(code));pump();guard run.context.cancelled else{return false}}
+    guard interruptions==[1,2,4,5,6],failures==0 else{return false}
+    let invalid=fixture();t.current=invalid;t.fail(invalid,"invalid",diagnosticReason:3);pump()
+    guard failures==1,interruptions.count==5 else{return false}
+    let stale=fixture();t.current=stale;t.fail(stale,"stale",diagnosticReason:1);t.stop();pump()
+    return failures==1 && interruptions.count==5
   }
   private func connect(_ run: DisplayTransportRun, remote: sockaddr_in?) throws {
     let connected: OwnedSocket
@@ -558,13 +592,13 @@ final class DisplayTransport: @unchecked Sendable {
     try setBlocking(connected.fd)
     let fd = connected.fd
     var idx = run.bridge.index; var one: Int32 = 1
-    // Longer than link grace, while hard send errors remain fatal immediately.
-    var timeout = timeval(tv_sec: 3, tv_usec: 0)
+    // A blocked writer must release well before the helper output-stall limit.
+    var timeout = timeval(tv_sec: 0, tv_usec: 100_000)
     guard setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &idx, socklen_t(MemoryLayout.size(ofValue: idx))) == 0,
       setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, 4) == 0,
       setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, 4) == 0,
       setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size)) == 0 else { throw DisplayTransportError.unavailable }
-    timeout.tv_sec = 5
+    timeout.tv_sec = 5;timeout.tv_usec = 0
     guard setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size)) == 0 else { throw DisplayTransportError.unavailable }
     try displayVerifySocket(fd, bridge: run.bridge, remote: run.remote)
     run.state.lock(); run.socket = connected; run.authStart = ProcessInfo.processInfo.systemUptime; run.state.unlock()
@@ -774,4 +808,17 @@ func verifyDisplayDiagnosticActivationForTests()->Bool {
   guard activated.wait(timeout:.now()+3) == .success,cancelled.wait(timeout:.now()+3) == .success,sawCancellation else{return false}
   do{try recorder.flushForTests()}catch{return false}
   return recorder.currentStream==nil && !racing.activateDiagnostics(stream:streamA)
+}
+
+func displayWriteBackpressureForTests()->Bool {
+  var sockets=[Int32](repeating:-1,count:2)
+  guard socketpair(AF_UNIX,SOCK_STREAM,0,&sockets)==0 else{return false}
+  defer{Darwin.close(sockets[0]);Darwin.close(sockets[1])}
+  var size:Int32=4096
+  guard setsockopt(sockets[0],SOL_SOCKET,SO_SNDBUF,&size,socklen_t(MemoryLayout.size(ofValue:size)))==0 else{return false}
+  var timeout=timeval(tv_sec:0,tv_usec:100_000)
+  guard setsockopt(sockets[0],SOL_SOCKET,SO_SNDTIMEO,&timeout,socklen_t(MemoryLayout.size(ofValue:timeout)))==0 else{return false}
+  let started=ProcessInfo.processInfo.systemUptime
+  do{try displayWriteFrame(sockets[0],Data(repeating:1,count:DisplayChannelCipher.maximumPayload));return false}
+  catch {let elapsed=ProcessInfo.processInfo.systemUptime-started;return elapsed>=0.5 && elapsed<1.5}
 }

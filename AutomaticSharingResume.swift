@@ -24,6 +24,8 @@ struct AutomaticSharingResume {
   }
 }
 
+enum SharingStopReason:String {case uiStop, emergencyStop}
+
 @MainActor extension App {
   func sharingObserveAuthenticatedBinding() {
     // Metadata only: capture the proven pair before a queued disconnect can
@@ -32,11 +34,17 @@ struct AutomaticSharingResume {
     if relay.authenticated,let pair=relay.authenticatedDevicePair,
       let host=relay.authenticatedSharingPeerHost,DisplayPeerRoute.valid(host) {
       sharingResume.bind(.init(pair:pair,inputIsSender:relay.inputIsSender,host:host))
-    } else {sharingResume.bind(nil);displayPreferenceLastSent=nil;if displayMode.active {displayMode.stop()}}
+    } else {
+      sharingResume.bind(nil);displayPreferenceLastSent=nil
+      if displayMode.active {
+        if applicationIsQuitting || automaticConnectionPaused || sharingInputRestoreBlocked || sharingResume.blocked || relay.automaticReconnectSuspended || !relay.sessionAllowed || relay.sessionLockedSignal || relay.screenSleeping || relay.systemSleeping {displayMode.stop()}
+        else {displayMode.inputConnectionInterrupted()}
+      }
+    }
   }
   func sharingInputPermitted(pair:LayoutDevicePair,sender:Bool)->Bool {
     if !applicationIsQuitting,!automaticConnectionPaused,!relay.automaticReconnectSuspended,!displayMode.cleaning,!relay.displayTopologyTransitionActive,!relay.hasUnresolvedLocalRecovery,relay.authenticated,relay.authenticatedDevicePair==pair,relay.inputIsSender==sender,relay.sessionAllowed,inputPermissionsReady() {_ = sharingApplyExplicitConnectIntent(pair:pair,sender:sender)}
-    guard !applicationIsQuitting,!sharingInputRestoreBlocked,sharingStore.isReadable else{return false}
+    guard !applicationIsQuitting,!sharingInputRestoreBlocked,(!displayMode.active || displayMode.inputReadyAfterRecovery),sharingStore.isReadable else{return false}
     guard let saved=sharingStore.load(pair:pair,inputIsSender:sender) else{return true}
     return sender ? saved.inputAuto:saved.receiverConsent
   }
@@ -89,9 +97,10 @@ struct AutomaticSharingResume {
     else if let binding=sharingResume.lastBinding,var state=sharingStore.load(pair:binding.pair,inputIsSender:binding.inputIsSender) {state.videoEnabled=false;sharingStore.save(state)}
     sharingResume.manualStop()
   }
-  func sharingUserStoppedAll() {
+  func sharingUserStoppedAll(reason:SharingStopReason) {
     guard !applicationIsQuitting,!isAutomationTest else{return}
-    sharingExplicitResumePending=nil
+    connectionLog("Sharing stopped origin=\(reason.rawValue)")
+    sharingExplicitResumePending=nil;sharingDeferredExplicitResume=nil
     sharingInputRestoreBlocked=true
     if let pair=relay.authenticatedDevicePair {sharingStore.save(.off(pair:pair,inputIsSender:relay.inputIsSender))}
     else if let binding=sharingResume.lastBinding {sharingStore.save(.off(pair:binding.pair,inputIsSender:binding.inputIsSender))}
@@ -113,7 +122,10 @@ struct AutomaticSharingResume {
     sharingResume.bind(.init(pair:pair,inputIsSender:relay.inputIsSender,host:host))
     if relay.bridgeInputSuspended {return}
     let safe = !automaticConnectionPaused && !relay.automaticReconnectSuspended && relay.sessionAllowed && !relay.sessionLockedSignal && !relay.screenSleeping && !relay.systemSleeping && !relay.hasUnresolvedLocalRecovery && inputPermissionsReady()
-    guard safe else{sharingReportGate(TCText("Sharing paused: check session, permissions or safety stop."));return}
+    guard safe else{
+      let details="sessionAllowed=\(relay.sessionAllowed) sessionLocked=\(relay.sessionLockedSignal) screenSleeping=\(relay.screenSleeping) systemSleeping=\(relay.systemSleeping) unresolvedRecovery=\(relay.hasUnresolvedLocalRecovery) inputPermissionsReady=\(inputPermissionsReady())"
+      sharingReportGate(TCText("Sharing paused: check session, permissions or safety stop."),details:details);return
+    }
     _ = sharingApplyExplicitConnectIntent(pair:pair,sender:relay.inputIsSender)
     guard !sharingInputRestoreBlocked else{sharingReportGate(TCText("Sharing paused. Stop and reconnect to resume."));return}
     sharingSeedCurrentIntent()
@@ -132,6 +144,16 @@ struct AutomaticSharingResume {
       }
     }
     refreshDisplayPreferenceUI()
+    if displayMode.reconnecting {
+      guard let retained=displayMode.retainedInputBinding,retained.pair==pair,retained.inputIsSender==relay.inputIsSender else{displayMode.stop();return}
+      guard !sharingResume.blocked,(!relay.inputIsSender || state.videoEnabled),
+        DisplayPreferencePolicy.canStart(inputIsSender:relay.inputIsSender,compatible:relay.displayPreferenceCompatible,localIntent:state.videoEnabled,remoteIntent:relay.peerDisplayPreference),
+        !relay.displayTopologyTransitionActive,!displayMode.cleaning,relay.multiDisplayDesktopReady,
+        !state.videoSending || CGPreflightScreenCaptureAccess() else{return}
+      displayMode.resumeRetainedConnection(peer:host,expectedPair:pair)
+      guard displayMode.inputReadyAfterRecovery else{return}
+    }
+    if displayMode.active && !displayMode.inputReadyAfterRecovery {return}
     if !relay.displayTopologyTransitionActive && !displayMode.cleaning {
       if relay.inputIsSender {
         if !state.inputAuto && relay.auto {relay.configureAuto(false,edge:relay.selectedEdge)}

@@ -341,3 +341,16 @@
 "Text clipboard received" = "Text clipboard received";
 "Both Macs need 0.9.11 or later and text sharing enabled. Only newly copied plain text is shared, up to 1 MiB. Formatting, file paths and files are not shared." = "Both Macs need 0.9.11 or later and text sharing enabled. Only newly copied plain text is shared, up to 1 MiB. Formatting, file paths and files are not shared.";
 "Text clipboard ready" = "Text clipboard ready";
+
+"Screen sharing and input connection stopped." = "Screen sharing and input connection stopped.";
+"Screen sharing and input connection stopped. The previous display configuration could not be verified. Check Displays settings before reconnecting." = "Screen sharing and input connection stopped. The previous display configuration could not be verified. Check Displays settings before reconnecting.";
+
+"Connection interrupted. Input is local. Reconnecting..." = "Connection interrupted. Input is local. Reconnecting...";
+"Still waiting for a Thunderbolt connection. Check both Macs." = "Still waiting for a Thunderbolt connection. Check both Macs.";
+"Input recovery is pending. Release held inputs and click Stop to retry." = "Input recovery is pending. Release held inputs and click Stop to retry.";
+
+"Connection quality is poor." = "Connection quality is poor.";
+"Keeping the last screen while reconnecting." = "Keeping the last screen while reconnecting.";
+"Close screen" = "Close screen";
+
+"Connecting" = "Connecting";
