@@ -17,6 +17,19 @@ func runSavedSharingStateTests()->Int {
   expect(earlyVideo.valid && earlyVideo.inputAuto && earlyVideo.videoEnabled)
   let manualVideo=SavedSharingState.firstVideo(pair:a,inputIsSender:true,auto:false,forward:true,consent:false)
   expect(manualVideo.valid && manualVideo.inputForward && !manualVideo.inputAuto)
+  for sender in [false,true] {
+    for videoEnabled in [false,true] {
+      var saved=SavedSharingState.off(pair:a,inputIsSender:sender)
+      saved.videoEnabled=videoEnabled;saved.videoSending = !sender
+      let enabled=saved.enablingInputForAuthenticatedRole()
+      expect(enabled.valid && enabled.inputAuto==sender && enabled.receiverConsent == !sender)
+      expect(!enabled.inputForward && enabled.videoEnabled==saved.videoEnabled && enabled.videoSending==saved.videoSending)
+      expect(enabled.enablingInputForAuthenticatedRole()==enabled)
+    }
+  }
+  var manual=SavedSharingState.off(pair:a,inputIsSender:true)
+  manual.inputForward=true
+  expect(manual.enablingInputForAuthenticatedRole()==manual)
   var state=SavedSharingState.off(pair:a,inputIsSender:true)
   expect(store.load(pair:a,inputIsSender:true)==nil)
   state.inputAuto=true;state.videoEnabled=true

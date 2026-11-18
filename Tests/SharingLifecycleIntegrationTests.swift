@@ -114,6 +114,59 @@ import CryptoKit
     expect(!app.sharingApplyExplicitConnectIntent(pair:pair,sender:sender),"replaced deferred cannot revive stale generation token")
     expect(store.load(pair:pair,inputIsSender:sender)==stopped,"stale generation preserves saved OFF")
   }
+  for sender in [false,true] {
+    let relay=Relay(),app=App(relay:relay,sharingStore:store)
+    relay.senderForTests=sender;relay.safetyObserversInstalled=true
+    relay.sessionSnapshotReadForTests={SessionSafetySnapshot(onConsole:true,loginDone:true,screenLocked:false)}
+    relay.desktopInputPermissionForTests={true}
+    let stopped=SavedSharingState.off(pair:pair,inputIsSender:sender)
+    expect(store.save(stopped),"authenticated restore fixture saves input OFF")
+    expect(app.sharingAuthenticatedInputIntent(pair:pair,sender:sender)==nil,"initial authentication rejects unauthenticated input intent")
+    expect(store.load(pair:pair,inputIsSender:sender)==stopped,"unauthenticated input intent preserves OFF")
+    relay.connectionForTests=OwnedSocket(-1);relay.keyForTests=SymmetricKey(size:.bits256)
+    relay.sharingLifecyclePairForTests=pair
+    expect(app.sharingAuthenticatedInputIntent(pair:other,sender:sender)==nil,"authenticated input rejects wrong pair")
+    expect(app.sharingAuthenticatedInputIntent(pair:pair,sender:!sender)==nil,"authenticated input rejects wrong role")
+    expect(store.load(pair:pair,inputIsSender:sender)==stopped,"wrong pair or role preserves OFF")
+    for videoEnabled in [false,true] {
+      var saved=stopped;saved.videoEnabled=videoEnabled;saved.videoSending = !sender
+      expect(store.save(saved),"save old input OFF record with video \(videoEnabled)")
+      let restored=app.sharingAuthenticatedInputIntent(pair:pair,sender:sender)
+      expect(restored?.inputAuto==sender && restored?.receiverConsent == !sender && restored?.inputForward==false,"safe authentication restores role input with video \(videoEnabled)")
+      expect(restored?.videoEnabled==saved.videoEnabled && restored?.videoSending==saved.videoSending,"safe authentication preserves both video flags \(videoEnabled)")
+      expect(store.load(pair:pair,inputIsSender:sender)==restored,"authenticated input intent persists restored state")
+    }
+    if sender {
+      var manual=stopped;manual.inputForward=true
+      expect(store.save(manual),"save explicit manual forwarding")
+      expect(app.sharingAuthenticatedInputIntent(pair:pair,sender:sender)==manual,"authentication retains manual forwarding without auto")
+    }
+    expect(store.save(stopped),"reset input OFF before safety gates")
+    app.automaticConnectionPaused=true
+    expect(app.sharingAuthenticatedInputIntent(pair:pair,sender:sender)==nil,"paused authentication rejects input restore")
+    app.automaticConnectionPaused=false;relay.desktopInputPermissionForTests={false}
+    expect(app.sharingAuthenticatedInputIntent(pair:pair,sender:sender)==nil,"missing permission rejects input restore")
+    relay.desktopInputPermissionForTests={true};relay.sessionLockedSignal=true
+    expect(app.sharingAuthenticatedInputIntent(pair:pair,sender:sender)==nil,"locked authentication rejects input restore")
+    relay.sessionLockedSignal=false;relay.screenSleeping=true
+    expect(app.sharingAuthenticatedInputIntent(pair:pair,sender:sender)==nil,"sleeping authentication rejects input restore")
+    relay.screenSleeping=false;relay.automaticReconnectSuspended=true
+    expect(app.sharingAuthenticatedInputIntent(pair:pair,sender:sender)==nil,"security suspension rejects input restore")
+    relay.automaticReconnectSuspended=false
+    expect(store.load(pair:pair,inputIsSender:sender)==stopped,"safety rejections preserve saved input OFF")
+    let readableRecords=defaults.data(forKey:SavedSharingStateStore.key)!
+    let corruptRecords=Data("{}".utf8)
+    defaults.set(corruptRecords,forKey:SavedSharingStateStore.key)
+    expect(app.sharingAuthenticatedInputIntent(pair:pair,sender:sender)==nil,"authenticated restore rejects unreadable storage")
+    expect(defaults.data(forKey:SavedSharingStateStore.key)==corruptRecords,"authenticated restore never overwrites corrupt storage")
+    defaults.set(readableRecords,forKey:SavedSharingStateStore.key)
+    for reason in [SharingStopReason.uiStop,.emergencyStop] {
+      app.sharingUserStoppedAll(reason:reason)
+      expect(app.sharingAuthenticatedInputIntent(pair:pair,sender:sender)==nil,"authenticated restore respects \(reason.rawValue)")
+      expect(app.sharingInputRestoreBlocked && app.sharingResume.blocked,"authenticated restore cannot clear stop latches \(reason.rawValue)")
+      expect(store.load(pair:pair,inputIsSender:sender)==stopped,"authenticated restore preserves stopped record \(reason.rawValue)")
+    }
+  }
   let freshPair=LayoutDevicePair(localID:UUID().uuidString,peerID:UUID().uuidString)!
   let freshRelay=Relay(),freshApp=App(relay:freshRelay,sharingStore:store)
   freshRelay.senderForTests=true;freshRelay.connectionForTests=OwnedSocket(-1);freshRelay.keyForTests=SymmetricKey(size:.bits256);freshRelay.sharingLifecyclePairForTests=freshPair

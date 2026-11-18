@@ -44,9 +44,8 @@ enum SharingStopReason:String {case uiStop, emergencyStop}
   }
   func sharingInputPermitted(pair:LayoutDevicePair,sender:Bool)->Bool {
     if !applicationIsQuitting,!automaticConnectionPaused,!relay.automaticReconnectSuspended,!displayMode.cleaning,!relay.displayTopologyTransitionActive,!relay.hasUnresolvedLocalRecovery,relay.authenticated,relay.authenticatedDevicePair==pair,relay.inputIsSender==sender,relay.sessionAllowed,inputPermissionsReady() {_ = sharingApplyExplicitConnectIntent(pair:pair,sender:sender)}
-    guard !applicationIsQuitting,!sharingInputRestoreBlocked,(!displayMode.active || displayMode.inputReadyAfterRecovery),sharingStore.isReadable else{return false}
-    guard let saved=sharingStore.load(pair:pair,inputIsSender:sender) else{return true}
-    return sender ? saved.inputAuto:saved.receiverConsent
+    guard let intent=sharingAuthenticatedInputIntent(pair:pair,sender:sender) else{return false}
+    return sender ? intent.inputAuto:intent.receiverConsent
   }
   func sharingCurrentIntent()->SavedSharingState? {
     guard relay.authenticated,let pair=relay.authenticatedDevicePair else{return nil}
@@ -63,25 +62,13 @@ enum SharingStopReason:String {case uiStop, emergencyStop}
     // A proven live peer, not a discovered/stored address, adopts always-on
     // input and video intent once. Actual capture still requires the existing
     // screen-recording permission and topology/session guards in restoreTick.
-    // Saved OFF records and manual/emergency stop latches always win.
+    // Saved video OFF and manual/emergency session-stop latches still win.
     let existing=sharingStore.load(pair:pair,inputIsSender:relay.inputIsSender)
     if var initial=sharingStore.seedAuthenticatedDefaults(pair:pair,inputIsSender:relay.inputIsSender),
       existing==nil,relay.inputIsSender,
       let preferred=UserDefaults.standard.object(forKey:"ThunderControl.virtualDisplayPreferred") as? Bool {
       initial.videoEnabled=preferred;sharingStore.save(initial)
     }
-  }
-  func sharingUserChangedInput() {
-    guard !isAutomationTest,!applicationIsQuitting else{return}
-    let binding=sharingResume.lastBinding
-    guard let pair=relay.authenticatedDevicePair ?? binding?.pair else{return}
-    let sender=relay.authenticated ? relay.inputIsSender:(binding?.inputIsSender ?? false)
-    guard (mode.selectedSegment==0)==sender else{return}
-    var state=sharingStore.load(pair:pair,inputIsSender:sender) ?? .authenticatedDefault(pair:pair,inputIsSender:sender)
-    state.inputAuto=sender && automatic.state == .on
-    state.inputForward=sender && !state.inputAuto && forward.state == .on
-    state.receiverConsent = !sender && enable.state == .on
-    sharingStore.save(state);sharingResume.manualResume();sharingInputRestoreBlocked=false
   }
   func sharingUserRequestedVideo(sending:Bool) {
     guard !sharingAutomaticVideoStart,!isAutomationTest,!applicationIsQuitting,relay.authenticated,
@@ -154,6 +141,8 @@ enum SharingStopReason:String {case uiStop, emergencyStop}
       guard displayMode.inputReadyAfterRecovery else{return}
     }
     if displayMode.active && !displayMode.inputReadyAfterRecovery {return}
+    guard let inputIntent=sharingAuthenticatedInputIntent(pair:pair,sender:relay.inputIsSender) else{return}
+    state=inputIntent
     if !relay.displayTopologyTransitionActive && !displayMode.cleaning {
       if relay.inputIsSender {
         if !state.inputAuto && relay.auto {relay.configureAuto(false,edge:relay.selectedEdge)}

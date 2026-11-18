@@ -5629,12 +5629,11 @@ final class PasteCommandProbe: NSResponder {
     displayPreferenceToggle.target=self;displayPreferenceToggle.action=#selector(toggleVirtualDisplay)
     displayPreferenceToggle.setAccessibilityIdentifier("virtualDisplayPreference")
     sendSection.addArrangedSubview(displayPreferenceToggle)
-    for button in [automatic,forward,gesture] {button.target=self;button.action=#selector(toggle)}
+    gesture.target=self;gesture.action=#selector(toggleInputGestures)
     // Handoff is armed automatically only after authentication and receiver readiness.
     forward.title=TCText("Manual Forward Test (do not use with automatic switching)")
     copyAddress.target=self;copyAddress.action=#selector(copyLocalAddress)
     receiveSection.addArrangedSubview(NSTextField(wrappingLabelWithString:TCText("When a connection request arrives, enter the code from the Sender Mac.")))
-    enable.target=self;enable.action=#selector(toggle)
     // Standalone experimental output test removed from normal UI.
     iface.widthAnchor.constraint(equalToConstant:100).isActive=true;port.widthAnchor.constraint(equalToConstant:80).isActive=true
     gesture.title=TCText("Experimental: Mission Control / Space Gesture Forwarding (consent required on both Macs)")
@@ -6156,23 +6155,8 @@ final class PasteCommandProbe: NSResponder {
     refreshLocalAddress()
     if mode.selectedSegment == 0 { generatePIN(); searchPeers() }
   }
-  @objc func toggle() {
-    guard !relay.displayTopologyTransitionActive else{refreshModeUI();return}
-    sharingUserChangedInput()
-    relay.experimental = gesture.state == .on
-    relay.configureAuto(
-      mode.selectedSegment == 0 && automatic.state == .on,
-      edge:relay.selectedEdge)
-    relay.forward =
-      mode.selectedSegment == 0 && !relay.displayTopologyTransitionActive && !relay.hasLocalInputsForAppearance && !relay.auto && !relay.hasUnresolvedLocalRecovery
-      && forward.state == .on
-    relay.consent(mode.selectedSegment == 1 && enable.state == .on)
-    automatic.state = relay.auto ? .on : .off
-    relay.experimental = gesture.state == .on
-    if !relay.inject { relay.releaseInputs() }
-    forward.state = relay.forward ? .on : .off
-    enable.state = relay.inject ? .on : .off
-    refreshLayout()
+  @objc func toggleInputGestures() {
+    relay.experimental=gesture.state == .on
   }
   func refreshModeUI() {
     automatic.isEnabled = !relay.displayTopologyTransitionActive;forward.isEnabled = !relay.displayTopologyTransitionActive;enable.isEnabled = !relay.displayTopologyTransitionActive

@@ -12,6 +12,21 @@ import AppKit
     guard sharingApplyExplicitConnectIntent(pair:pair,sender:relay.inputIsSender) else{return}
     sharingRestoreTick();refreshModeUI()
   }
+  func sharingAuthenticatedInputIntent(pair:LayoutDevicePair,sender:Bool)->SavedSharingState? {
+    guard relay.authenticated,relay.authenticatedDevicePair==pair,relay.inputIsSender==sender,
+      !applicationIsQuitting,!automaticConnectionPaused,!sharingInputRestoreBlocked,
+      !relay.automaticReconnectSuspended,!displayMode.cleaning,!relay.displayTopologyTransitionActive,
+      !relay.hasUnresolvedLocalRecovery,!relay.bridgeInputSuspended,relay.sessionAllowed,
+      !relay.sessionLockedSignal,!relay.screenSleeping,!relay.systemSleeping,
+      (!displayMode.active || displayMode.inputReadyAfterRecovery),
+      (relay.desktopInputPermissionForTests?() ?? inputPermissionsReady()),sharingStore.isReadable else{return nil}
+    let existing=sharingStore.load(pair:pair,inputIsSender:sender)
+    var state=existing ?? .authenticatedDefault(pair:pair,inputIsSender:sender)
+    if existing==nil,sender,let preferred=sharingNewPairVideoPreference() {state.videoEnabled=preferred}
+    state=state.enablingInputForAuthenticatedRole()
+    guard existing==state || sharingStore.save(state) else{return nil}
+    return state
+  }
   func sharingPrepareRoleChange() {sharingExplicitResumePending=nil;sharingDeferredExplicitResume=nil}
   func sharingDidStartExplicitConnection(sending:Bool) {
     sharingDeferredExplicitResume=nil;sharingExplicitResumePending=(relay.generation,sending)
