@@ -46,13 +46,17 @@ struct AudioJitterBuffer {
 /// While connected, shows the peer as an output device and moves audio in both directions:
 /// sends what local apps play into the ThunderControl device, and plays what the peer sends.
 @MainActor final class AudioBridge {
-  static let deviceUID = "local.experimental.ThunderControl.Audio"
-  static let driverBundleID = "local.experimental.ThunderControl.AudioDriver"
-  private static let peerNameSelector = AudioObjectPropertySelector(0x7463_706E) // 'tcpn'
-  private static let audioDataSelector = AudioObjectPropertySelector(0x7463_7061) // 'tcpa'
+  nonisolated static let deviceUID = "local.experimental.ThunderControl.Audio"
+  nonisolated static let driverBundleID = "local.experimental.ThunderControl.AudioDriver"
+  private nonisolated static let peerNameSelector = AudioObjectPropertySelector(0x7463_706E) // 'tcpn'
+  private nonisolated static let audioDataSelector = AudioObjectPropertySelector(0x7463_7061) // 'tcpa'
+
+  /// True when the user last chose the ThunderControl device while connected; restored on reconnect.
+  nonisolated static let selectedKey = "ThunderControl.audioOutputUsesPeer"
 
   private let send: (Data) -> Void
   private var poller: DispatchSourceTimer?
+  private var defaultOutputListener: AudioObjectPropertyListenerBlock?
   private let playback = OSAllocatedUnfairLock(initialState: AudioJitterBuffer())
   private var engine: AVAudioEngine?
   private var idleTimer: Timer?
@@ -69,10 +73,24 @@ struct AudioJitterBuffer {
     timer.setEventHandler(handler: Self.captureHandler(plugin: plugin, send: send))
     timer.resume()
     poller = timer
+    var address = Self.address(kAudioHardwarePropertyDefaultOutputDevice)
+    let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+      MainActor.assumeIsolated { self?.rememberSelection() }
+    }
+    AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, .main, listener)
+    defaultOutputListener = listener
+    if UserDefaults.standard.bool(forKey: Self.selectedKey) { restoreSelection() }
     return true
   }
 
   func stop() {
+    // Stop listening before the device disappears, so macOS falling back to
+    // another output is not recorded as the user's choice.
+    if let listener = defaultOutputListener {
+      var address = Self.address(kAudioHardwarePropertyDefaultOutputDevice)
+      AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, .main, listener)
+      defaultOutputListener = nil
+    }
     poller?.cancel(); poller = nil
     stopPlayback()
     if let plugin = Self.plugin() { Self.setPeerName("", plugin: plugin) }
@@ -85,6 +103,40 @@ struct AudioJitterBuffer {
     playback.withLock { $0.push(pcm) }
     lastPacket = ProcessInfo.processInfo.systemUptime
     if engine == nil { startPlayback() }
+  }
+
+  // MARK: Selection
+
+  private var restoringUntil = 0.0
+
+  private func rememberSelection() {
+    guard defaultOutputListener != nil, ProcessInfo.processInfo.systemUptime >= restoringUntil else { return }
+    if Self.defaultOutputUID() == Self.deviceUID { UserDefaults.standard.set(true, forKey: Self.selectedKey) }
+    else if Self.device(uid: Self.deviceUID) != 0 { UserDefaults.standard.set(false, forKey: Self.selectedKey) }
+  }
+
+  /// macOS settles its own default output shortly after a device appears and can switch
+  /// away from a choice made in that time, so keep reselecting until the choice has held
+  /// for a second (at most 3 seconds). Changes in that window are not recorded as the user's.
+  private func restoreSelection() {
+    let started = ProcessInfo.processInfo.systemUptime
+    restoringUntil = started + 3
+    var heldSince: Double?
+    func tick() {
+      guard defaultOutputListener != nil else { return }
+      let now = ProcessInfo.processInfo.systemUptime
+      let selected = Self.defaultOutputUID() == Self.deviceUID
+      heldSince = selected ? (heldSince ?? now) : nil
+      if let heldSince, now - heldSince >= 1 { restoringUntil = now }
+      guard now < restoringUntil else { rememberSelection(); return }
+      var device = Self.device(uid: Self.deviceUID)
+      if device != 0, !selected {
+        var address = Self.address(kAudioHardwarePropertyDefaultOutputDevice)
+        AudioObjectSetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, UInt32(MemoryLayout<AudioObjectID>.size), &device)
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { tick() }
+    }
+    tick()
   }
 
   // MARK: Capture

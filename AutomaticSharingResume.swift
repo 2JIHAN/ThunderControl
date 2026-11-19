@@ -89,8 +89,15 @@ enum SharingStopReason:String {case uiStop, emergencyStop}
     connectionLog("Sharing stopped origin=\(reason.rawValue)")
     sharingExplicitResumePending=nil;sharingDeferredExplicitResume=nil
     sharingInputRestoreBlocked=true
-    if let pair=relay.authenticatedDevicePair {sharingStore.save(.off(pair:pair,inputIsSender:relay.inputIsSender))}
-    else if let binding=sharingResume.lastBinding {sharingStore.save(.off(pair:binding.pair,inputIsSender:binding.inputIsSender))}
+    // Stop turns input off and latches until an explicit Connect, but keeps the
+    // saved video choice so that Connect brings the virtual display back as it was.
+    func stoppedState(_ pair:LayoutDevicePair,_ sender:Bool)->SavedSharingState {
+      var state=SavedSharingState.off(pair:pair,inputIsSender:sender)
+      state.videoEnabled=sharingStore.load(pair:pair,inputIsSender:sender)?.videoEnabled ?? false
+      return state
+    }
+    if let pair=relay.authenticatedDevicePair {sharingStore.save(stoppedState(pair,relay.inputIsSender))}
+    else if let binding=sharingResume.lastBinding {sharingStore.save(stoppedState(binding.pair,binding.inputIsSender))}
     sharingResume.manualStop()
   }
   func sharingDisplayStatusDidChange() {

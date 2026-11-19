@@ -101,9 +101,12 @@ import CryptoKit
     expect(!app.sharingApplyExplicitConnectIntent(pair:pair,sender:sender),"consumed deferred cannot replay")
     for reason in [SharingStopReason.uiStop,.emergencyStop] {
       app.sharingDeferExplicitConnection(pair:pair,sender:sender)
+      var videoOn=stopped;videoOn.videoEnabled=true
+      expect(store.save(videoOn),"save input OFF with video ON \(reason.rawValue)")
       app.sharingUserStoppedAll(reason:reason)
       expect(app.sharingDeferredExplicitResume==nil && !app.sharingApplyExplicitConnectIntent(pair:pair,sender:sender),"Stop invalidates deferred intent \(reason.rawValue)")
-      expect(store.load(pair:pair,inputIsSender:sender)==stopped,"Stop after defer persists OFF \(reason.rawValue)")
+      expect(store.load(pair:pair,inputIsSender:sender)==videoOn,"Stop turns input OFF but keeps video intent \(reason.rawValue)")
+      expect(store.save(stopped),"restore OFF fixture \(reason.rawValue)")
     }
     app.sharingDeferExplicitConnection(pair:pair,sender:sender);app.sharingPrepareRoleChange()
     expect(app.sharingDeferredExplicitResume==nil && !app.sharingApplyExplicitConnectIntent(pair:pair,sender:sender),"role change invalidates deferred intent")

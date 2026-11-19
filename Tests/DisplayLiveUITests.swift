@@ -323,8 +323,8 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
             fflush(stdout)
             let closeDeadline = ProcessInfo.processInfo.systemUptime + 60
             while closed == 0 && ProcessInfo.processInfo.systemUptime < closeDeadline { try await Task.sleep(nanoseconds: 20_000_000) }
-            try displayLiveRequire(closed == 1 && userClosed == 1 && !window.isVisible, "native centered close button stops screen exactly once")
-            print("PASS native centered red close button: explicit user stop exactly once")
+            try displayLiveRequire(closed == 1 && userClosed == 0 && !window.isVisible, "native centered close button closes the interrupted screen once and keeps the saved video choice")
+            print("PASS native centered red close button: closes once without turning the virtual display off")
             return
         }
     }

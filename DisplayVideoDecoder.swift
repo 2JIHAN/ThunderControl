@@ -1830,9 +1830,10 @@ struct DisplayViewerStartup {
         connectionWarning?.removeFromSuperview(); connectionWarning = nil
         onConnectionRecovered?()
     }
+    /// Closing a screen whose connection dropped is not turning the virtual display off;
+    /// the saved choice stays on so the next connection brings the screen back.
     @objc private func closeInterruptedScreen() {
         guard connectionWarning?.closeAllowed == true else { return }
-        onUserClose?()
         close()
     }
     func close() {
