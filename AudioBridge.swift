@@ -49,11 +49,10 @@ struct AudioJitterBuffer {
   static let deviceUID = "local.experimental.ThunderControl.Audio"
   static let driverBundleID = "local.experimental.ThunderControl.AudioDriver"
   private static let peerNameSelector = AudioObjectPropertySelector(0x7463_706E) // 'tcpn'
+  private static let audioDataSelector = AudioObjectPropertySelector(0x7463_7061) // 'tcpa'
 
   private let send: (Data) -> Void
-  private var captureDevice: AudioObjectID = 0
-  private var captureProc: AudioDeviceIOProcID?
-  private var defaultOutputListener: AudioObjectPropertyListenerBlock?
+  private var poller: DispatchSourceTimer?
   private let playback = OSAllocatedUnfairLock(initialState: AudioJitterBuffer())
   private var engine: AVAudioEngine?
   private var idleTimer: Timer?
@@ -64,26 +63,19 @@ struct AudioJitterBuffer {
 
   /// Returns false when the driver is not installed; audio then stays off for this session.
   @discardableResult func start(peerName: String) -> Bool {
-    guard Self.setPeerName(peerName) else { return false }
-    var address = Self.address(kAudioHardwarePropertyDefaultOutputDevice)
-    let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-      MainActor.assumeIsolated { self?.followDefaultOutput() }
-    }
-    AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, .main, listener)
-    defaultOutputListener = listener
-    followDefaultOutput()
+    guard let plugin = Self.plugin(), Self.setPeerName(peerName, plugin: plugin) else { return false }
+    let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "ThunderControl.audio.capture", qos: .userInteractive))
+    timer.schedule(deadline: .now(), repeating: .milliseconds(10), leeway: .milliseconds(2))
+    timer.setEventHandler(handler: Self.captureHandler(plugin: plugin, send: send))
+    timer.resume()
+    poller = timer
     return true
   }
 
   func stop() {
-    if let listener = defaultOutputListener {
-      var address = Self.address(kAudioHardwarePropertyDefaultOutputDevice)
-      AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, .main, listener)
-      defaultOutputListener = nil
-    }
-    stopCapture()
+    poller?.cancel(); poller = nil
     stopPlayback()
-    Self.setPeerName("")
+    if let plugin = Self.plugin() { Self.setPeerName("", plugin: plugin) }
   }
 
   /// Plays a packet from the peer. Never plays into our own device: that would loop
@@ -97,63 +89,48 @@ struct AudioJitterBuffer {
 
   // MARK: Capture
 
-  /// Capture runs only while the ThunderControl device is the default output, so the
-  /// microphone indicator is lit only while this Mac's audio is going to the peer.
-  private func followDefaultOutput() {
-    let device = Self.device(uid: Self.deviceUID)
-    let selected = device != 0 && Self.defaultOutputUID() == Self.deviceUID
-    if selected, captureProc == nil {
-      AVCaptureDevice.requestAccess(for: .audio) { granted in
-        DispatchQueue.main.async { [weak self] in
-          guard granted, let self, self.defaultOutputListener != nil else { return }
-          self.startCapture(device)
-        }
+  /// Runs every 10 ms off the main actor. Drains the driver only while some app is playing
+  /// into the device, which is rechecked every 250 ms. The driver hands over samples through
+  /// a property, so no input stream is opened and macOS shows no microphone indicator.
+  private nonisolated static func captureHandler(plugin: AudioObjectID, send: @escaping (Data) -> Void) -> () -> Void {
+    var tick = 0
+    var running = false
+    var pending = Data()
+    let chunk = AudioWirePolicy.chunkFrames * 4
+    return {
+      if tick % 25 == 0 {
+        let now = isRunningSomewhere()
+        if now && !running { _ = drain(plugin) } // discard samples left from an earlier session
+        if !now { pending.removeAll() }
+        running = now
       }
-    } else if !selected {
-      stopCapture()
-    }
-  }
-
-  private func startCapture(_ device: AudioObjectID) {
-    guard captureProc == nil, device != 0 else { return }
-    var proc: AudioDeviceIOProcID?
-    let status = AudioDeviceCreateIOProcIDWithBlock(&proc, device, nil, Self.captureBlock(send))
-    guard status == noErr, let proc else { return }
-    guard AudioDeviceStart(device, proc) == noErr else { AudioDeviceDestroyIOProcID(device, proc); return }
-    captureDevice = device
-    captureProc = proc
-  }
-
-  /// Runs on the HAL I/O thread, outside the main actor.
-  private nonisolated static func captureBlock(_ send: @escaping (Data) -> Void) -> AudioDeviceIOBlock {
-    var pending = [Int16]()
-    pending.reserveCapacity(AudioWirePolicy.chunkFrames * 4)
-    return { _, input, _, _, _ in
-      let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
-      guard let buffer = buffers.first, let data = buffer.mData else { return }
-      let samples = data.assumingMemoryBound(to: Float.self)
-      for i in 0..<Int(buffer.mDataByteSize) / MemoryLayout<Float>.size {
-        pending.append(Int16(max(-1, min(1, samples[i])) * 32_767))
-      }
-      let chunk = AudioWirePolicy.chunkFrames * 2
+      tick += 1
+      guard running, let pcm = drain(plugin) else { return }
+      pending.append(pcm)
       while pending.count >= chunk {
-        let slice = pending[0..<chunk]
-        // Exact digital silence means nothing is playing; skip it rather than stream zeros.
-        if slice.contains(where: { $0 != 0 }) {
-          let pcm = slice.withUnsafeBytes { Data($0) }
-          DispatchQueue.main.async { send(pcm) }
-        }
+        let packet = Data(pending.prefix(chunk))
         pending.removeFirst(chunk)
+        // Exact digital silence means nothing is playing; skip it rather than stream zeros.
+        if packet.contains(where: { $0 != 0 }) { DispatchQueue.main.async { send(packet) } }
       }
     }
   }
 
-  private func stopCapture() {
-    guard let proc = captureProc else { return }
-    AudioDeviceStop(captureDevice, proc)
-    AudioDeviceDestroyIOProcID(captureDevice, proc)
-    captureProc = nil
-    captureDevice = 0
+  private nonisolated static func drain(_ plugin: AudioObjectID) -> Data? {
+    var value: Unmanaged<CFPropertyList>?
+    var size = UInt32(MemoryLayout<Unmanaged<CFPropertyList>?>.size)
+    var property = address(audioDataSelector)
+    guard AudioObjectGetPropertyData(plugin, &property, 0, nil, &size, &value) == noErr, let value else { return nil }
+    return value.takeRetainedValue() as? Data
+  }
+
+  private nonisolated static func isRunningSomewhere() -> Bool {
+    let device = device(uid: deviceUID)
+    guard device != 0 else { return false }
+    var running = UInt32(0)
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    var property = address(kAudioDevicePropertyDeviceIsRunningSomewhere)
+    return AudioObjectGetPropertyData(device, &property, 0, nil, &size, &running) == noErr && running != 0
   }
 
   // MARK: Playback
@@ -191,9 +168,7 @@ struct AudioJitterBuffer {
 
   private func stopPlayback() {
     idleTimer?.invalidate(); idleTimer = nil
-    if let engine {
-      engine.stop()
-    }
+    engine?.stop()
     if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
     configObserver = nil
     engine = nil
@@ -202,26 +177,29 @@ struct AudioJitterBuffer {
 
   // MARK: Core Audio helpers
 
-  private static func address(_ selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
+  private nonisolated static func address(_ selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
     AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
   }
 
-  @discardableResult private static func setPeerName(_ name: String) -> Bool {
+  private static func plugin() -> AudioObjectID? {
     var bundleID = driverBundleID as CFString
     var plugin = AudioObjectID(0)
     var size = UInt32(MemoryLayout<AudioObjectID>.size)
     var translate = address(kAudioHardwarePropertyTranslateBundleIDToPlugIn)
-    let found = withUnsafeMutablePointer(to: &bundleID) {
+    let status = withUnsafeMutablePointer(to: &bundleID) {
       AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &translate,
         UInt32(MemoryLayout<CFString>.size), $0, &size, &plugin)
     }
-    guard found == noErr, plugin != 0 else { return false }
+    return status == noErr && plugin != 0 ? plugin : nil
+  }
+
+  @discardableResult private static func setPeerName(_ name: String, plugin: AudioObjectID) -> Bool {
     var value = name as CFString
     var property = address(peerNameSelector)
     return AudioObjectSetPropertyData(plugin, &property, 0, nil, UInt32(MemoryLayout<CFString>.size), &value) == noErr
   }
 
-  private static func device(uid: String) -> AudioObjectID {
+  private nonisolated static func device(uid: String) -> AudioObjectID {
     var cfUID = uid as CFString
     var device = AudioObjectID(0)
     var size = UInt32(MemoryLayout<AudioObjectID>.size)

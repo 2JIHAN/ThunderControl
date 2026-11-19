@@ -10,7 +10,7 @@ cat > "$B/Contents/Info.plist" <<'PLIST'
 <key>CFBundleIdentifier</key><string>local.experimental.ThunderControl.AudioDriver</string>
 <key>CFBundleName</key><string>ThunderControlAudio</string>
 <key>CFBundlePackageType</key><string>BNDL</string>
-<key>CFBundleShortVersionString</key><string>1.0</string><key>CFBundleVersion</key><string>1</string>
+<key>CFBundleShortVersionString</key><string>1.1</string><key>CFBundleVersion</key><string>2</string>
 <key>CFPlugInFactories</key><dict><key>5B3F2C1E-7A64-4D8B-9E21-C0A47F6D3B58</key><string>ThunderControlAudioFactory</string></dict>
 <key>CFPlugInTypes</key><dict><key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key><array><string>5B3F2C1E-7A64-4D8B-9E21-C0A47F6D3B58</string></array></dict>
 </dict></plist>

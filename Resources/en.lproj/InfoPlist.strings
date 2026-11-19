@@ -1,3 +1,2 @@
 "CFBundleDisplayName" = "ThunderControl";
 "NSLocalNetworkUsageDescription" = "Connect only to a paired Mac over the verified Thunderbolt bridge to share keyboard, pointer input and an explicitly started extended display.";
-"NSMicrophoneUsageDescription" = "Send the sound you play to the paired Mac when you choose it as the sound output.";
