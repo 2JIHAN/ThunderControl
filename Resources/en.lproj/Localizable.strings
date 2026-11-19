@@ -354,3 +354,5 @@
 "Close screen" = "Close screen";
 
 "Connecting" = "Connecting";
+
+"ThunderControl will install its audio device so you can choose the connected Mac as a sound output." = "ThunderControl will install its audio device so you can choose the connected Mac as a sound output.";

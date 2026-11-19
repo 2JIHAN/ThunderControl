@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreAudio
+import CryptoKit
 import Foundation
 import os
 
@@ -183,7 +184,7 @@ struct AudioJitterBuffer {
       let buffers = UnsafeMutableAudioBufferListPointer(bufferList)
       guard buffers.count >= 2, let left = buffers[0].mData?.assumingMemoryBound(to: Float.self),
         let right = buffers[1].mData?.assumingMemoryBound(to: Float.self) else { return noErr }
-      playback.withLock { $0.pull(Int(frameCount), left, right) }
+      playback.withLockUnchecked { $0.pull(Int(frameCount), left, right) }
       return noErr
     }
   }
@@ -242,5 +243,30 @@ struct AudioJitterBuffer {
     var uidAddress = address(kAudioDevicePropertyDeviceUID)
     guard AudioObjectGetPropertyData(device, &uidAddress, 0, nil, &size, &uid) == noErr, let uid else { return nil }
     return uid.takeRetainedValue() as String
+  }
+}
+
+/// The app carries the driver in Contents/Resources and installs or updates it with the
+/// administrator prompt. A declined prompt is not repeated until the bundled driver changes.
+enum AudioDriverInstaller {
+  static let installed = "/Library/Audio/Plug-Ins/HAL/ThunderControlAudio.driver"
+  static func installIfNeeded() {
+    let executable = "Contents/MacOS/ThunderControlAudio"
+    guard let bundled = Bundle.main.url(forResource: "ThunderControlAudio", withExtension: "driver"),
+      !bundled.path.contains("'"), !bundled.path.contains("\""), !bundled.path.contains("\\"),
+      let wanted = try? Data(contentsOf: bundled.appendingPathComponent(executable)) else { return }
+    if (try? Data(contentsOf: URL(fileURLWithPath: installed).appendingPathComponent(executable))) == wanted { return }
+    let digest = SHA256.hash(data: wanted).map { String(format: "%02x", $0) }.joined()
+    let key = "audioDriverInstallAttempt"
+    guard UserDefaults.standard.string(forKey: key) != digest else { return }
+    UserDefaults.standard.set(digest, forKey: key)
+    let prompt = TCText("ThunderControl will install its audio device so you can choose the connected Mac as a sound output.")
+      .replacingOccurrences(of: "\"", with: "")
+    let command = "/bin/rm -rf '\(installed)' && /usr/bin/ditto '\(bundled.path)' '\(installed)' && /usr/sbin/chown -R root:wheel '\(installed)' && /usr/bin/killall coreaudiod"
+    // osascript runs outside the main thread's run loop, so input relaying keeps working while the prompt is open.
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    process.arguments = ["-e", "do shell script \"\(command)\" with administrator privileges with prompt \"\(prompt)\""]
+    try? process.run()
   }
 }

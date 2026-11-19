@@ -354,3 +354,5 @@
 "Close screen" = "화면 종료";
 
 "Connecting" = "연결중입니다";
+
+"ThunderControl will install its audio device so you can choose the connected Mac as a sound output." = "연결된 Mac을 소리 출력 장치로 고를 수 있도록 ThunderControl 오디오 장치를 설치합니다.";

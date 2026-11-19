@@ -5529,6 +5529,7 @@ final class PasteCommandProbe: NSResponder {
   let appGestureToggle=NSButton(checkboxWithTitle:TCText("Experimental: App Zoom/Rotate/Swipe (behavior unverified, consent on both Macs)"),target:nil,action:nil)
   let state = NSTextField(wrappingLabelWithString: TCText("Listen for Connections"))
   func applicationDidFinishLaunching(_ n: Notification) {
+    if !CommandLine.arguments.dropFirst().contains(where:{$0.hasPrefix("--")}) {AudioDriverInstaller.installIfNeeded()}
     installApplicationIcon()
     installMenus()
     window = NSWindow(
