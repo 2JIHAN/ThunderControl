@@ -3,6 +3,7 @@ import CryptoKit
 import Darwin
 import IOKit
 import OSLog
+import os
 
 // Callback owns no Relay pointer. Static epoch storage outlives every callback.
 // Lifecycle changes occur on the main thread; callback only takes the epoch lock.
@@ -177,6 +178,9 @@ struct Wire: Codable {
   // Hello-only text capability and a distinct data field; legacy image frames never carry either.
   var textClipboardCodec:Int? = nil
   var textClipboard:TextClipboardPacket? = nil
+  // Hello-only audio capability; "audio" packets carry PCM per AudioWirePolicy.
+  var audioCodec:Int? = nil
+  var audio:Data? = nil
 }
 struct DesktopSystemGestureTarget:Equatable {
   let revision:UInt64
@@ -418,7 +422,8 @@ struct Validator {
         (w.folderTransferCodec==nil || w.folderTransferCodec==1),
         (w.imageClipboardCodec==nil || w.imageClipboardCodec==1),
         (w.imageClipboardIsolationCodec==nil || w.imageClipboardIsolationCodec==1),w.imageClipboard==nil,
-        (w.textClipboardCodec==nil || w.textClipboardCodec==1),w.textClipboard==nil
+        (w.textClipboardCodec==nil || w.textClipboardCodec==1),w.textClipboard==nil,
+        (w.audioCodec==nil || w.audioCodec==1),w.audio==nil
       else { throw Failure("Invalid hello") }
       session = w.session
       next = 1
@@ -608,6 +613,7 @@ struct PeerValidator {
   var bridgeRecoverySupported=false
   var imageClipboardSupported=false
   var textClipboardSupported=false
+  var audioSupported=false
   mutating func accept(_ w: Wire) throws {
     guard w.session == session, w.sequence == next, next < UInt64.max else {
       throw Failure("Replay or sequence mismatch")
@@ -620,6 +626,11 @@ struct PeerValidator {
       guard textClipboardSupported,TextClipboardWirePolicy.validEnvelope(w) else{throw Failure("Invalid text clipboard envelope")}
       next += 1;return
     }
+    if w.kind=="audio" {
+      guard audioSupported,AudioWirePolicy.validEnvelope(w) else{throw Failure("Invalid audio envelope")}
+      next += 1;return
+    }
+    guard w.audio==nil,w.audioCodec==nil else{throw Failure("Unexpected audio fields")}
     guard w.fileTransferCodec==nil,w.folderTransferCodec==nil,w.imageClipboard==nil,w.imageClipboardCodec==nil,w.imageClipboardIsolationCodec==nil,w.textClipboard==nil,w.textClipboardCodec==nil else{throw Failure("Unexpected clipboard fields")}
     guard w.desktopAppGestureCodec==nil else{throw Failure("Unexpected desktop app gesture capability")}
     guard w.bridgeRecoveryCodec==nil else{throw Failure("Unexpected bridge recovery capability")}
@@ -1143,6 +1154,21 @@ final class Relay {
   }
   private var imageClipboardCompatible=false
   private var imageClipboardController:ImageClipboardController?
+  private var audioCompatible=false
+  private var audioBridge:AudioBridge?
+  // Audio frames admitted but not yet written; bounded so audio never fills the input queue.
+  private let audioInFlight=OSAllocatedUnfairLock(initialState:0)
+  @MainActor private func startAudio(generation expected:UUID,context expectedContext:SessionContext) {
+    guard audioBridge==nil,!lockedTransportOnly else{return}
+    let bridge=AudioBridge {[weak self,weak expectedContext] pcm in
+      guard let self,let expectedContext,self.generation==expected,self.context === expectedContext,!expectedContext.cancelled,self.authenticated,!self.lockedTransportOnly,!self.bridgeInputSuspended,self.currentSessionBlockReason()==nil else{return}
+      guard self.audioInFlight.withLock({n in guard n<8 else{return false};n+=1;return true}) else{return}
+      var w=Wire(kind:"audio",session:self.session,sequence:0);w.audio=pcm
+      if !self.enqueue(w) {self.audioInFlight.withLock{$0-=1}}
+    }
+    if bridge.start(peerName:authenticatedPeerDisplayName ?? TCText("Bridge peer")) {audioBridge=bridge}
+    else {connectionLog("Audio output unavailable: ThunderControl audio driver not installed")}
+  }
   var imageClipboardEnabled=false
   var imageClipboardStatusChanged:((String)->Void)?
   @MainActor func setImageClipboardEnabled(_ enabled:Bool) {
@@ -3284,6 +3310,8 @@ final class Relay {
     fileSafetyTimer?.invalidate();fileSafetyTimer=nil
     MainActor.assumeIsolated{fileTransfer.configure(nil)}
     if let clipboard=imageClipboardController {MainActor.assumeIsolated{clipboard.stop()};imageClipboardController=nil}
+    if let audio=audioBridge {MainActor.assumeIsolated{audio.stop()};audioBridge=nil}
+    audioCompatible=false
     imageClipboardCompatible=false;textClipboardCompatible=false
     let textStatus=textClipboardEnabled ? "Text clipboard: waiting for both Macs to update and enable text sharing.":"Text clipboard sharing is off."
     DispatchQueue.main.async{[weak self] in self?.textClipboardStatusChanged?(textStatus)}
@@ -3937,7 +3965,7 @@ final class Relay {
           seal(
             Wire(
               concurrentDisplayCodec:1,kind: sendMode ? "sender-hello-v5" : "receiver-hello-v5", session: localSession,
-              sequence: 0, os: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,osBuild:systemBuildIdentifier(),gestureCodec:DockGestureCodec.supported ? 1 : 0,appGestureCodec:AppGestureCodec.supported ? 1 : 0,cursorVisibilityCodec:1,peerDisplayName:ConnectionNotificationTracker.displayName(Host.current().localizedName ?? "ThunderControl Mac"),multiDisplayDesktopCodec:1,desktopGestureCodec:DockGestureCodec.supported ? 1:0,systemControlKeyCodec:1,videoQualityCodec:localVideoQualityCodec,bridgeRecoveryCodec:1,displayPreferenceCodec:1,desktopAppGestureCodec:AppGestureCodec.supported ? 1:0,fileTransferCodec:1,imageClipboardCodec:1,imageClipboardIsolationCodec:1,folderTransferCodec:1,textClipboardCodec:1), k))
+              sequence: 0, os: ProcessInfo.processInfo.operatingSystemVersion.majorVersion,osBuild:systemBuildIdentifier(),gestureCodec:DockGestureCodec.supported ? 1 : 0,appGestureCodec:AppGestureCodec.supported ? 1 : 0,cursorVisibilityCodec:1,peerDisplayName:ConnectionNotificationTracker.displayName(Host.current().localizedName ?? "ThunderControl Mac"),multiDisplayDesktopCodec:1,desktopGestureCodec:DockGestureCodec.supported ? 1:0,systemControlKeyCodec:1,videoQualityCodec:localVideoQualityCodec,bridgeRecoveryCodec:1,displayPreferenceCodec:1,desktopAppGestureCodec:AppGestureCodec.supported ? 1:0,fileTransferCodec:1,imageClipboardCodec:1,imageClipboardIsolationCodec:1,folderTransferCodec:1,textClipboardCodec:1,audioCodec:1), k))
         var remoteHello = try unseal(readFrame(c), k)
         guard (sendMode || remoteHello.session==pairingScope),remoteHello.kind == (sendMode ? "receiver-hello-v5" : "sender-hello-v5") else {
           throw Failure("Handshake role mismatch")
@@ -3954,6 +3982,7 @@ final class Relay {
         let imageClipboardNegotiated=ImageClipboardWirePolicy.isolatedSharingSupported(codec:remoteHello.imageClipboardCodec,isolation:remoteHello.imageClipboardIsolationCodec)
         let textClipboardNegotiated=TextClipboardWirePolicy.supported(textCodec:remoteHello.textClipboardCodec,imageCodec:remoteHello.imageClipboardCodec,isolation:remoteHello.imageClipboardIsolationCodec)
         let bridgeRecoveryNegotiated=remoteHello.bridgeRecoveryCodec==1
+        let audioNegotiated=remoteHello.audioCodec==1
         let visibilityCompatible=remoteHello.cursorVisibilityCodec==1
         let appCompatible=AppGestureCodec.compatible(build:remoteHello.osBuild,codec:remoteHello.appGestureCodec)
         let desktopAppGestureNegotiated=multiDisplayDesktopCompatibleNegotiated && appCompatible && remoteHello.desktopAppGestureCodec==1
@@ -3972,7 +4001,7 @@ final class Relay {
         let fileSession:FileSession? = remoteHello.fileTransferCodec==1 ? DisplayPeerRoute.authenticatedSocketHost(c).map { host in
           FileSession(root:FileSession.purposeRoot(k,local:localSession,peer:remoteHello.session),inputIDs:[localSession,remoteHello.session].sorted().joined(separator:"|"),localIP:b.ip,interfaceIndex:b.index,peerIP:host,cancelled:{sessionContext.cancelled},onCancel:{sessionContext.addCancellationHandler($0)},localDeviceID:confirmedLayoutPair.localID,peerDeviceID:confirmedLayoutPair.peerID,folderTransferSupported:remoteHello.folderTransferCodec==1)
         } : nil
-        var peerValidator = PeerValidator(senderPeer: !sendMode, session: remoteHello.session,cursorVisibilitySupported:visibilityCompatible,concurrentDisplaySupported:displayCompatible,multiDisplayDesktopSupported:multiDisplayDesktopCompatibleNegotiated,desktopGesturesSupported:desktopSystemGestureNegotiated,desktopAppGesturesSupported:desktopAppGestureNegotiated,displayPreferenceSupported:displayPreferenceNegotiated,systemControlKeysSupported:systemControlKeysNegotiated,bridgeRecoverySupported:bridgeRecoveryNegotiated,imageClipboardSupported:imageClipboardWireSupported,textClipboardSupported:textClipboardNegotiated)
+        var peerValidator = PeerValidator(senderPeer: !sendMode, session: remoteHello.session,cursorVisibilitySupported:visibilityCompatible,concurrentDisplaySupported:displayCompatible,multiDisplayDesktopSupported:multiDisplayDesktopCompatibleNegotiated,desktopGesturesSupported:desktopSystemGestureNegotiated,desktopAppGesturesSupported:desktopAppGestureNegotiated,displayPreferenceSupported:displayPreferenceNegotiated,systemControlKeysSupported:systemControlKeysNegotiated,bridgeRecoverySupported:bridgeRecoveryNegotiated,imageClipboardSupported:imageClipboardWireSupported,textClipboardSupported:textClipboardNegotiated,audioSupported:audioNegotiated)
         timeout.tv_sec = 0
         setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         DispatchQueue.main.async {
@@ -3989,6 +4018,7 @@ final class Relay {
           self.multiDisplayDesktopCompatible=multiDisplayDesktopCompatibleNegotiated;self.desktopSystemGestureCompatible=desktopSystemGestureNegotiated;self.desktopAppGestureCompatible=desktopAppGestureNegotiated
           self.systemControlKeysCompatible=systemControlKeysNegotiated
           self.imageClipboardCompatible=imageClipboardNegotiated;self.textClipboardCompatible=textClipboardNegotiated
+          self.audioCompatible=audioNegotiated
           self.bridgeRecoveryCompatible=bridgeRecoveryNegotiated
           self.peerVideoQualityCompatible=videoQualityNegotiated
           self.displayPreferenceCompatible=displayPreferenceNegotiated;self.peerDisplayPreference=nil
@@ -4022,6 +4052,7 @@ final class Relay {
             guard inputPermissionsReady() else{self.safetyStop("Input permissions missing after authentication");return}
             try self.capture()
             if imageClipboardNegotiated || textClipboardNegotiated {self.startImageClipboard(generation:g,context:sessionContext)}
+            if audioNegotiated {self.startAudio(generation:g,context:sessionContext)}
             if let fileSession {self.startFileTransfer(fileSession,generation:g,context:sessionContext)}
             if !self.sender,self.automaticSharingInputAllowed(false) {self.consent(true)}
             self.status(visibilityCompatible ? TCText("Two-way cursor visibility switching available: enable automatic switching and Receiver input to show the cursor only on the active Mac.") : TCText("Two-way cursor visibility requires 0.6.6 or later on both Macs. Existing input forwarding continues."))
@@ -4283,7 +4314,7 @@ final class Relay {
     let g = generation
     let clipboardGate=imageClipboardController?.sendGate
     out.async {
-      defer { self.pending.signal(); self.hintReplayCapacity() }
+      defer { self.pending.signal(); self.hintReplayCapacity(); if w.kind=="audio" {self.audioInFlight.withLock{$0-=1}} }
       guard !ctx.cancelled else { return }
       var transmitted=w
       if let packet=w.imageClipboard,let clipboardGate {transmitted.imageClipboard=clipboardGate.packetForTransmission(packet)}
@@ -5145,6 +5176,11 @@ final class Relay {
     if w.kind=="textClipboard" {
       guard textClipboardCompatible,!bridgeInputSuspended,let packet=w.textClipboard else{return}
       MainActor.assumeIsolated{imageClipboardController?.receive(packet)}
+      return
+    }
+    if w.kind=="audio" {
+      guard audioCompatible,!bridgeInputSuspended,let pcm=w.audio else{return}
+      MainActor.assumeIsolated{audioBridge?.receive(pcm)}
       return
     }
     if bridgeInputSuspended {return}
@@ -6948,6 +6984,7 @@ struct ThunderControlMain {
       check(runImageClipboardTests()==0)
       check(runImageClipboardWireTests()==0)
       check(runTextClipboardTests()==0)
+      check(runAudioBridgeTests()==0)
       check(runSystemControlKeyTests()==0)
       check(runSystemControlRelayTests()==0)
       #if TC_QUALITY_TIERS
