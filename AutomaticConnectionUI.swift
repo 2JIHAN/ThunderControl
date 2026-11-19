@@ -41,6 +41,7 @@ import AppKit
   func automaticConnectionTick() {
     if connectionRecoveryWait.startedAt != nil {updateConnectionState()}
     sharingRestoreTick()
+    if displayMode.cleaning && !relay.hasSession && !relay.authenticated {displayMode.stop(disconnectInput:true)}
     guard !displayMode.cleaning else{return}
     if displayMode.active && !relay.hasSession {
       guard displayMode.reconnecting,let binding=displayMode.retainedInputBinding,

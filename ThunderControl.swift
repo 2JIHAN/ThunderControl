@@ -2516,6 +2516,14 @@ final class Relay {
     try adoptReceiverMain(map)
     if authenticated {try resumeDisplayReceiver(map:map)}
   }
+  func retireDisconnectedDisplay(ownedID:CGDirectDisplayID)->Bool {
+    guard !hasSession,!authenticated,!auto,!forward,!inject,!hasUnresolvedLocalRecovery,displayBarrier==nil,
+      displayLease==nil || displayLease?.ownedID==ownedID,
+      let first=freshDisplayBaseline(),let second=freshDisplayBaseline(),first==second,second.supported,
+      !first.ids.contains(ownedID),!second.ids.contains(ownedID) else{return false}
+    displayLease=nil
+    return true
+  }
   private func adoptDisplayLease(_ lease:ConcurrentDisplayLease) {
     displayLease=lease
     if let map=lease.accepted.desktop(revision:max(1,receiverDesktopPublishRevision),virtualID:lease.ownedID) {try? adoptReceiverMain(map)}

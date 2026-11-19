@@ -144,6 +144,7 @@ struct OwnedDisplayMonitor {
   var commitInputDisplay:((DisplayBaseline,CGDirectDisplayID)throws->Void)?
   var finishInputDisplay:((DisplayBaseline)throws->Void)?
   var abortInputTransition:(()->Void)?
+  var retireInputDisplay:((CGDirectDisplayID)->Bool)?
   private var transport:DisplayTransport?,viewer:DisplayViewer?,helper:Process?,heartbeat:FileHandle?,timer:Timer?
   private var baseline:DisplayBaseline?,virtualID:CGDirectDisplayID?,expectedPair:LayoutDevicePair?
   private var physicalRetirement:(id:CGDirectDisplayID,snapshot:PhysicalDisplayMirroring?,required:Bool)?
@@ -701,6 +702,10 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
         guard let self else{return};self.cleanupRunning=false
         if self.disconnectingInput && ownedRemoved {
           self.abortInputTransition?()
+          if let id=retiredDisplayID,self.retireInputDisplay?(id) != true {
+            self.report(TCText("Input stopped for safety because restoration of the original display configuration could not be confirmed. Click Stop Screen Sharing again to check."));return
+          }
+          connectionLog("Display disconnected_retirement owned=\(retiredDisplayID.map(String.init) ?? "none") removed=\(ownedRemoved) restored=\(restored) inputResumed=false")
           self.baseline=nil;self.physicalRetirement=nil;self.cleaning=false;self.transitionEngaged=false;self.disconnectingInput=false
           self.report(restored ? self.finalMessage:TCText("Screen sharing and input connection stopped. The previous display configuration could not be verified. Check Displays settings before reconnecting."))
           return
@@ -749,6 +754,7 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
     func fixture(id:UInt32?=nil,required:Bool=true)->(App,Effects) {
       let app=App(),effects=Effects(),controller=app.displayMode
       controller.abortInputTransition={effects.aborts+=1}
+      controller.retireInputDisplay={_ in true}
       controller.finishInputDisplay={_ in effects.finishes+=1}
       controller.status={effects.messages.append($0)}
       controller.cleaning=true;controller.sending=true;controller.transitionEngaged=true
@@ -756,8 +762,9 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
       return(app,effects)
     }
     func wait(_ controller:DisplayModeController)->Bool {
-      let deadline=Date(timeIntervalSinceNow:12)
-      while controller.cleanupRunning && Date()<deadline {_ = RunLoop.current.run(mode:.default,before:Date(timeIntervalSinceNow:0.005))}
+      let started=ProcessInfo.processInfo.systemUptime,deadline=started+60
+      while controller.cleanupRunning && ProcessInfo.processInfo.systemUptime<deadline {_ = RunLoop.current.run(mode:.default,before:Date(timeIntervalSinceNow:0.005))}
+      print("Display retirement wait seconds=\(ProcessInfo.processInfo.systemUptime-started) pending=\(controller.cleanupRunning)")
       return !controller.cleanupRunning
     }
     var failures=0
@@ -772,6 +779,19 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
     full.tearDownConnection(userStop:false,updateUI:false)
     expect(!full.displayMode.cleaning && effects.aborts==aborts && effects.finishes==0,"repeated full stop is idempotent")
     expect(effects.messages.last==TCText("Screen sharing and input connection stopped. The previous display configuration could not be verified. Check Displays settings before reconnecting."),"unverified restoration is a warning, not a stuck cleanup")
+    let (disconnected,disconnectedEffects)=fixture()
+    disconnected.automaticConnectionTick()
+    expect(wait(disconnected.displayMode) && !disconnected.displayMode.cleaning && disconnectedEffects.finishes==0,"disconnected cleanup automatically retires missing-snapshot screen without input resume")
+    expect(!disconnected.automaticConnectionPaused && !disconnected.sharingInputRestoreBlocked && !disconnected.sharingResume.blocked,"automatic cleanup never invents a user stop")
+    let (blocked,blockedEffects)=fixture()
+    blocked.automaticConnectionPaused=true;blocked.sharingInputRestoreBlocked=true;blocked.sharingResume.manualStop();blocked.relay.automaticReconnectSuspended=true
+    blocked.automaticConnectionTick()
+    expect(wait(blocked.displayMode) && !blocked.displayMode.cleaning && blockedEffects.finishes==0,"stopped session can clean up without resuming input")
+    expect(blocked.automaticConnectionPaused && blocked.sharingInputRestoreBlocked && blocked.sharingResume.blocked && blocked.relay.automaticReconnectSuspended,"user emergency and safety stop latches survive automatic cleanup")
+    let (rejected,rejectedEffects)=fixture()
+    rejected.displayMode.retireInputDisplay={_ in false}
+    rejected.automaticConnectionTick()
+    expect(wait(rejected.displayMode) && rejected.displayMode.cleaning && rejectedEffects.finishes==0,"unconfirmed input lease retirement keeps cleanup blocked")
     let (video,videoEffects)=fixture()
     video.displayMode.stop()
     expect(wait(video.displayMode) && video.displayMode.cleaning && videoEffects.aborts>0 && videoEffects.finishes==0,"video-only stop retains strict restoration requirement")
@@ -814,6 +834,7 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
     displayMode.commitInputDisplay={[weak self] original,id in guard let self else{throw Failure("Input owner unavailable")};try self.relay.commitDisplayTopology(original:original,ownedID:id)}
     displayMode.finishInputDisplay={[weak self] original in guard let self else{throw Failure("Input owner unavailable")};try self.relay.finishDisplayTopologyRemoval(original:original)}
     displayMode.abortInputTransition={[weak self] in self?.relay.abortDisplayTopologyTransition()}
+    displayMode.retireInputDisplay={[weak self] id in self?.relay.retireDisconnectedDisplay(ownedID:id)==true}
     displayMode.userStopped={[weak self] in self?.sharingUserStoppedVideo()}
     displayMode.status={[weak self] text in guard let self else{return};self.displayStatus.stringValue=text;self.updateConnectionState();self.connectButton.isEnabled = !self.relay.hasSession && !self.displayMode.cleaning;self.mode.isEnabled = !self.displayMode.active && !self.displayMode.cleaning;self.sharingDisplayStatusDidChange()
 #if TC_QUALITY_TIERS

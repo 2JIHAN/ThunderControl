@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import CoreGraphics
 
 func runRetainedDisplayReconnectTests()->Int {
@@ -43,6 +44,23 @@ func runRetainedDisplayReconnectTests()->Int {
         expect(false,"actual start must reject outstanding barrier")
       } catch {expect(relay.desktopBarrierForTests != nil,"barrier is not silently cleared by start")}
     }
+    for invalid in ["present","unreadable","unstable","session","authentication","recovery","wrongOwnedID"] {
+      let r=Relay();r.configureRetainedReconnectForTests(lease:lease)
+      var reads=0
+      r.desktopBaselineReadForTests={reads+=1;return invalid=="unreadable" ? nil : invalid=="present" || (invalid=="unstable" && reads==2) ? current:original}
+      if invalid=="session" {r.connectionForTests=OwnedSocket(-1);r.keyForTests=SymmetricKey(size:.bits256)}
+      if invalid=="authentication" {r.keyForTests=SymmetricKey(size:.bits256);r.connectionForTests=OwnedSocket(-1)}
+      if invalid=="recovery" {r.receiverFocusRecoveryPending={true}}
+      expect(!r.retireDisconnectedDisplay(ownedID:invalid=="wrongOwnedID" ? 3:2),"reject unsafe disconnected retirement "+invalid)
+      r.desktopBaselineReadForTests={current}
+      expect(r.retainedDisplayLeaseValid(ownedID:2,original:original),"failed retirement preserves lease "+invalid)
+    }
+    let retired=Relay();retired.configureRetainedReconnectForTests(lease:lease);retired.desktopBaselineReadForTests={original};retired.automaticReconnectSuspended=true
+    expect(retired.retireDisconnectedDisplay(ownedID:2),"stable absent owned display retires disconnected lease")
+    expect(retired.retireDisconnectedDisplay(ownedID:2),"retirement is idempotent")
+    retired.desktopBaselineReadForTests={current}
+    expect(!retired.retainedDisplayLeaseValid(ownedID:2,original:original),"retired lease cannot be reused")
+    expect(!retired.auto && !retired.forward && !retired.inject && !retired.authenticated && retired.automaticReconnectSuspended,"retirement neither enables input nor clears safety stop")
     let relay=Relay()
     relay.configureRetainedReconnectForTests(lease:lease)
     relay.desktopBaselineReadForTests={current}
