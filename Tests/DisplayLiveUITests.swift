@@ -117,7 +117,7 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     let ownershipFixture=App(relay:Relay())
     ownershipFixture.sourceWindowOwnership.eligibleViewer={viewer.isOpenForSourceOwnership ? viewer:nil}
     viewer.onWillClose={ownershipFixture.relay.pauseSourceForForegroundLoss()}
-    let deadline = ProcessInfo.processInfo.systemUptime + 25
+    let deadline = ProcessInfo.processInfo.systemUptime + (startsFullScreen ? 34 : 25)
     func pump(until condition: () -> Bool, maximum: Double,stage:String) async throws {
         let end = min(deadline, ProcessInfo.processInfo.systemUptime + maximum)
         while !condition() && ProcessInfo.processInfo.systemUptime < end {
@@ -139,6 +139,16 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
     }
     // Drive the same coordinator methods as production App callbacks. No input
     // Relay is connected; these windows own only generated fixture pixels.
+    if startsFullScreen {
+        let other = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 120, height: 80), styleMask: [.titled], backing: .buffered, defer: false)
+        other.isReleasedWhenClosed = false
+        defer { other.close() }
+        other.makeKeyAndOrderFront(nil)
+        try await pump(until: { other.isKeyWindow && application.isActive }, maximum: 2, stage: "another window holds initial focus")
+        try await Task.sleep(nanoseconds: 5_500_000_000)
+        try displayLiveRequire(other.isKeyWindow && !viewer.isFullScreenForTests && !ownershipFixture.sourceWindowOwnership.hasStableOwnership, "delayed activation does not take input ownership or enter on a background window")
+        window.makeKeyAndOrderFront(nil)
+    }
     ownershipFixture.sourceWindowOwnership.request(stop:{})
     var enteredFullScreen = false
     let fullScreenObserver = NotificationCenter.default.addObserver(forName: NSWindow.didEnterFullScreenNotification, object: window, queue: .main) { _ in
@@ -329,6 +339,16 @@ private func displayLiveVerifyScreenshot(_ path: String) throws -> Int {
         }
     }
     let wasFullscreen=viewer.isFullScreenForTests
+    if startsFullScreen {
+        var exited = false
+        let observer = NotificationCenter.default.addObserver(forName: NSWindow.didExitFullScreenNotification, object: window, queue: .main) { _ in exited = true }
+        defer { NotificationCenter.default.removeObserver(observer) }
+        window.toggleFullScreen(nil)
+        try await pump(until: { exited && !viewer.isFullScreenForTests }, maximum: 3, stage: "user exits native fullscreen")
+        viewer.showConnectionWarning(); viewer.resumeConnection(); viewer.show()
+        try await Task.sleep(nanoseconds: 250_000_000)
+        try displayLiveRequire(window.isVisible && !viewer.isFullScreenForTests && closed == 0, "retained viewer respects manual windowed mode on reconnect")
+    }
     if #available(macOS 14.4, *) {
         // Retire a genuine pending request synchronously before its main-queue
         // completion can run. close/clear must not resurrect its metrics sample.
@@ -384,7 +404,7 @@ func displayViewerStartupLifecycleTests() throws {
     startup.close(); startup.didEnterFullScreen()
     try displayLiveRequire(!startup.mayPresentVideo && !startup.requestIfReady(windowReady: true), "closed viewer ignores late entry and request")
     startup.begin(fullScreen: true)
-    try displayLiveRequire(startup.useWindowedFallback() && startup.mayPresentVideo, "readiness timeout falls back to usable window")
+    try displayLiveRequire(startup.useWindowedFallback() && startup.mayPresentVideo, "interrupted startup stays usable in windowed mode")
     try displayLiveRequire(!startup.useWindowedFallback() && !startup.requestIfReady(windowReady: true), "fallback is idempotent and cannot toggle")
     startup.begin(fullScreen: true)
     _ = startup.requestIfReady(windowReady: true)

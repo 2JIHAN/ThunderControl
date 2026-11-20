@@ -939,7 +939,6 @@ struct DisplayViewerStartup {
     private var windowEpoch: UInt64 = 0
     private var startup = DisplayViewerStartup()
     private var startupTimer: Timer?
-    private var startupDeadline: TimeInterval = 0
     private var entryDeadline: TimeInterval?
     private var fullScreenRetryNotBefore: TimeInterval = 0
     var isVideoPresentationReadyForTests: Bool { startup.mayPresentVideo }
@@ -1103,7 +1102,7 @@ struct DisplayViewerStartup {
         guard format.valid else { return }
         closing = false
         windowEpoch &+= 1
-        let epoch = windowEpoch
+        entryDeadline = nil; fullScreenRetryNotBefore = 0
         startup.begin(fullScreen: startsFullScreen)
         let screen = targetScreen ?? NSScreen.main ?? NSScreen.screens.first
         let available = screen.map { $0.visibleFrame.intersection($0.frame) } ?? NSRect(x: 0, y: 0, width: 1024, height: 768)
@@ -1130,17 +1129,21 @@ struct DisplayViewerStartup {
         window.setFrame(frame, display: false); window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         if startsFullScreen {
-            startupDeadline = ProcessInfo.processInfo.systemUptime + 5; entryDeadline=nil
             startupDiagnostic("waiting-window",window)
-            let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self, weak window] _ in
-                MainActor.assumeIsolated {
-                    guard let self, let window, !self.closing, self.windowEpoch == epoch,
-                          self.viewerWindow === window else { return }
-                    self.advanceFullScreenStartup(window)
-                }
-            }
-            startupTimer = timer; RunLoop.main.add(timer, forMode: .common)
+            scheduleFullScreenStartup()
         }
+    }
+    private func scheduleFullScreenStartup() {
+        guard startup.phase == .waitingForWindow, startupTimer == nil, let window = viewerWindow else { return }
+        let epoch = windowEpoch
+        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self, weak window] _ in
+            MainActor.assumeIsolated {
+                guard let self, let window, !self.closing, self.windowEpoch == epoch,
+                      self.viewerWindow === window else { return }
+                self.advanceFullScreenStartup(window)
+            }
+        }
+        startupTimer = timer; RunLoop.main.add(timer, forMode: .common)
     }
     private func advanceFullScreenStartup(_ window: NSWindow) {
         guard startup.isPending else { return }
@@ -1148,11 +1151,13 @@ struct DisplayViewerStartup {
         if let deadline=entryDeadline,now>=deadline {
             finishFullScreenFallback(window,reason:"entry-timeout");return
         }
-        if entryDeadline==nil,now>=startupDeadline {
-            finishFullScreenFallback(window,reason:"window-readiness-timeout");return
+        // Activation is not a failed native request. Wait for the next key/active notification without polling.
+        let windowReady = window.isVisible && window.isKeyWindow && NSApp.isActive
+        if startup.phase == .waitingForWindow && !windowReady {
+            startupTimer?.invalidate(); startupTimer = nil; return
         }
         guard now >= fullScreenRetryNotBefore else { return }
-        if startup.requestIfReady(windowReady: window.isVisible && window.isKeyWindow && NSApp.isActive) {
+        if startup.requestIfReady(windowReady: windowReady) {
             entryDeadline=now+8
             startupDiagnostic("native-request",window)
             window.toggleFullScreen(nil)
@@ -1167,6 +1172,11 @@ struct DisplayViewerStartup {
         NSLog("ThunderControl: native fullscreen startup failed or timed out; keeping a usable viewer window (no automatic toggle retry).")
         drainPresentation()
     }
+    func windowWillEnterFullScreen(_ notification: Notification) {
+        // A user-initiated native transition already satisfies the pending startup request.
+        guard notification.object as? NSWindow === viewerWindow, startup.phase == .waitingForWindow else { return }
+        startup.useWindowedFallback(); startupTimer?.invalidate(); startupTimer = nil
+    }
     func windowDidEnterFullScreen(_ notification: Notification) {
         guard let window = notification.object as? NSWindow, window === viewerWindow, !closing else { return }
         startup.didEnterFullScreen()
@@ -1180,19 +1190,9 @@ struct DisplayViewerStartup {
         if startup.retryAfterRejection(maximumRetries: 2) {
             let now = ProcessInfo.processInfo.systemUptime
             fullScreenRetryNotBefore = now + 0.75
-            entryDeadline = nil; startupDeadline = now + 5
+            entryDeadline = nil
             startupDiagnostic("appkit-rejected-retry-\(startup.rejectedAttempts)", window)
-            if startupTimer == nil {
-                let epoch = windowEpoch
-                let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self, weak window] _ in
-                    MainActor.assumeIsolated {
-                        guard let self, let window, !self.closing, self.windowEpoch == epoch,
-                              self.viewerWindow === window else { return }
-                        self.advanceFullScreenStartup(window)
-                    }
-                }
-                startupTimer = timer; RunLoop.main.add(timer, forMode: .common)
-            }
+            scheduleFullScreenStartup()
             return
         }
         finishFullScreenFallback(window,reason:"appkit-rejected")
@@ -1807,6 +1807,7 @@ struct DisplayViewerStartup {
     }
     func showConnectionWarning() {
         guard !closing, let surface else { return }
+        if startup.useWindowedFallback() { startupTimer?.invalidate(); startupTimer = nil }
         if !connectionInterrupted { clear(preservingDisplayedImage: true) }
         connectionInterrupted = true; waitingForConnectionFrame = false
         onFocusLost?()
@@ -1860,7 +1861,7 @@ struct DisplayViewerStartup {
     }
     @objc private func appDidResignActive(_ notification: Notification) { reportFocusLost() }
     @objc private func appDidBecomeActive(_ notification: Notification) {
-        reportFocusGained()
+        reportFocusGained(); scheduleFullScreenStartup()
     }
     private func removeLocalInputMonitor() {
         if let localInputMonitor { NSEvent.removeMonitor(localInputMonitor) }; localInputMonitor = nil
@@ -1877,7 +1878,7 @@ struct DisplayViewerStartup {
         guard !closing, NSApp.isActive, viewerWindow?.isKeyWindow == true, !focusArmed else { return }
         focusArmed = true; onFocusGained?()
     }
-    func windowDidBecomeKey(_ notification: Notification) { reportFocusGained() }
+    func windowDidBecomeKey(_ notification: Notification) { reportFocusGained(); scheduleFullScreenStartup() }
     func windowDidResignKey(_ notification: Notification) { reportFocusLost() }
     private func handleLocalInput(_ event: NSEvent) -> NSEvent? {
         guard !closing, NSApp.isActive, let window = viewerWindow, window.isKeyWindow,

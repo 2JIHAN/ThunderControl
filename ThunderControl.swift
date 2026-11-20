@@ -1260,6 +1260,20 @@ final class Relay {
   var sharingLifecyclePairForTests:LayoutDevicePair? {get{authenticatedDevicePair} set{authenticatedDevicePair=newValue}}
   var sharingLifecycleCapabilityForTests:Bool {get{displayPreferenceCompatible} set{displayPreferenceCompatible=newValue}}
   var sourceBoundarySize:CGSize? {topology?.bounds.size}
+  // Repair missed releases only for local-only input. Never release peer-owned input or guess the state of a gesture/media key.
+  private func reconcileReleasedLocalInputs(
+    keyDown:(CGKeyCode)->Bool = { CGEventSource.keyState(.hidSystemState,key:$0) || CGEventSource.keyState(.combinedSessionState,key:$0) },
+    buttonDown:(Int64)->Bool = { n in
+      guard (0..<32).contains(n),let b=CGMouseButton(rawValue:UInt32(n)) else{return true}
+      return CGEventSource.buttonState(.hidSystemState,button:b) || CGEventSource.buttonState(.combinedSessionState,button:b)
+    }, flags:()->CGEventFlags = { CGEventSource.flagsState(.hidSystemState).union(CGEventSource.flagsState(.combinedSessionState)) }) {
+    guard sender,auto,!forward,handoff.phase == .local,authenticated,
+      !localKeys.isEmpty || !localButtons.isEmpty || !localFlags.isEmpty,
+      ownership.owned.isEmpty,boundaryBlockedReason == .inputHeld else{return}
+    for k in localKeys where k < 128 && !keyDown(k) {localKeys.remove(k)}
+    for b in localButtons where !buttonDown(b) {localButtons.remove(b)}
+    if !localFlags.isEmpty {localFlags.formIntersection(flags())}
+  }
   var boundaryBlockedReason:BoundaryBlockedReason? {
     if !authenticated {return .disconnected}
     if lockedTransportOnly || sessionLockedSignal || screenSleeping || systemSleeping || displayBarrier != nil || bridgeInputSuspended || automaticReconnectSuspended || ownership.blocked || hasUnresolvedLocalRecovery {return .safety}
@@ -3059,6 +3073,15 @@ final class Relay {
     guard began==0,r.handoff.phase == .local else{return false}
     r.receiverAvailable=true
     guard r.boundaryBlockedReason==nil else{return false}
+    r.localKeys=[12,13,300];r.localButtons=[0,1];r.localFlags=[.maskCommand,.maskShift]
+    guard r.boundaryBlockedReason == .inputHeld else{return false}
+    r.reconcileReleasedLocalInputs(keyDown:{$0==13},buttonDown:{$0==1},flags:{.maskShift})
+    guard r.localKeys==[13,300],r.localButtons==[1],r.localFlags == .maskShift,r.boundaryBlockedReason == .inputHeld else {
+      print("FAIL missed release: released local input still marked held, or held input discarded");return false
+    }
+    r.localKeys.remove(300) // media key release must come from the event stream
+    r.reconcileReleasedLocalInputs(keyDown:{_ in false},buttonDown:{_ in false},flags:{[]})
+    guard r.boundaryBlockedReason==nil else{return false}
     motion(CGPoint(x:200,y:100),.zero)
     motion(CGPoint(x:399,y:100),CGVector(dx:-1,dy:0))
     motion(CGPoint(x:399,y:100),CGVector(dx:1,dy:0),true)
@@ -3849,6 +3872,7 @@ final class Relay {
         return
       }
       let now = ProcessInfo.processInfo.systemUptime
+      self.reconcileReleasedLocalInputs()
       if !self.bridgeRecovery.valid(now:now) {self.stop(reason:"Bridge input recovery timed out");return}
       if self.authenticated,self.bridgeRecoveryCompatible {
         if !self.sender,now-self.lastLeaseSent>=0.1 {
