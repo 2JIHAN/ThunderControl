@@ -46,6 +46,8 @@ import AppKit
   }
   func updateAutomaticWindowVisibility(connected:Bool) {
     guard appearanceInstalled,!isAutomationTest,let action=connectedWindowVisibility.setConnected(connected),!applicationIsQuitting else{return}
+    // Bringing the main window forward on disconnect would leave the fullscreen viewer.
+    if case .showMainWindow=action,displayMode.hasOpenViewer {return}
     applyMainWindowVisibility(action)
   }
   func applyMainWindowVisibility(_ action:ConnectedWindowVisibility.Action) {

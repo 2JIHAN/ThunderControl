@@ -134,6 +134,8 @@ struct OwnedDisplayMonitor {
     return viewer
   }
   var sharingSending:Bool? {active ? sending:nil}
+  /// The MacBook viewer window is still open, including while waiting to reconnect.
+  var hasOpenViewer:Bool {active && !sending && viewer?.isOpenForSourceOwnership==true}
   var sessionPermitted:(()->Bool)?
   #if TC_FRESH_RECEIVER_SAFETY
   var makeSafetyTicket:((UUID)->DisplaySafetyTicket?)?
@@ -458,7 +460,9 @@ struct OwnedDisplayMonitor {
   private func tick() {
     guard active else{return}
     if inputBindingConflicts?()==true {stop(message:TCText("The input peer changed. Closing the previous peer's video connection."));return}
-    if waitingForFreshFrame,let since=retentionStartedAt,ProcessInfo.processInfo.systemUptime-since>=Self.retentionLimit {
+    if sending,waitingForFreshFrame,let since=retentionStartedAt,ProcessInfo.processInfo.systemUptime-since>=Self.retentionLimit {
+      // Only the Mac mini retires its virtual display. The MacBook keeps the frozen
+      // viewer until the user closes it, so a later reconnect stays in fullscreen.
       // Saved video intent is kept, so the next connection brings the screen back.
       stop(message:TCText("The screen connection did not recover, so the screen was closed."));return
     }
@@ -762,12 +766,10 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
     controller.firstFrameTimedOut()
     // A failed resume attempt must not restart the retention clock.
     guard controller.active,controller.reconnecting,controller.waitingForFreshFrame,controller.retentionStartedAt==beforeRetry else{return false}
-    controller.retentionStartedAt=ProcessInfo.processInfo.systemUptime-limit
+    // The MacBook viewer itself never expires; only the sender retires its display.
+    controller.retentionStartedAt=ProcessInfo.processInfo.systemUptime-limit-100
     controller.tick()
-    guard !controller.active,!controller.reconnecting,!controller.waitingForFreshFrame else{return false}
-    controller.active=true;controller.expectedPair=pair;controller.virtualID=123
-    controller.inputConnectionInterrupted()
-    guard controller.active,controller.reconnecting,let renewed=controller.retentionStartedAt,ProcessInfo.processInfo.systemUptime-renewed<limit else{return false}
+    guard controller.active,controller.reconnecting,controller.waitingForFreshFrame,controller.hasOpenViewer==false else{return false}
     #if TC_FRESH_RECEIVER_SAFETY
     // Receiver ticket loss: a disconnect alone keeps the screen, otherwise stop.
     controller.reconnecting=false;controller.waitingForFreshFrame=false
@@ -787,7 +789,18 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
     guard !controller.active,!controller.reconnecting,!controller.waitingForFreshFrame,controller.epoch != epoch,controller.retainedInputBinding==nil else{return false}
     controller.active=true;controller.expectedPair=pair;controller.inputBindingConflicts={false}
     controller.retentionSessionPermitted={false};controller.inputConnectionInterrupted()
-    return !controller.active && !controller.reconnecting
+    guard !controller.active && !controller.reconnecting else{return false}
+    // Sender: the retained virtual display is retired after the limit.
+    let sender=DisplayModeController()
+    sender.localRetentionSafety={true};sender.retentionSessionPermitted={true}
+    sender.inputBindingValid={false};sender.inputBindingConflicts={false}
+    sender.active=true;sender.sending=true;sender.expectedPair=pair
+    sender.inputConnectionInterrupted()
+    guard sender.active,sender.reconnecting else{return false}
+    sender.retentionStartedAt=ProcessInfo.processInfo.systemUptime-limit+5;sender.tick()
+    guard sender.active,sender.reconnecting else{return false}
+    sender.retentionStartedAt=ProcessInfo.processInfo.systemUptime-limit;sender.tick()
+    return !sender.active && !sender.reconnecting
   }
   static func verifyStopRetirementForTests()->Bool {
     guard let current=DisplayBaseline.read(),current.supported else{return false}

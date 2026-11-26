@@ -6053,7 +6053,9 @@ final class PasteCommandProbe: NSResponder {
       let old = self.previousForeground
       let mayRestorePreviousApp=NSApp.isActive
       self.previousForeground = nil
-      let keepsViewer=self.sourceWindowOwnership.restore()
+      // A viewer waiting to reconnect also counts: activating the previous app
+      // would pull the user out of the fullscreen viewer to another Space.
+      let keepsViewer=self.sourceWindowOwnership.restore() || self.displayMode.hasOpenViewer
       if self.sourceWindowWasVisible && self.connectedWindowVisibility.mayRestoreMainWindow { self.window.orderBack(nil) }
       self.sourceWindowWasVisible = false
       if !keepsViewer && mayRestorePreviousApp && self.relay.sessionAllowed,let old,!old.isTerminated {

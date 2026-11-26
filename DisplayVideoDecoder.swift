@@ -729,6 +729,8 @@ struct DisplayLatestDecodedFrame {
 struct DisplayConnectionWarningProgress {
     let startedAt: Double
     static let closeDelay = 5.0
+    /// A brief outage first looks like a frozen frame; the card appears only if it persists.
+    static let showDelay = 2.0
     private func elapsed(at now: Double) -> Double? {
         guard startedAt.isFinite, now.isFinite, now >= startedAt else { return nil }
         let value = now - startedAt
@@ -739,6 +741,7 @@ struct DisplayConnectionWarningProgress {
         return min(2, Int(elapsed.truncatingRemainder(dividingBy: 1.5) / 0.5)) + 1
     }
     func canClose(at now: Double) -> Bool { elapsed(at: now).map { $0 >= Self.closeDelay } ?? false }
+    func visible(at now: Double) -> Bool { elapsed(at: now).map { $0 >= Self.showDelay } ?? false }
 }
 
 @MainActor private final class DisplayConnectionCloseButton: NSButton {
@@ -797,6 +800,8 @@ struct DisplayConnectionWarningProgress {
         let now = ProcessInfo.processInfo.systemUptime
         let message = TCText("Connecting") + String(repeating: ".", count: progress.dots(at: now))
         if detail.stringValue != message { detail.stringValue = message }
+        let shown = progress.visible(at: now)
+        if isHidden == shown { isHidden = !shown }
         let allowed = progress.canClose(at: now)
         if button.isEnabled != allowed { button.isEnabled = allowed; button.needsDisplay = true }
     }

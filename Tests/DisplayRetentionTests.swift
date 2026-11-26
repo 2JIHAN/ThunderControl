@@ -10,6 +10,10 @@ import Foundation
     (5, 2, true), (5.001, 2, true), (9.999, 2, true),
     (10, 3, true), (10.001, 3, true)
   ]
+  for (elapsed, shown) in [(0.0, false), (1.999, false), (2.0, true), (5.0, true)] {
+    valid = (progress.visible(at: 100 + elapsed) == shown) && valid
+  }
+  valid = !progress.visible(at: Double.nan) && valid
   for (elapsed, dots, canClose) in cases {
     valid = (progress.dots(at: 100 + elapsed) == dots) && valid
     valid = (progress.canClose(at: 100 + elapsed) == canClose) && valid
