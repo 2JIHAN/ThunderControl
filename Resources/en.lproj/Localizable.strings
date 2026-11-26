@@ -356,3 +356,4 @@
 "Connecting" = "Connecting";
 
 "ThunderControl will install its audio device so you can choose the connected Mac as a sound output." = "ThunderControl will install its audio device so you can choose the connected Mac as a sound output.";
+"The screen connection did not recover, so the screen was closed." = "The screen connection did not recover, so the screen was closed.";

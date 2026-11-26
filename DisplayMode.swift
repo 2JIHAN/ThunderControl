@@ -86,6 +86,10 @@ struct OwnedDisplayMonitor {
     guard active,let expectedPair else{return nil};return(expectedPair,!sending)
   }
   private var attempt=UUID(),retainedPeer="",retryAfter=0.0
+  /// Keep the last screen only for a brief interruption. An unplugged cable or a
+  /// peer that has ended must not leave the virtual display behind indefinitely.
+  static let retentionLimit=60.0
+  private var retentionStartedAt:Double?
   private let attachmentLock=NSLock()
   private var attachment:(transport:DisplayTransport,epoch:UUID,attempt:UUID,ownedID:UInt32?,freshAfter:UInt64,format:DisplayVideoFormat)?
   private func publishAttachment(_ t:DisplayTransport?,freshAfter:UInt64=0) {
@@ -102,6 +106,8 @@ struct OwnedDisplayMonitor {
     guard active else{return}
     guard inputBindingConflicts?() != true,locallySafe else{stop();return}
     if sending,helper != nil,virtualID==nil {stop();return}
+    // Failed resume attempts re-enter here; the limit counts from the first interruption.
+    if !waitingForFreshFrame {retentionStartedAt=ProcessInfo.processInfo.systemUptime}
     reconnecting=true;waitingForFreshFrame=true
     if !sending {receivedFirstFrame=false}
     attempt=UUID();publishAttachment(nil)
@@ -133,6 +139,14 @@ struct OwnedDisplayMonitor {
   var makeSafetyTicket:((UUID)->DisplaySafetyTicket?)?
   var currentSafetyTicket:((DisplaySafetyTicket)->Bool)?
   var sampledSessionPermitted:((FreshSessionSafetySample,DisplaySafetyTicket,Double)->Bool)?
+  /// True when the input session is gone with no local lock or sleep signal.
+  var inputConnectionLost:(()->Bool)?
+  // The fixed ticket also expires the moment the input session ends, before the
+  // Relay publishes that disconnect. Treat that alone as an interruption so the
+  // viewer keeps its last image; inputConnectionInterrupted still stops on lock/sleep.
+  private func receiverSafetyLost(_ message:String) {
+    if !sending,inputConnectionLost?()==true {inputConnectionInterrupted()} else {stop(message:message)}
+  }
   private var safetyTicket:DisplaySafetyTicket?
   private let periodicSafetyQueue=DispatchQueue(label:"ThunderControl.display.periodic-safety")
   private var periodicSafetyPending=DisplaySafetyPending()
@@ -304,7 +318,7 @@ struct OwnedDisplayMonitor {
       // acceptance and an unsafe stop, so old completions cannot stop a new run.
       guard self.active,self.epoch==token,self.attempt==attemptToken,self.transport === t,self.safetyTicket==fixedSafetyTicket else{return}
       guard payloadSafe,self.currentSafetyTicket?(fixedSafetyTicket)==true,sample.valid(at:guardFinishedAt),guardFinishedAt>=guardStartedAt else {
-        self.stop(message:TCText("Screen transmission stopped because the session's safety state changed."));return
+        self.receiverSafetyLost(TCText("Screen transmission stopped because the session's safety state changed."));return
       }
       guard !sending else{self.stop(message:TCText("Received data not allowed on the video-only channel."));return}
       if data.first==7 {
@@ -372,7 +386,7 @@ struct OwnedDisplayMonitor {
       // Shared production completion fence: retired unsafe samples cannot stop
       // replacement sessions, even if an injected evaluator reenters/restarts.
       guard periodicSafetyContextCurrent(ticket:ticket,token:token,expectedTransport:expectedTransport) else{return}
-      stop(message:TCText("Screen transmission stopped due to locking or a safety state change."));return
+      receiverSafetyLost(TCText("Screen transmission stopped due to locking or a safety state change."));return
     }
     // Success is discarded, never cached or used to authorize payloads.
   }
@@ -444,6 +458,10 @@ struct OwnedDisplayMonitor {
   private func tick() {
     guard active else{return}
     if inputBindingConflicts?()==true {stop(message:TCText("The input peer changed. Closing the previous peer's video connection."));return}
+    if waitingForFreshFrame,let since=retentionStartedAt,ProcessInfo.processInfo.systemUptime-since>=Self.retentionLimit {
+      // Saved video intent is kept, so the next connection brings the screen back.
+      stop(message:TCText("The screen connection did not recover, so the screen was closed."));return
+    }
     if !reconnecting,inputBindingValid?() != true {inputConnectionInterrupted();if !active{return}}
     if reconnecting {
       guard locallySafe else{stop(message:TCText("Screen transmission stopped due to locking or a safety state change."));return}
@@ -454,7 +472,7 @@ struct OwnedDisplayMonitor {
       guard safe else{stop(message:TCText("Screen transmission stopped due to locking or a safety state change."));return}
     } else {
       guard let ticket=safetyTicket,currentSafetyTicket?(ticket)==true else {
-        stop(message:TCText("Screen transmission stopped due to locking or a safety state change."));return
+        receiverSafetyLost(TCText("Screen transmission stopped due to locking or a safety state change."));return
       }
       schedulePeriodicSafety(ticket:ticket)
     }
@@ -721,7 +739,7 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
     }
   }
   static func verifyRetentionLifecycleForTests()->Bool {
-    let controller=DisplayModeController()
+    let controller=DisplayModeController(),limit=DisplayModeController.retentionLimit
     let pair=LayoutDevicePair(localID:UUID().uuidString,peerID:UUID().uuidString)!
     controller.localRetentionSafety={true};controller.retentionSessionPermitted={true}
     controller.inputBindingValid={false};controller.inputBindingConflicts={false}
@@ -732,14 +750,39 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
     guard controller.active,controller.reconnecting,controller.waitingForFreshFrame,!controller.inputReadyAfterRecovery,controller.epoch==epoch,
       controller.virtualID==123,controller.transport==nil,controller.currentAttachment(epoch)==nil,
       controller.retainedInputBinding?.pair==pair,controller.retainedInputBinding?.inputIsSender==true else{return false}
-    // Far beyond socket/grace deadlines, local retention itself has no expiry.
+    // Beyond socket/grace deadlines but within the retention limit, the screen stays.
     controller.started = -100_000;controller.retryAfter = -100_000
+    let firstInterruption=controller.retentionStartedAt
+    controller.retentionStartedAt=ProcessInfo.processInfo.systemUptime-limit+5
     controller.tick()
-    guard controller.active,controller.reconnecting,controller.waitingForFreshFrame,!controller.inputReadyAfterRecovery,controller.virtualID==123 else{return false}
+    guard firstInterruption != nil,controller.active,controller.reconnecting,controller.waitingForFreshFrame,!controller.inputReadyAfterRecovery,controller.virtualID==123 else{return false}
     controller.reconnecting=false // Authentication alone must not enable input.
     guard controller.waitingForFreshFrame,!controller.inputReadyAfterRecovery else{return false}
+    let beforeRetry=controller.retentionStartedAt
     controller.firstFrameTimedOut()
+    // A failed resume attempt must not restart the retention clock.
+    guard controller.active,controller.reconnecting,controller.waitingForFreshFrame,controller.retentionStartedAt==beforeRetry else{return false}
+    controller.retentionStartedAt=ProcessInfo.processInfo.systemUptime-limit
+    controller.tick()
+    guard !controller.active,!controller.reconnecting,!controller.waitingForFreshFrame else{return false}
+    controller.active=true;controller.expectedPair=pair;controller.virtualID=123
+    controller.inputConnectionInterrupted()
+    guard controller.active,controller.reconnecting,let renewed=controller.retentionStartedAt,ProcessInfo.processInfo.systemUptime-renewed<limit else{return false}
+    #if TC_FRESH_RECEIVER_SAFETY
+    // Receiver ticket loss: a disconnect alone keeps the screen, otherwise stop.
+    controller.reconnecting=false;controller.waitingForFreshFrame=false
+    controller.inputConnectionLost={true};controller.receiverSafetyLost("fixture")
     guard controller.active,controller.reconnecting,controller.waitingForFreshFrame else{return false}
+    controller.reconnecting=false;controller.waitingForFreshFrame=false
+    controller.inputConnectionLost={false};controller.receiverSafetyLost("fixture")
+    guard !controller.active,!controller.reconnecting else{return false}
+    controller.active=true;controller.expectedPair=pair;controller.virtualID=123
+    controller.inputConnectionLost={true};controller.localRetentionSafety={false};controller.receiverSafetyLost("fixture")
+    guard !controller.active else{return false} // Local lock/sleep still wins over retention.
+    controller.localRetentionSafety={true}
+    controller.active=true;controller.expectedPair=pair;controller.virtualID=123
+    controller.inputConnectionInterrupted()
+    #endif
     controller.inputBindingConflicts={true};controller.tick()
     guard !controller.active,!controller.reconnecting,!controller.waitingForFreshFrame,controller.epoch != epoch,controller.retainedInputBinding==nil else{return false}
     controller.active=true;controller.expectedPair=pair;controller.inputBindingConflicts={false}
@@ -823,6 +866,7 @@ heartbeat=input.fileHandleForWriting;try heartbeat?.write(contentsOf:Data([1]))
     displayMode.makeSafetyTicket={[weak self] epoch in self?.relay.displaySafetyTicket(epoch:epoch)}
     displayMode.currentSafetyTicket={[weak self] ticket in self?.relay.displaySafetyTicketCurrent(ticket)==true}
     displayMode.sampledSessionPermitted={[weak self] sample,ticket,now in self?.relay.sampledDisplaySessionPermitted(sample,ticket:ticket,now:now)==true}
+    displayMode.inputConnectionLost={[weak self] in self?.relay.displayInputConnectionLost==true}
     #endif
     displayMode.sessionPermitted={[weak self] in guard let self else{return false};return self.relay.sessionAllowed && !self.relay.screenSleeping && !self.relay.systemSleeping && self.relay.multiDisplayDesktopReady}
     displayMode.retentionSessionPermitted={[weak self] in

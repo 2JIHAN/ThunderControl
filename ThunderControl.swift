@@ -1729,6 +1729,12 @@ final class Relay {
     context != nil && context?.cancelled == false && authenticated && safetyObserversInstalled &&
       !sessionLockedSignal && !transportScreenLockObserved && !screenSleeping && !systemSleeping && multiDisplayDesktopReady
   }
+  /// The ticket failed only because the input session ended, not because of a local lock or sleep.
+  var displayInputConnectionLost:Bool {
+    dispatchPrecondition(condition:.onQueue(.main))
+    let live=context != nil && context?.cancelled == false && authenticated
+    return !live && !sessionLockedSignal && !transportScreenLockObserved && !screenSleeping && !systemSleeping
+  }
   func displaySafetyTicketCurrent(_ ticket:DisplaySafetyTicket)->Bool {
     dispatchPrecondition(condition:.onQueue(.main))
     return displaySafetyCurrent && ticket.relayGeneration==generation && ticket.safetyRevision==displaySafetyRevision
@@ -1757,8 +1763,12 @@ final class Relay {
     guard !r.displaySafetyTicketCurrent(awake),let ready=r.displaySafetyTicket(epoch:epoch) else{return false}
     r.multiDisplayDesktopCompatible=false;r.multiDisplayDesktopCompatible=true
     guard !r.displaySafetyTicketCurrent(ready),let oldRun=r.displaySafetyTicket(epoch:epoch) else{return false}
+    guard !r.displayInputConnectionLost else{return false}
     r.context?.cancel(reason:"fixture cancellation")
-    guard !r.displaySafetyTicketCurrent(oldRun),r.displaySafetyTicket(epoch:epoch)==nil else{return false}
+    guard !r.displaySafetyTicketCurrent(oldRun),r.displaySafetyTicket(epoch:epoch)==nil,r.displayInputConnectionLost else{return false}
+    r.sessionLockedSignal=true
+    guard !r.displayInputConnectionLost else{return false} // A lock is never reported as a mere disconnect.
+    r.sessionLockedSignal=false
     r.context=SessionContext(socket)
     r.generation=UUID() // An old completion must not affect replacement context.
     guard !r.displaySafetyTicketCurrent(oldRun) else{return false}
